@@ -1,0 +1,28 @@
+version: '3'
+
+services:
+  acme:
+    image: neilpang/acme.sh:latest
+    container_name: acme
+    network_mode: host
+    volumes:
+      - ./data:/acme.sh
+      - /opt/nginx/certs:/certs
+      - /opt/nginx/html:/webroot
+    environment:
+      - TZ=${TZ:-Australia/Sydney}
+      # Cloudflare DNS API (for wildcard certificates)
+      - CF_Email=${CF_Email:-}
+      - CF_Key=${CF_Key:-}
+      - CF_Token=${CF_Token:-}
+      # Aliyun DNS API
+      - Ali_Key=${Ali_Key:-}
+      - Ali_Secret=${Ali_Secret:-}
+      # Tencent Cloud DNS API
+      - Tencent_SecretId=${Tencent_SecretId:-}
+      - Tencent_SecretKey=${Tencent_SecretKey:-}
+      # DNSPod API
+      - DP_Id=${DP_Id:-}
+      - DP_Key=${DP_Key:-}
+    command: daemon
+    restart: unless-stopped

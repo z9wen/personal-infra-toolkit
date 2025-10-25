@@ -1,0 +1,5 @@
+# Environment file with sensitive credentials
+.env
+
+# ACME data directory (contains certificates and keys)
+data/
