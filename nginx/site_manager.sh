@@ -30,7 +30,7 @@ show_help() {
     cat << HELP
 Nginx Site Manager - Nginx Virtual Host Management Tool (Docker & Native)
 
-Usage: $0 <command> [options]
+Usage: ./site_manager.sh <command> [options]
 
 Commands:
   add <domain>                           Add new website (single domain)
@@ -40,10 +40,11 @@ Commands:
   delete <domain>                        Delete website (with confirmation)
   list                                   List all websites
   status                                 Show Nginx status
-  acme-status                            Show ACME.sh status and certificate list
+  acme-status                            Show ACME.sh status and certificate list (auto-install if not found)
   logs <domain> [lines]                  View website logs (default: last 50 lines)
   reload                                 Reload Nginx configuration
   test                                   Test Nginx configuration
+  help                                   Show this help message
 
 SSL Options:
   --with-www                             Add www.$domain to certificate
@@ -53,22 +54,23 @@ SSL Options:
   
 Examples:
   # Add websites
-  $0 add example.com                     # Add example.com
-  $0 add api.example.com                 # Add API subdomain
+  ./site_manager.sh add example.com                     # Add example.com
+  ./site_manager.sh add api.example.com                 # Add API subdomain
   
   # SSL certificates
-  $0 ssl api.example.com                 # Single domain: api.example.com
-  $0 ssl example.com --with-www          # Two domains: example.com + www.example.com
-  $0 ssl example.com --extra www,api,cdn # Multiple: example.com + www + api + cdn
-  $0 ssl example.com --wildcard          # Wildcard: example.com + *.example.com
-  $0 ssl example.com --server zerossl    # Use ZeroSSL instead of Let's Encrypt
-  $0 ssl example.com --server google     # Use Google Trust Services
-  $0 ssl example.com --server buypass    # Use BuyPass (180-day validity)
+  ./site_manager.sh ssl api.example.com                 # Single domain: api.example.com
+  ./site_manager.sh ssl example.com --with-www          # Two domains: example.com + www.example.com
+  ./site_manager.sh ssl example.com --extra www,api,cdn # Multiple: example.com + www + api + cdn
+  ./site_manager.sh ssl example.com --wildcard          # Wildcard: example.com + *.example.com
+  ./site_manager.sh ssl example.com --server zerossl    # Use ZeroSSL instead of Let's Encrypt
+  ./site_manager.sh ssl example.com --server google     # Use Google Trust Services
+  ./site_manager.sh ssl example.com --server buypass    # Use BuyPass (180-day validity)
   
   # Other operations
-  $0 logs example.com 100                # View last 100 lines of logs
-  $0 list                                # List all websites
-  $0 delete old-site.com                 # Delete website
+  ./site_manager.sh logs example.com 100                # View last 100 lines of logs
+  ./site_manager.sh list                                # List all websites
+  ./site_manager.sh delete old-site.com                 # Delete website
+  ./site_manager.sh acme-status                         # Check ACME.sh status or install it
 
 Notes:
   - Default: Single domain only (no www)
@@ -462,7 +464,7 @@ add_site() {
     
     if [ -z "$domain" ]; then
         print_error "Please specify a domain"
-        echo "Usage: $0 add <domain>"
+        echo "Usage: ./site_manager.sh add <domain>"
         exit 1
     fi
     
@@ -665,10 +667,10 @@ NGINX
     print_info "Next steps:"
     echo "  1. Point domain DNS to this server"
     echo "  2. Apply SSL certificate:"
-    echo "     - Single domain:  $0 ssl $domain"
-    echo "     - With www:       $0 ssl $domain --with-www"
-    echo "     - Custom domains: $0 ssl $domain --extra www.$domain,cdn.$domain"
-    echo "     - Wildcard:       $0 ssl $domain --wildcard"
+    echo "     - Single domain:  ./site_manager.sh ssl $domain"
+    echo "     - With www:       ./site_manager.sh ssl $domain --with-www"
+    echo "     - Custom domains: ./site_manager.sh ssl $domain --extra www.$domain,cdn.$domain"
+    echo "     - Wildcard:       ./site_manager.sh ssl $domain --wildcard"
     echo "  3. Visit: http://$domain"
     echo ""
     print_info "Website files location: $site_root/$domain/"
@@ -685,7 +687,7 @@ add_ssl() {
     
     if [ -z "$domain" ]; then
         print_error "Please specify a domain"
-        echo "Usage: $0 ssl <domain> [options]"
+        echo "Usage: ./site_manager.sh ssl <domain> [options]"
         echo ""
         echo "Options:"
         echo "  --with-www              Add www.$domain"
@@ -694,13 +696,13 @@ add_ssl() {
         echo "  --server <provider>     ACME server (letsencrypt|zerossl|google|buypass)"
         echo ""
         echo "Examples:"
-        echo "  $0 ssl api.example.com                          # Single domain only"
-        echo "  $0 ssl example.com --with-www                   # example.com + www.example.com"
-        echo "  $0 ssl example.com --extra www,cdn,api          # example.com + www,cdn,api subdomains"
-        echo "  $0 ssl example.com --wildcard                   # example.com + *.example.com"
-        echo "  $0 ssl example.com --server zerossl             # Use ZeroSSL"
-        echo "  $0 ssl example.com --server google              # Use Google Trust Services"
-        echo "  $0 ssl example.com --server buypass             # Use BuyPass (180-day validity)"
+        echo "  ./site_manager.sh ssl api.example.com                          # Single domain only"
+        echo "  ./site_manager.sh ssl example.com --with-www                   # example.com + www.example.com"
+        echo "  ./site_manager.sh ssl example.com --extra www,cdn,api          # example.com + www,cdn,api subdomains"
+        echo "  ./site_manager.sh ssl example.com --wildcard                   # example.com + *.example.com"
+        echo "  ./site_manager.sh ssl example.com --server zerossl             # Use ZeroSSL"
+        echo "  ./site_manager.sh ssl example.com --server google              # Use Google Trust Services"
+        echo "  ./site_manager.sh ssl example.com --server buypass             # Use BuyPass (180-day validity)"
         exit 1
     fi
     
@@ -755,7 +757,7 @@ add_ssl() {
     # Check if website configuration exists
     if [ ! -f "$NGINX_ROOT/conf.d/$domain.conf" ]; then
         print_error "Website $domain does not exist!"
-        print_info "Please run first: $0 add $domain"
+        print_info "Please run first: ./site_manager.sh add $domain"
         exit 1
     fi
     
@@ -1182,7 +1184,7 @@ view_logs() {
     
     if [ -z "$domain" ]; then
         print_error "Please specify a domain"
-        echo "Usage: $0 logs <domain> [lines]"
+        echo "Usage: ./site_manager.sh logs <domain> [lines]"
         exit 1
     fi
     
@@ -1217,9 +1219,94 @@ show_status() {
     echo "  Disabled: $disabled"
 }
 
+# Install ACME.sh (interactive)
+install_acme() {
+    print_info "ACME.sh is not installed"
+    echo ""
+    echo "Choose installation method:"
+    echo "  1) Docker (recommended, isolated)"
+    echo "  2) Native (install to ~/.acme.sh/)"
+    echo "  3) Cancel"
+    echo ""
+    read -p "Select [1-3]: " acme_choice
+    
+    case $acme_choice in
+        1)
+            print_info "Installing ACME.sh via Docker..."
+            echo ""
+            
+            # Check if Docker is available
+            if ! command -v docker &> /dev/null; then
+                print_error "Docker is not installed!"
+                print_info "Please install Docker first: https://docs.docker.com/get-docker/"
+                exit 1
+            fi
+            
+            # Create directories
+            mkdir -p ~/.acme.sh
+            mkdir -p /opt/nginx/certs
+            mkdir -p /opt/nginx/html
+            
+            # Run ACME container
+            docker run -d --name acme \
+                --restart=unless-stopped \
+                -v ~/.acme.sh:/acme.sh \
+                -v /opt/nginx/certs:/certs \
+                -v /opt/nginx/html:/webroot \
+                neilpang/acme.sh:latest daemon
+            
+            if [ $? -eq 0 ]; then
+                print_success "ACME.sh Docker container installed successfully!"
+                ACME_MODE="docker"
+            else
+                print_error "Failed to install ACME.sh Docker container"
+                exit 1
+            fi
+            ;;
+            
+        2)
+            print_info "Installing ACME.sh natively..."
+            echo ""
+            
+            # Install acme.sh
+            curl -fsSL https://get.acme.sh | sh -s email=my@example.com
+            
+            if [ $? -eq 0 ]; then
+                print_success "ACME.sh installed successfully!"
+                print_info "Installation path: $HOME/.acme.sh/"
+                ACME_MODE="native"
+                ACME_SH_PATH="$HOME/.acme.sh/acme.sh"
+            else
+                print_error "Failed to install ACME.sh"
+                exit 1
+            fi
+            ;;
+            
+        3)
+            print_info "Cancelled"
+            exit 0
+            ;;
+            
+        *)
+            print_error "Invalid choice"
+            exit 1
+            ;;
+    esac
+}
+
 # Show ACME status and certificate list
 show_acme_status() {
-    detect_acme_mode
+    # Try to detect, but don't exit if not found
+    if [ -z "$ACME_MODE" ]; then
+        if docker ps 2>/dev/null | grep -q "acme"; then
+            ACME_MODE="docker"
+        elif [ -f "$ACME_SH_PATH" ]; then
+            ACME_MODE="native"
+        else
+            # ACME not found, offer to install
+            install_acme
+        fi
+    fi
     
     echo ""
     print_success "ACME Mode: $ACME_MODE"
