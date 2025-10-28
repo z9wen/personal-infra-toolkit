@@ -34,6 +34,7 @@ Usage: ./site_manager.sh <command> [options]
 
 Commands:
   add <domain>                           Add new website (single domain)
+  proxy <domain> <backend_url>           Setup reverse proxy for domain
   ssl <domain> [options]                 Apply SSL certificate
   enable <domain>                        Enable website
   disable <domain>                       Disable website
@@ -47,7 +48,7 @@ Commands:
   help                                   Show this help message
 
 SSL Options:
-  --with-www                             Add www.$domain to certificate
+  --with-www                             Add www.\$domain to certificate
   --extra <domains>                      Add custom domains (comma-separated)
   --wildcard                             Use wildcard certificate (requires DNS API)
   --server <provider>                    ACME server (letsencrypt|zerossl|google|buypass, default: letsencrypt)
@@ -56,6 +57,9 @@ Examples:
   # Add websites
   ./site_manager.sh add example.com                     # Add example.com
   ./site_manager.sh add api.example.com                 # Add API subdomain
+  
+  # Reverse proxy
+  ./site_manager.sh proxy api.example.com http://127.0.0.1:3000    # Proxy to local port 3000
   
   # SSL certificates
   ./site_manager.sh ssl api.example.com                 # Single domain: api.example.com
@@ -209,17 +213,28 @@ check_credentials() {
             echo "  2. Enable 'Public Certificate Authority API'"
             echo "  3. Create External Account Binding credentials"
             echo ""
+            read -p "Enter your email address: " ACME_EMAIL
             read -p "Enter GOOGLE_EAB_KID: " GOOGLE_EAB_KID
             read -p "Enter GOOGLE_EAB_HMAC_KEY: " GOOGLE_EAB_HMAC_KEY
+            export ACME_EMAIL
             export GOOGLE_EAB_KID
             export GOOGLE_EAB_HMAC_KEY
             
-            if [ -z "$GOOGLE_EAB_KID" ] || [ -z "$GOOGLE_EAB_HMAC_KEY" ]; then
-                print_error "EAB credentials cannot be empty!"
+            if [ -z "$ACME_EMAIL" ] || [ -z "$GOOGLE_EAB_KID" ] || [ -z "$GOOGLE_EAB_HMAC_KEY" ]; then
+                print_error "Email and EAB credentials cannot be empty!"
                 return 1
             fi
             echo ""
         fi
+        
+        # Register account with Google Trust Services (if not already registered)
+        print_info "Registering ACME account with Google Trust Services..."
+        acme_exec --register-account \
+            --server google \
+            --eab-kid "$GOOGLE_EAB_KID" \
+            --eab-hmac-key "$GOOGLE_EAB_HMAC_KEY" \
+            ${ACME_EMAIL:+--accountemail "$ACME_EMAIL"} 2>/dev/null || true
+        
         print_info "Using Google Trust Services with EAB credentials"
     fi
     
@@ -914,12 +929,19 @@ NGINX
         # Issue certificate using HTTP validation
         print_info "Step 1/3: Issuing certificate via HTTP validation..."
         
-        # Set webroot path based on ACME mode
+        # Set webroot path based on ACME mode and Nginx mode
         local webroot_path
         if [ "$ACME_MODE" = "docker" ]; then
             webroot_path="/webroot/$domain"
         else
-            webroot_path="$NGINX_ROOT/html/$domain"
+            # Native ACME.sh needs actual filesystem path
+            if [ "$NGINX_MODE" = "docker" ]; then
+                # Docker Nginx: use host path that maps to container
+                webroot_path="/opt/nginx/html/$domain"
+            else
+                # Native Nginx: use standard path
+                webroot_path="$NGINX_ROOT/html/$domain"
+            fi
         fi
         
         # Build command with optional EAB parameters for Google
@@ -946,16 +968,25 @@ NGINX
     # Install certificate
     print_info "Step 2/3: Installing certificate..."
     
-    # Set certificate paths based on ACME mode
+    # Set certificate paths based on ACME mode and Nginx mode
     local cert_key_path
     local cert_fullchain_path
     if [ "$ACME_MODE" = "docker" ]; then
         cert_key_path="/certs/$domain/$domain.key"
         cert_fullchain_path="/certs/$domain/fullchain.cer"
     else
-        mkdir -p "$NGINX_ROOT/certs/$domain"
-        cert_key_path="$NGINX_ROOT/certs/$domain/$domain.key"
-        cert_fullchain_path="$NGINX_ROOT/certs/$domain/fullchain.cer"
+        # Native ACME.sh needs actual filesystem path
+        if [ "$NGINX_MODE" = "docker" ]; then
+            # Docker Nginx: use host path that maps to container
+            mkdir -p "/opt/nginx/certs/$domain"
+            cert_key_path="/opt/nginx/certs/$domain/$domain.key"
+            cert_fullchain_path="/opt/nginx/certs/$domain/fullchain.cer"
+        else
+            # Native Nginx: use standard path
+            mkdir -p "$NGINX_ROOT/certs/$domain"
+            cert_key_path="$NGINX_ROOT/certs/$domain/$domain.key"
+            cert_fullchain_path="$NGINX_ROOT/certs/$domain/fullchain.cer"
+        fi
     fi
     
     acme_exec --install-cert -d "$domain" \
@@ -1044,6 +1075,13 @@ list_sites() {
             local status="✓ Enabled"
             local ssl_status="❌ No SSL"
             local ssl_type=""
+            local proxy_info=""
+            
+            # Check if it's a reverse proxy
+            if grep -q "proxy_pass" "$conf" 2>/dev/null; then
+                local backend=$(grep "proxy_pass" "$conf" | head -1 | awk '{print $2}' | sed 's/;//')
+                proxy_info=" | Proxy: $backend"
+            fi
             
             # Check SSL
             if [ -f "$NGINX_ROOT/certs/$domain/fullchain.cer" ]; then
@@ -1074,9 +1112,11 @@ list_sites() {
             fi
             
             echo -e "${GREEN}●${NC} $domain"
-            echo "   Status: $status | SSL: $ssl_status$ssl_type"
+            echo "   Status: $status | SSL: $ssl_status$ssl_type$proxy_info"
             echo "   Config: $conf"
-            echo "   Files: $NGINX_ROOT/html/$domain/"
+            if [ -z "$proxy_info" ]; then
+                echo "   Files: $NGINX_ROOT/html/$domain/"
+            fi
             echo ""
         fi
     done
@@ -1175,6 +1215,311 @@ delete_site() {
     reload_nginx
     print_success "Website $domain deleted"
     print_info "Backup saved at: $backup_dir"
+}
+
+# Setup reverse proxy
+setup_proxy() {
+    local domain=$1
+    local backend=$2
+    
+    if [ -z "$domain" ] || [ -z "$backend" ]; then
+        print_error "Please specify domain and backend URL"
+        echo "Usage: ./site_manager.sh proxy <domain> <backend_url>"
+        echo ""
+        echo "Examples:"
+        echo "  ./site_manager.sh proxy api.example.com http://127.0.0.1:3000"
+        echo "  ./site_manager.sh proxy app.example.com http://localhost:8080"
+        exit 1
+    fi
+    
+    detect_nginx_mode
+    
+    # Set paths based on Nginx mode
+    local conf_dir log_dir cert_dir
+    if [ "$NGINX_MODE" = "docker" ]; then
+        conf_dir="$NGINX_ROOT/conf.d"
+        log_dir="$NGINX_ROOT/logs"
+        cert_dir="$NGINX_ROOT/certs"
+    else
+        conf_dir="$NGINX_ROOT/sites-available"
+        log_dir="/var/log/nginx"
+        cert_dir="/etc/nginx/certs"
+    fi
+    
+    # Check if website configuration exists
+    local config_exists=false
+    local has_ssl=false
+    
+    if [ -f "$conf_dir/$domain.conf" ]; then
+        config_exists=true
+        # Check if SSL is configured
+        if grep -q "listen 443 ssl" "$conf_dir/$domain.conf" 2>/dev/null; then
+            has_ssl=true
+        fi
+        
+        print_warning "Website $domain already exists!"
+        read -p "Update to reverse proxy configuration? (y/N) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            print_info "Cancelled"
+            exit 0
+        fi
+    else
+        print_info "Creating reverse proxy for $domain → $backend..."
+        
+        # Create directories
+        if [ "$NGINX_MODE" = "native" ]; then
+            sudo mkdir -p "$log_dir/$domain"
+            sudo mkdir -p "$cert_dir/$domain"
+        else
+            mkdir -p "$log_dir/$domain"
+            mkdir -p "$cert_dir/$domain"
+        fi
+    fi
+    
+    # Create Nginx reverse proxy configuration
+    local nginx_conf="$conf_dir/$domain.conf"
+    
+    if [ "$has_ssl" = true ]; then
+        # Update existing SSL configuration with proxy
+        print_info "Updating HTTPS reverse proxy configuration..."
+        
+        if [ "$NGINX_MODE" = "native" ]; then
+            sudo tee "$nginx_conf" > /dev/null <<NGINX
+# HTTP Configuration (redirect to HTTPS)
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain;
+    
+    # Redirect to HTTPS
+    location / {
+        return 301 https://\$server_name\$request_uri;
+    }
+    
+    # Logs
+    access_log $log_dir/$domain/access.log;
+    error_log $log_dir/$domain/error.log;
+}
+
+# HTTPS Reverse Proxy Configuration
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name $domain;
+    
+    # SSL Certificate
+    ssl_certificate /etc/nginx/certs/$domain/fullchain.cer;
+    ssl_certificate_key /etc/nginx/certs/$domain/$domain.key;
+    
+    # SSL Optimization
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+    
+    # Security Headers
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    
+    # Reverse Proxy Settings
+    location / {
+        proxy_pass $backend;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        
+        # WebSocket support
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        
+        # Timeout settings
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+    
+    # Logs
+    access_log $log_dir/$domain/access.log;
+    error_log $log_dir/$domain/error.log;
+}
+NGINX
+        else
+            cat > "$nginx_conf" <<NGINX
+# HTTP Configuration (redirect to HTTPS)
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain;
+    
+    # Redirect to HTTPS
+    location / {
+        return 301 https://\$server_name\$request_uri;
+    }
+    
+    # Logs
+    access_log /var/log/nginx/$domain/access.log;
+    error_log /var/log/nginx/$domain/error.log;
+}
+
+# HTTPS Reverse Proxy Configuration
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name $domain;
+    
+    # SSL Certificate
+    ssl_certificate /etc/nginx/certs/$domain/fullchain.cer;
+    ssl_certificate_key /etc/nginx/certs/$domain/$domain.key;
+    
+    # SSL Optimization
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+    
+    # Security Headers
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    
+    # Reverse Proxy Settings
+    location / {
+        proxy_pass $backend;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        
+        # WebSocket support
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        
+        # Timeout settings
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+    
+    # Logs
+    access_log /var/log/nginx/$domain/access.log;
+    error_log /var/log/nginx/$domain/error.log;
+}
+NGINX
+        fi
+    else
+        # Create new HTTP-only reverse proxy configuration
+        print_info "Creating HTTP reverse proxy configuration..."
+        
+        if [ "$NGINX_MODE" = "native" ]; then
+            sudo tee "$nginx_conf" > /dev/null <<NGINX
+# HTTP Reverse Proxy Configuration
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain;
+    
+    # ACME certificate validation path (for future SSL setup)
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/$domain;
+        try_files \$uri =404;
+    }
+    
+    # Reverse Proxy Settings
+    location / {
+        proxy_pass $backend;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        
+        # WebSocket support
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        
+        # Timeout settings
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+    
+    # Logs
+    access_log $log_dir/$domain/access.log;
+    error_log $log_dir/$domain/error.log;
+}
+NGINX
+            # Enable site by creating symlink
+            sudo ln -sf "$nginx_conf" "$NGINX_ROOT/sites-enabled/$domain.conf"
+        else
+            cat > "$nginx_conf" <<NGINX
+# HTTP Reverse Proxy Configuration
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain;
+    
+    # ACME certificate validation path (for future SSL setup)
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/$domain;
+        try_files \$uri =404;
+    }
+    
+    # Reverse Proxy Settings
+    location / {
+        proxy_pass $backend;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        
+        # WebSocket support
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        
+        # Timeout settings
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+    
+    # Logs
+    access_log /var/log/nginx/$domain/access.log;
+    error_log /var/log/nginx/$domain/error.log;
+}
+NGINX
+        fi
+    fi
+    
+    # Test and reload
+    reload_nginx
+    
+    print_success "Reverse proxy configured successfully!"
+    echo ""
+    print_info "Configuration:"
+    echo "  Domain:  $domain"
+    echo "  Backend: $backend"
+    echo "  SSL:     $([ "$has_ssl" = true ] && echo "Enabled (HTTPS)" || echo "Disabled (HTTP only)")"
+    echo ""
+    if [ "$has_ssl" = false ]; then
+        print_info "Next steps:"
+        echo "  1. Point domain DNS to this server"
+        echo "  2. Apply SSL certificate: ./site_manager.sh ssl $domain"
+        echo "  3. Visit: http://$domain (will auto-redirect to HTTPS after SSL setup)"
+    else
+        print_info "Visit: https://$domain"
+    fi
 }
 
 # View logs
@@ -1336,9 +1681,14 @@ main() {
             check_nginx_running
             add_site "$2"
             ;;
+        proxy)
+            check_nginx_running
+            setup_proxy "$2" "$3"
+            ;;
         ssl)
             check_nginx_running
-            add_ssl "$2" "$3"
+            shift  # Remove 'ssl' command
+            add_ssl "$@"  # Pass all remaining arguments
             ;;
         enable)
             check_nginx_running
