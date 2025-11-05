@@ -140,6 +140,20 @@ show_status() {
   else
     echo "acme.sh is not installed."
   fi
+  pause_for_menu
+}
+
+list_certificates() {
+  if ! ensure_acme_installed; then
+    pause_for_menu
+    return
+  fi
+
+  echo "Existing certificates managed by acme.sh:"
+  if ! "$ACME_HOME/acme.sh" --list; then
+    err "Unable to list certificates via acme.sh."
+  fi
+  pause_for_menu
 }
 
 current_default_ca() {
@@ -150,10 +164,21 @@ current_default_ca() {
     ca="$(awk '/\*/ {print $2; exit}' <<<"$output")"
     if [[ -n "$ca" ]]; then
       echo "$ca"
-      return
+      return 0
     fi
   fi
-  read_account_conf_var "DEFAULT_ACME_SERVER"
+  local account_ca
+  account_ca="$(read_account_conf_var "DEFAULT_ACME_SERVER" || true)"
+  if [[ -n "$account_ca" ]]; then
+    echo "$account_ca"
+  fi
+  return 0
+}
+
+pause_for_menu() {
+  echo
+  read -n1 -s -r -p "Press any key to return to the menu..." || true
+  echo
 }
 
 ensure_acme_installed() {
@@ -437,14 +462,15 @@ main_menu() {
 -------------------------------
  ACME.sh Management Assistant
 -------------------------------
- 1) Install or reinstall acme.sh
- 2) Uninstall acme.sh
+ 1) Issue single-domain certificate
+ 2) Issue wildcard certificate
  3) Set default ACME CA
- 4) Show status
- 5) Configure Cloudflare DNS credentials
- 6) Issue single-domain certificate
- 7) Issue wildcard certificate
- 8) Exit
+ 4) Configure Cloudflare DNS credentials
+ 5) Show status
+ 6) List existing certificates
+ 7) Install or reinstall acme.sh
+ 8) Uninstall acme.sh
+ 9) Exit
 EOF
 }
 
@@ -452,30 +478,33 @@ main() {
   while true; do
     main_menu
     local choice
-    read -rp "Choose an option [1-8]: " choice
+    read -rp "Choose an option [1-9]: " choice
     case "$choice" in
       1|"")
-        install_flow
+        issue_single_domain_certificate
         ;;
       2)
-        uninstall_flow
+        issue_wildcard_certificate
         ;;
       3)
         set_ca_flow
         ;;
       4)
-        show_status
-        ;;
-      5)
         configure_cloudflare_env
         ;;
+      5)
+        show_status
+        ;;
       6)
-        issue_single_domain_certificate
+        list_certificates
         ;;
       7)
-        issue_wildcard_certificate
+        install_flow
         ;;
       8)
+        uninstall_flow
+        ;;
+      9)
         echo "Bye."
         return
         ;;
