@@ -1,27 +1,30 @@
 # SOME_TOOLS
 
-一些实用的 Linux 运维工具集合。
+## 📦 TOOL LIST
 
-## 📦 工具列表
-
-#### 🚀 xray-install 快速安装
+#### 🚀 xray-install 
 
 ```bash
 wget -O xray-install.sh 'https://raw.githubusercontent.com/z9wen/toolsss/refs/heads/main/xray-install.sh' && chmod +x xray-install.sh && bash xray-install.sh
 ```
-
-或使用 curl：
-
+or  curl：
 ```bash
 curl -fsSL 'https://raw.githubusercontent.com/z9wen/toolsss/refs/heads/main/xray-install.sh' -o xray-install.sh && chmod +x xray-install.sh && bash xray-install.sh
 ```
-
-#### 📖 使用方法
-
-安装完成后，使用快捷命令：
-
+### xray-install use
 ```bash
 xraya
 ```
+### ---------
+### bbr_optimizer install
+```bash
+wget -O bbr_optimizer.sh 'https://raw.githubusercontent.com/z9wen/toolsss/refs/heads/main/bbr_optimizer.sh' && chmod +x bbr_optimizer.sh && bash bbr_optimizer.sh
+```
+### acme_manage install
+```bash
+wget -O acme_manage.sh 'https://raw.githubusercontent.com/z9wen/toolsss/refs/heads/main/acme_manage.sh' && chmod +x acme_manage.sh && acme_manage.sh
+```
+
+
 
 
