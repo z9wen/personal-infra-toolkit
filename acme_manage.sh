@@ -320,6 +320,39 @@ ensure_cloudflare_ready() {
   return 1
 }
 
+is_account_registered() {
+  local server="$1"
+  ensure_acme_installed || return 1
+  
+  # Check if account.conf exists and has account information
+  if [[ ! -f "$ACME_HOME/account.conf" ]]; then
+    return 1
+  fi
+  
+  # Check if there's a registered account for this server
+  local ca_dir="$ACME_HOME/ca"
+  if [[ ! -d "$ca_dir" ]]; then
+    return 1
+  fi
+  
+  # For Google servers, check if account exists in ca directory
+  if is_google_server_value "$server"; then
+    # Check for any Google account directory
+    if find "$ca_dir" -type d -name "*acme-v02.api.pki.goog*" 2>/dev/null | grep -q .; then
+      return 0
+    fi
+  fi
+  
+  # For other servers, check based on server URL/name
+  local server_hash
+  server_hash="$(echo -n "$server" | md5sum 2>/dev/null | awk '{print $1}')" || server_hash="$server"
+  if [[ -d "$ca_dir/$server" ]] || [[ -d "$ca_dir/$server_hash" ]]; then
+    return 0
+  fi
+  
+  return 1
+}
+
 register_google_account() {
   ensure_acme_installed || return 1
   local server_arg="${1:-google}"
@@ -487,7 +520,11 @@ install_flow() {
 
   install_acme "$email" "$provider" "$force"
   if is_google_server_value "$server_arg"; then
-    register_google_account "$server_arg"
+    if ! is_account_registered "$server_arg"; then
+      register_google_account "$server_arg"
+    else
+      info "Google ACME account is already registered."
+    fi
   fi
 }
 
@@ -506,7 +543,14 @@ set_ca_flow() {
   server_arg="$(provider_to_server_arg "$provider")"
   set_default_ca "$provider"
   if is_google_server_value "$server_arg"; then
-    register_google_account "$server_arg"
+    if ! is_account_registered "$server_arg"; then
+      register_google_account "$server_arg"
+    else
+      info "Google ACME account is already registered."
+      if confirm "Re-register Google ACME account with new credentials"; then
+        register_google_account "$server_arg"
+      fi
+    fi
   fi
 }
 
@@ -617,11 +661,15 @@ issue_wildcard_certificate() {
   local ca
   ca="$(current_default_ca)"
   if is_google_server_value "$ca"; then
-    local ca_label
-    ca_label="$(format_ca_display "$ca")"
-    echo "${ca_label:-Google Trust Services} requires Google ACME External Account Binding for wildcard orders."
-    if ! register_google_account "$ca"; then
-      return
+    if ! is_account_registered "$ca"; then
+      local ca_label
+      ca_label="$(format_ca_display "$ca")"
+      echo "${ca_label:-Google Trust Services} requires Google ACME External Account Binding for wildcard orders."
+      if ! register_google_account "$ca"; then
+        return
+      fi
+    else
+      info "Using existing Google ACME account registration."
     fi
   fi
 
