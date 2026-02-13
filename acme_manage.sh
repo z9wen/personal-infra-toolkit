@@ -792,6 +792,114 @@ remove_certificates_flow() {
   fi
 }
 
+renew_certificates_flow() {
+  ensure_acme_installed || return
+
+  echo "Existing certificates managed by acme.sh:"
+  local list_output=""
+  if ! list_output="$("$ACME_HOME/acme.sh" --list 2>&1)"; then
+    err "Unable to list certificates via acme.sh (continuing anyway)."
+  fi
+  if [[ -n "$list_output" ]]; then
+    echo "$list_output"
+  fi
+
+  cat <<'EOF' >&2
+
+Renewal options:
+  1) Renew all certificates
+  2) Renew specific certificate(s)
+EOF
+  local choice
+  read -rp "Renewal selection [1]: " choice
+  case "${choice:-1}" in
+    1)
+      if confirm "Renew all certificates"; then
+        info "Renewing all certificates..."
+        if "$ACME_HOME/acme.sh" --renew-all; then
+          info "All certificates renewed successfully."
+        else
+          err "Some certificates may have failed to renew. Check the output above."
+        fi
+      else
+        echo "Renewal canceled."
+      fi
+      ;;
+    2)
+      local domain_input
+      read -rp "Enter the primary domain(s) to renew (space-separated): " domain_input
+      read -ra domain_array <<<"$domain_input"
+      local domains=()
+      local domain
+      for domain in "${domain_array[@]}"; do
+        if [[ -n "$domain" ]]; then
+          domains+=("${domain,,}")
+        fi
+      done
+
+      if ((${#domains[@]} == 0)); then
+        err "At least one domain must be provided."
+        return
+      fi
+
+      local key_choice
+      key_choice="$(prompt_certificate_key_type)"
+      local variants=()
+      case "$key_choice" in
+        ecc)
+          variants=(ecc)
+          ;;
+        both)
+          variants=(rsa ecc)
+          ;;
+        *)
+          variants=(rsa)
+          ;;
+      esac
+
+      echo "Selected domain(s): ${domains[*]}"
+      if ! confirm "Renew the selected certificate(s)"; then
+        echo "Renewal canceled."
+        return
+      fi
+
+      local failures=0
+      for domain in "${domains[@]}"; do
+        for variant in "${variants[@]}"; do
+          local human_label="RSA"
+          if [[ "$variant" == "ecc" ]]; then
+            human_label="ECC"
+          fi
+          if ! certificate_variant_exists "$domain" "$variant" "$list_output"; then
+            info "No $human_label certificate found for $domain; skipping."
+            continue
+          fi
+          local cmd=( "$ACME_HOME/acme.sh" --renew -d "$domain" )
+          if [[ "$variant" == "ecc" ]]; then
+            cmd+=(--ecc)
+          fi
+          info "Renewing $human_label certificate for $domain"
+          if ! "${cmd[@]}"; then
+            err "Failed to renew $human_label certificate for $domain"
+            ((failures++))
+          else
+            info "$human_label certificate for $domain renewed successfully."
+          fi
+        done
+      done
+
+      if ((failures > 0)); then
+        err "$failures renewal operation(s) failed. Review the log above for details."
+      else
+        info "Requested certificate(s) renewed successfully."
+      fi
+      ;;
+    *)
+      echo "Unknown selection. Canceling."
+      ;;
+  esac
+}
+
 main_menu() {
   cat <<'EOF'
 -------------------------------
@@ -806,7 +914,8 @@ main_menu() {
  7) Install or reinstall acme.sh
  8) Uninstall acme.sh
  9) Remove certificate(s)
-10) Exit
+10) Renew certificate(s)
+11) Exit
 EOF
 }
 
@@ -814,7 +923,7 @@ main() {
   while true; do
     main_menu
     local choice
-    read -rp "Choose an option [1-10]: " choice
+    read -rp "Choose an option [1-11]: " choice
     case "$choice" in
       1|"")
         issue_single_domain_certificate
@@ -844,6 +953,9 @@ main() {
         remove_certificates_flow
         ;;
       10)
+        renew_certificates_flow
+        ;;
+      11)
         echo "Bye."
         return
         ;;
