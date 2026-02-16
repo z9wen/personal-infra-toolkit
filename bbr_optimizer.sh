@@ -462,8 +462,8 @@ apply_config() {
     echo "Queue Discipline: $(sysctl -n net.core.default_qdisc)"
     echo "Congestion Control: $(sysctl -n net.ipv4.tcp_congestion_control)"
     echo "tcp_notsent_lowat: $(sysctl -n net.ipv4.tcp_notsent_lowat) bytes"
-    echo "Max Recv Buffer: $(sysctl -n net.core.rmem_max) bytes ($(echo "scale=2; $(sysctl -n net.core.rmem_max)/1024/1024" | bc) MB)"
-    echo "Max Send Buffer: $(sysctl -n net.core.wmem_max) bytes ($(echo "scale=2; $(sysctl -n net.core.wmem_max)/1024/1024" | bc) MB)"
+    echo "Max Recv Buffer: $(sysctl -n net.core.rmem_max) bytes ($(awk "BEGIN {printf \"%.2f\", $(sysctl -n net.core.rmem_max)/1024/1024}") MB)"
+    echo "Max Send Buffer: $(sysctl -n net.core.wmem_max) bytes ($(awk "BEGIN {printf \"%.2f\", $(sysctl -n net.core.wmem_max)/1024/1024}") MB)"
     
     icmp_status=$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null || echo "0")
     if [ "$icmp_status" = "1" ]; then
