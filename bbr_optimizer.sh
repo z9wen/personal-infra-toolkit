@@ -57,8 +57,12 @@ check_kernel() {
 # Backup current configuration
 backup_config() {
     backup_file="/etc/sysctl.conf.backup.$(date +%Y%m%d_%H%M%S)"
-    cp /etc/sysctl.conf "$backup_file"
-    print_success "Configuration backed up to: $backup_file"
+    if [ -f /etc/sysctl.conf ]; then
+        cp /etc/sysctl.conf "$backup_file"
+        print_success "Configuration backed up to: $backup_file"
+    else
+        print_info "No existing /etc/sysctl.conf found, skipping backup"
+    fi
 }
 
 # Display menu
@@ -434,6 +438,12 @@ apply_config() {
     
     # Backup
     backup_config
+    
+    # Create /etc/sysctl.conf if it doesn't exist
+    if [ ! -f /etc/sysctl.conf ]; then
+        touch /etc/sysctl.conf
+        print_info "Created new /etc/sysctl.conf"
+    fi
     
     # Remove old BBR configuration (if exists)
     sed -i '/# ==================== BBR/,/fs.inotify.max_user_instances/d' /etc/sysctl.conf
