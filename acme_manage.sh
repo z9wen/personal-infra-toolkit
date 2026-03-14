@@ -323,33 +323,50 @@ ensure_cloudflare_ready() {
 is_account_registered() {
   local server="$1"
   ensure_acme_installed || return 1
-  
-  # Check if account.conf exists and has account information
-  if [[ ! -f "$ACME_HOME/account.conf" ]]; then
-    return 1
-  fi
-  
-  # Check if there's a registered account for this server
+
   local ca_dir="$ACME_HOME/ca"
   if [[ ! -d "$ca_dir" ]]; then
     return 1
   fi
-  
-  # For Google servers, check if account exists in ca directory
+
+  # For Google servers, match by hostname fragment
   if is_google_server_value "$server"; then
-    # Check for any Google account directory
     if find "$ca_dir" -type d -name "*acme-v02.api.pki.goog*" 2>/dev/null | grep -q .; then
       return 0
     fi
+    return 1
   fi
-  
-  # For other servers, check based on server URL/name
-  local server_hash
-  server_hash="$(echo -n "$server" | md5sum 2>/dev/null | awk '{print $1}')" || server_hash="$server"
-  if [[ -d "$ca_dir/$server" ]] || [[ -d "$ca_dir/$server_hash" ]]; then
+
+  # Map known short names to their CA hostnames (matching acme.sh's directory layout)
+  local ca_host=""
+  local lower="${server,,}"
+  case "$lower" in
+    letsencrypt|lets)
+      ca_host="acme-v02.api.letsencrypt.org"
+      ;;
+    zerossl|zero-ssl|zero)
+      ca_host="acme.zerossl.com"
+      ;;
+    buypass|bp)
+      ca_host="api.buypass.com"
+      ;;
+    sslcom|sslcom-ca)
+      ca_host="acme.ssl.com"
+      ;;
+    http*://*)
+      # Strip scheme, strip query string — keep host+path
+      ca_host="${server#*://}"
+      ca_host="${ca_host%%\?*}"
+      ;;
+    *)
+      ca_host="$server"
+      ;;
+  esac
+
+  if [[ -n "$ca_host" ]] && find "$ca_dir" -type d -path "*${ca_host}*" 2>/dev/null | grep -q .; then
     return 0
   fi
-  
+
   return 1
 }
 
@@ -494,7 +511,9 @@ run_acme_issue_command() {
         return 0
       fi
     else
-      info "Force reissue skipped."
+      info "Force reissue skipped by user."
+      rm -f "$tmp"
+      return 2
     fi
   fi
 
@@ -637,8 +656,12 @@ EOF
     cmd+=(--dns dns_cf)
   fi
 
-  if ! run_acme_issue_command "$domain" "${cmd[@]}"; then
+  local issue_rc=0
+  run_acme_issue_command "$domain" "${cmd[@]}" || issue_rc=$?
+  if [[ $issue_rc -eq 1 ]]; then
     err "Certificate issuance failed."
+    return
+  elif [[ $issue_rc -ne 0 ]]; then
     return
   fi
 
@@ -674,8 +697,12 @@ issue_wildcard_certificate() {
   fi
 
   local cmd=( "$ACME_HOME/acme.sh" --issue -d "$domain" -d "*.$domain" --dns dns_cf )
-  if ! run_acme_issue_command "$domain" "${cmd[@]}"; then
+  local issue_rc=0
+  run_acme_issue_command "$domain" "${cmd[@]}" || issue_rc=$?
+  if [[ $issue_rc -eq 1 ]]; then
     err "Wildcard certificate issuance failed."
+    return
+  elif [[ $issue_rc -ne 0 ]]; then
     return
   fi
 
@@ -696,6 +723,7 @@ remove_certificates_flow() {
 
   local domain_input
   read -rp "Enter the primary domain(s) to remove (space-separated): " domain_input
+  local -a domain_array
   read -ra domain_array <<<"$domain_input"
   local domains=()
   local domain
@@ -760,7 +788,7 @@ remove_certificates_flow() {
           info "$human_label certificate for $domain was already removed."
         else
           err "Failed to remove $human_label certificate for $domain"
-          ((failures++))
+          failures=$((failures + 1))
         fi
       else
         echo "$cmd_output"
@@ -828,6 +856,7 @@ EOF
     2)
       local domain_input
       read -rp "Enter the primary domain(s) to renew (space-separated): " domain_input
+      local -a domain_array
       read -ra domain_array <<<"$domain_input"
       local domains=()
       local domain
@@ -881,7 +910,7 @@ EOF
           info "Renewing $human_label certificate for $domain"
           if ! "${cmd[@]}"; then
             err "Failed to renew $human_label certificate for $domain"
-            ((failures++))
+            failures=$((failures + 1))
           else
             info "$human_label certificate for $domain renewed successfully."
           fi
@@ -925,8 +954,11 @@ main() {
     local choice
     read -rp "Choose an option [1-11]: " choice
     case "$choice" in
-      1|"")
+      1)
         issue_single_domain_certificate
+        ;;
+      "")
+        echo "Please enter a valid option [1-11]."
         ;;
       2)
         issue_wildcard_certificate
