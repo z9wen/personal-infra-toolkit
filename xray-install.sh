@@ -882,10 +882,6 @@ showInstallStatus() {
         fi
 
         if echo ${currentInstallProtocolType} | grep -q ",2,"; then
-            echoContent yellow "Trojan+gRPC[TLS] \c"
-        fi
-
-        if echo ${currentInstallProtocolType} | grep -q ",2,"; then
             echoContent yellow "VLESS+gRPC[TLS] \c"
         fi
         if echo ${currentInstallProtocolType} | grep -q ",6,"; then
@@ -1499,7 +1495,11 @@ updateRedirectNginxConf() {
 
     local nginxH2Conf=
     nginxH2Conf="listen 127.0.0.1:31302 http2 so_keepalive=on proxy_protocol;"
-    nginxVersion=$(nginx -v 2>&1)
+    local nginxBin="nginx"
+    if [[ -f "/www/server/nginx/sbin/nginx" ]]; then
+        nginxBin="/www/server/nginx/sbin/nginx"
+    fi
+    nginxVersion=$("${nginxBin}" -v 2>&1)
 
     if echo "${nginxVersion}" | grep -q "1.25" && [[ $(echo "${nginxVersion}" | awk -F "[.]" '{print $3}') -gt 0 ]] || [[ $(echo "${nginxVersion}" | awk -F "[.]" '{print $2}') -gt 25 ]]; then
         nginxH2Conf="listen 127.0.0.1:31302 so_keepalive=on proxy_protocol;http2 on;"
@@ -1513,7 +1513,7 @@ updateRedirectNginxConf() {
     }
 EOF
 
-    if echo "${selectCustomInstallType}" | grep -qE ",2,|,2," || [[ -z "${selectCustomInstallType}" ]]; then
+    if echo "${selectCustomInstallType}" | grep -q ",2," || [[ -z "${selectCustomInstallType}" ]]; then
 
         cat <<EOF >>${nginxConfigPath}xray-agent.conf
 server {
@@ -1535,69 +1535,6 @@ server {
 		grpc_set_header X-Real-IP \$proxy_add_x_forwarded_for;
 		client_body_timeout 1071906480m;
 		grpc_read_timeout 1071906480m;
-		grpc_pass grpc://127.0.0.1:31301;
-	}
-
-	location /${currentPath}trojangrpc {
-		if (\$content_type !~ "application/grpc") {
-            		return 404;
-		}
- 		client_max_body_size 0;
-		grpc_set_header X-Real-IP \$proxy_add_x_forwarded_for;
-		client_body_timeout 1071906480m;
-		grpc_read_timeout 1071906480m;
-		grpc_pass grpc://127.0.0.1:31304;
-	}
-	location / {
-    }
-}
-EOF
-    elif echo "${selectCustomInstallType}" | grep -q ",2," || [[ -z "${selectCustomInstallType}" ]]; then
-        cat <<EOF >>${nginxConfigPath}xray-agent.conf
-server {
-	${nginxH2Conf}
-
-	set_real_ip_from 127.0.0.1;
-    real_ip_header proxy_protocol;
-
-	server_name ${domain};
-	root ${nginxStaticPath};
-
-	location /${currentPath} {
-		client_max_body_size 0;
-		keepalive_requests 4294967296;
-		client_body_timeout 1071906480m;
- 		send_timeout 1071906480m;
- 		lingering_close always;
- 		grpc_read_timeout 1071906480m;
- 		grpc_send_timeout 1071906480m;
-		grpc_pass grpc://127.0.0.1:31301;
-	}
-	location / {
-    }
-}
-EOF
-
-    elif echo "${selectCustomInstallType}" | grep -q ",2," || [[ -z "${selectCustomInstallType}" ]]; then
-        cat <<EOF >>${nginxConfigPath}xray-agent.conf
-server {
-	${nginxH2Conf}
-
-	set_real_ip_from 127.0.0.1;
-    real_ip_header proxy_protocol;
-
-    server_name ${domain};
-	root ${nginxStaticPath};
-
-	location /${currentPath}trojangrpc {
-		client_max_body_size 0;
-		# keepalive_time 1071906480m;
-		keepalive_requests 4294967296;
-		client_body_timeout 1071906480m;
- 		send_timeout 1071906480m;
- 		lingering_close always;
- 		grpc_read_timeout 1071906480m;
- 		grpc_send_timeout 1071906480m;
 		grpc_pass grpc://127.0.0.1:31301;
 	}
 	location / {
@@ -2131,6 +2068,18 @@ handleNginx() {
     
     # 启动 Nginx
     if ! echo "${selectCustomInstallType}" | grep -qwE ",3,|,8,|,3,8," && [[ -z $(pgrep -f "nginx") ]] && [[ "$1" == "start" ]]; then
+        # 验证配置语法
+        local nginxTestResult=
+        if [[ "${nginxCtl}" == "/www/server/nginx/sbin/nginx" ]]; then
+            nginxTestResult=$(/www/server/nginx/sbin/nginx -t -c /www/server/nginx/conf/nginx.conf 2>&1)
+        else
+            nginxTestResult=$(nginx -t 2>&1)
+        fi
+        if ! echo "${nginxTestResult}" | grep -q "successful"; then
+            echoContent red " ---> Nginx配置验证失败，请检查配置"
+            echo "${nginxTestResult}" | tee /opt/xray-agent/nginx_error.log
+            return 1
+        fi
         if [[ "${nginxCtl}" == "systemctl" ]]; then
             systemctl start nginx 2>/opt/xray-agent/nginx_error.log
         elif [[ "${nginxCtl}" == "/etc/init.d/nginx" ]]; then
@@ -2597,25 +2546,6 @@ initXrayClients() {
             currentUser="{\"id\":\"${uuid}\",\"email\":\"${email}-VLESS_XHTTP\"}"
             users=$(echo "${users}" | jq -r ". +=[${currentUser}]")
         fi
-        # trojan grpc
-        if echo "${type}" | grep -q ",11,"; then
-            currentUser="{\"password\":\"${uuid}\",\"email\":\"${email}-Trojan_gRPC\"}"
-            users=$(echo "${users}" | jq -r ". +=[${currentUser}]")
-        fi
-        # VMess WS
-        if echo "${type}" | grep -q ",9,"; then
-            currentUser="{\"id\":\"${uuid}\",\"email\":\"${email}-VMess_WS\",\"alterId\": 0}"
-
-            users=$(echo "${users}" | jq -r ". +=[${currentUser}]")
-        fi
-
-        # trojan tcp
-        if echo "${type}" | grep -q ",10,"; then
-            currentUser="{\"password\":\"${uuid}\",\"email\":\"${email}-trojan_tcp\"}"
-
-            users=$(echo "${users}" | jq -r ". +=[${currentUser}]")
-        fi
-
         # vless grpc
         if echo "${type}" | grep -q ",2,"; then
             currentUser="{\"id\":\"${uuid}\",\"email\":\"${email}-vless_grpc\"}"
@@ -2632,7 +2562,7 @@ initXrayClients() {
 
         # vless reality grpc
         if echo "${type}" | grep -q ",8,"; then
-            currentUser="{\"id\":\"${uuid}\",\"email\":\"${email}-vless_reality_grpc\",\"flow\":\"\"}"
+            currentUser="{\"id\":\"${uuid}\",\"email\":\"${email}-vless_reality_grpc\"}"
 
             users=$(echo "${users}" | jq -r ". +=[${currentUser}]")
         fi
@@ -3437,7 +3367,7 @@ showAccounts() {
     fi
     # VLESS XHTTP
     if echo ${currentInstallProtocolType} | grep -q ",4,"; then
-        echoContent skyBlue "\n================================ VLESS XHTTP TLS [仅CDN推荐] ================================\n"
+        echoContent skyBlue "\n================================ VLESS XHTTP Reality [推荐] ================================\n"
 
         jq -c '.inbounds[0].settings.clients//.inbounds[0].users//[] | .[]' ${configPath}12_VLESS_XHTTP_inbounds.json | while read -r user; do
             local email=
@@ -3583,8 +3513,28 @@ EOF
         cat <<EOF >>"/opt/xray-agent/subscribe_local/default/${user}"
 vless://${id}@$(getPublicIP):${port}?encryption=none&security=reality&type=xhttp&sni=${xrayVLESSRealityXHTTPServerName}&fp=chrome&path=${path}&pbk=${currentRealityXHTTPPublicKey}&sid=6ba85179e30d4fc2#${email}
 EOF
+        cat <<EOF >>"/opt/xray-agent/subscribe_local/clashMeta/${user}"
+  - name: "${email}"
+    type: vless
+    server: $(getPublicIP)
+    port: ${port}
+    uuid: ${id}
+    udp: true
+    tls: true
+    reality-opts:
+      public-key: ${currentRealityXHTTPPublicKey}
+      short-id: 6ba85179e30d4fc2
+    network: xhttp
+    xhttp-opts:
+      path: ${path}
+      host: ${xrayVLESSRealityXHTTPServerName}
+    servername: ${xrayVLESSRealityXHTTPServerName}
+    client-fingerprint: chrome
+EOF
+        singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\":\"vless\",\"server\":\"$(getPublicIP)\",\"server_port\":${port},\"uuid\":\"${id}\",\"tls\":{\"enabled\":true,\"server_name\":\"${xrayVLESSRealityXHTTPServerName}\",\"utls\":{\"enabled\":true,\"fingerprint\":\"chrome\"},\"reality\":{\"enabled\":true,\"public_key\":\"${currentRealityXHTTPPublicKey}\",\"short_id\":\"6ba85179e30d4fc2\"}},\"transport\":{\"type\":\"xhttp\",\"path\":\"${path}\"},\"packet_encoding\":\"xudp\"}]" "/opt/xray-agent/subscribe_local/sing-box/${user}")
+        echo "${singBoxSubscribeLocalConfig}" | jq . >"/opt/xray-agent/subscribe_local/sing-box/${user}"
         echoContent yellow " ---> 二维码 VLESS(VLESS+reality+XHTTP)"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40$(getPublicIP)%3A${port}%3Fencryption%3Dnone%26security%3Dreality%26type%3Dtcp%26sni%3D${xrayVLESSRealityXHTTPServerName}%26fp%3Dchrome%26path%3D${path}%26host%3D${xrayVLESSRealityXHTTPServerName}%26pbk%3D${currentRealityXHTTPPublicKey}%26sid%3D6ba85179e30d4fc2%23${email}\n"
+        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40$(getPublicIP)%3A${port}%3Fencryption%3Dnone%26security%3Dreality%26type%3Dxhttp%26sni%3D${xrayVLESSRealityXHTTPServerName}%26fp%3Dchrome%26path%3D${path}%26host%3D${xrayVLESSRealityXHTTPServerName}%26pbk%3D${currentRealityXHTTPPublicKey}%26sid%3D6ba85179e30d4fc2%23${email}\n"
 
     elif
         [[ "${type}" == "vlessgrpc" ]]
@@ -4397,30 +4347,6 @@ addUser() {
             echo "${clients}" | jq . >${configPath}03_VLESS_WS_inbounds.json
         fi
 
-        # trojan grpc
-        if echo "${currentInstallProtocolType}" | grep -q ",2,"; then
-            local clients=
-            clients=$(initXrayClients 2 "${uuid}" "${email}")
-            clients=$(jq -r "${userConfig} = ${clients}" ${configPath}04_trojan_gRPC_inbounds.json)
-            echo "${clients}" | jq . >${configPath}04_trojan_gRPC_inbounds.json
-        fi
-
-        # VMess WS
-        if echo "${currentInstallProtocolType}" | grep -q ",2,"; then
-            local clients=
-            clients=$(initXrayClients 3 "${uuid}" "${email}")
-            clients=$(jq -r "${userConfig} = ${clients}" ${configPath}05_VMess_WS_inbounds.json)
-            echo "${clients}" | jq . >${configPath}05_VMess_WS_inbounds.json
-        fi
-
-        # trojan tcp
-        if echo "${currentInstallProtocolType}" | grep -q ",4,"; then
-            local clients=
-            clients=$(initXrayClients 4 "${uuid}" "${email}")
-            clients=$(jq -r "${userConfig} = ${clients}" ${configPath}04_trojan_TCP_inbounds.json)
-            echo "${clients}" | jq . >${configPath}04_trojan_TCP_inbounds.json
-        fi
-
         # vless grpc
         if echo "${currentInstallProtocolType}" | grep -q ",2,"; then
             local clients=
@@ -4443,6 +4369,14 @@ addUser() {
             clients=$(initXrayClients 8 "${uuid}" "${email}")
             clients=$(jq -r "${userConfig} = ${clients}" ${configPath}08_VLESS_vision_gRPC_inbounds.json)
             echo "${clients}" | jq . >${configPath}08_VLESS_vision_gRPC_inbounds.json
+        fi
+
+        # vless xhttp
+        if echo "${currentInstallProtocolType}" | grep -q ",4,"; then
+            local clients=
+            clients=$(initXrayClients 4 "${uuid}" "${email}")
+            clients=$(jq -r "${userConfig} = ${clients}" ${configPath}12_VLESS_XHTTP_inbounds.json)
+            echo "${clients}" | jq . >${configPath}12_VLESS_XHTTP_inbounds.json
         fi
 
     done
@@ -4490,11 +4424,12 @@ removeUser() {
             echo "${vlessWSResult}" | jq . >${configPath}03_VLESS_WS_inbounds.json
         fi
 
-        if echo ${currentInstallProtocolType} | grep -q ",2,"; then
-            local trojangRPCUsers
-            trojangRPCUsers=$(jq -r 'del(.inbounds[0].settings.clients['${delUserIndex}'])' ${configPath}04_trojan_gRPC_inbounds.json)
-            echo "${trojangRPCUsers}" | jq . >${configPath}04_trojan_gRPC_inbounds.json
+        if echo ${currentInstallProtocolType} | grep -q ",4,"; then
+            local vlessXHTTPResult
+            vlessXHTTPResult=$(jq -r 'del(.inbounds[0].settings.clients['${delUserIndex}'])' ${configPath}12_VLESS_XHTTP_inbounds.json)
+            echo "${vlessXHTTPResult}" | jq . >${configPath}12_VLESS_XHTTP_inbounds.json
         fi
+
     fi
     manageAccount 1
 }
@@ -5175,8 +5110,7 @@ setupRelay() {
         "network": "tcp",
         "security": "tls",
         "tlsSettings": {
-          "serverName": "${relaySNI}",
-          "allowInsecure": false
+          "serverName": "${relaySNI}"
         }
       }
     }
@@ -5530,7 +5464,7 @@ customXrayInstall() {
 
         handleNginx stop
         # 随机path
-        if echo "${selectCustomInstallType}" | grep -qE ",1,|,2,|,2,|,4,"; then
+        if echo "${selectCustomInstallType}" | grep -qE ",1,|,2,|,4,"; then
             randomPathFunction 4
         fi
         if [[ -n "${btDomain}" ]]; then
@@ -5684,7 +5618,11 @@ installSubscribe() {
     local listenIPv6=
     if [[ -z "${subscribePort}" ]]; then
 
-        nginxVersion=$(nginx -v 2>&1)
+        local nginxBin="nginx"
+        if [[ -f "/www/server/nginx/sbin/nginx" ]]; then
+            nginxBin="/www/server/nginx/sbin/nginx"
+        fi
+        nginxVersion=$("${nginxBin}" -v 2>&1)
 
         if echo "${nginxVersion}" | grep -q "not found" || [[ -z "${nginxVersion}" ]]; then
             echoContent yellow "未检测到nginx，无法使用订阅服务\n"
@@ -5712,7 +5650,7 @@ installSubscribe() {
         echo
         local httpSubscribeStatus=
 
-        if ! echo "${selectCustomInstallType}" | grep -qE ",0,|,1,|,2,|,2,|,3,|,4," && ! echo "${currentInstallProtocolType}" | grep -qE ",0,|,1,|,2,|,2,|,3,|,4," && [[ -z "${domain}" ]]; then
+        if ! echo "${selectCustomInstallType}" | grep -qE ",0,|,1,|,2,|,3,|,4," && ! echo "${currentInstallProtocolType}" | grep -qE ",0,|,1,|,2,|,3,|,4," && [[ -z "${domain}" ]]; then
             httpSubscribeStatus=true
         fi
 
@@ -6807,9 +6745,6 @@ menu() {
     2)
         selectCoreInstall
         ;;
-        #    3)
-        #        initXrayFrontingConfig 1
-        #        ;;
     3)
         manageReality 1
         ;;
