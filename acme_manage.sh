@@ -11,7 +11,7 @@ set -euo pipefail
 ACME_HOME="${ACME_HOME:-$HOME/.acme.sh}"
 INSTALLER_URL="https://get.acme.sh"
 DEFAULT_PROVIDER="letsencrypt"
-ACME_ENV_FILE="${ACME_ENV_FILE:-/etc/acme.sh.env}"
+ACME_ENV_FILE="${ACME_ENV_FILE:-/etc/acme-manager/credentials}"
 APT_UPDATED=0
 
 GTS_DIRECTORY_DEFAULT="https://dv.acme-v02.api.pki.goog/directory"
@@ -275,6 +275,7 @@ load_env_file() {
 }
 
 write_env_file() {
+  mkdir -p "$(dirname "$ACME_ENV_FILE")"
   local tmp
   tmp="$(mktemp)"
   {
