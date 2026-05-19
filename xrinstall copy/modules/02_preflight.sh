@@ -4,29 +4,63 @@
 checkBTPanel() {
     if [[ -n $(pgrep -f "BT-Panel") ]]; then
         # 读取域名
-        if [[ -d '/www/server/panel/vhost/cert/' && -n $(find /www/server/panel/vhost/cert/*/fullchain.pem) ]]; then
+        if [[ -d '/www/server/panel/vhost/nginx/' ]] && [[ -n $(find /www/server/panel/vhost/nginx -maxdepth 1 -name "*.conf" ! -name "xray-agent.conf" ! -name "phpmyadmin.conf") ]]; then
+            local -a btDomains=()
+            mapfile -t btDomains < <(find /www/server/panel/vhost/nginx -maxdepth 1 -name "*.conf" ! -name "xray-agent.conf" ! -name "phpmyadmin.conf" -printf "%f\n" 2>/dev/null | sed 's/\.conf$//' | sort)
+            local btDomainCount=${#btDomains[@]}
+            if ((btDomainCount == 0)); then
+                return
+            fi
+
             if [[ -z "${currentHost}" ]]; then
                 echoContent skyBlue "\n读取宝塔配置\n"
 
-                find /www/server/panel/vhost/cert/*/fullchain.pem | awk -F "[/]" '{print $7}' | awk '{print NR""":"$0}'
+                local displayIndex
+                for ((displayIndex = 0; displayIndex < btDomainCount; displayIndex++)); do
+                    local printIndex=$((displayIndex + 1))
+                    echo "${printIndex}:${btDomains[displayIndex]}"
+                done
 
                 read -r -p "请输入编号选择:" selectBTDomain
             else
-                selectBTDomain=$(find /www/server/panel/vhost/cert/*/fullchain.pem | awk -F "[/]" '{print $7}' | awk '{print NR""":"$0}' | grep "${currentHost}" | cut -d ":" -f 1)
+                local displayIndex
+                for ((displayIndex = 0; displayIndex < btDomainCount; displayIndex++)); do
+                    if [[ "${btDomains[displayIndex]}" == "${currentHost}" ]]; then
+                        selectBTDomain=$((displayIndex + 1))
+                        break
+                    fi
+                done
             fi
 
-            if [[ -n "${selectBTDomain}" ]]; then
-                btDomain=$(find /www/server/panel/vhost/cert/*/fullchain.pem | awk -F "[/]" '{print $7}' | awk '{print NR""":"$0}' | grep -e "^${selectBTDomain}:" | cut -d ":" -f 2)
-
-                if [[ -z "${btDomain}" ]]; then
+            if [[ -n "${selectBTDomain}" && "${selectBTDomain}" =~ ^[0-9]+$ ]]; then
+                local selectedIndex=$((selectBTDomain - 1))
+                if ((selectedIndex < 0 || selectedIndex >= btDomainCount)); then
                     echoContent red " ---> 选择错误，请重新选择"
                     checkBTPanel
                 else
+                    btDomain=${btDomains[selectedIndex]}
                     domain=${btDomain}
-                    if [[ ! -f "/opt/xray-agent/tls/${btDomain}.crt" && ! -f "/opt/xray-agent/tls/${btDomain}.key" ]]; then
-                        ln -s "/www/server/panel/vhost/cert/${btDomain}/fullchain.pem" "/opt/xray-agent/tls/${btDomain}.crt"
-                        ln -s "/www/server/panel/vhost/cert/${btDomain}/privkey.pem" "/opt/xray-agent/tls/${btDomain}.key"
+                    local btConfFile="/www/server/panel/vhost/nginx/${btDomain}.conf"
+                    local certFile=
+                    local keyFile=
+                    certFile=$(awk '$1 == "ssl_certificate" {gsub(/;/, "", $2); print $2; exit}' "${btConfFile}" 2>/dev/null)
+                    keyFile=$(awk '$1 == "ssl_certificate_key" {gsub(/;/, "", $2); print $2; exit}' "${btConfFile}" 2>/dev/null)
+
+                    if [[ -z "${certFile}" ]]; then
+                        certFile="/www/server/panel/vhost/cert/${btDomain}/fullchain.pem"
                     fi
+                    if [[ -z "${keyFile}" ]]; then
+                        keyFile="/www/server/panel/vhost/cert/${btDomain}/privkey.pem"
+                    fi
+
+                    if [[ ! -f "${certFile}" || ! -f "${keyFile}" ]]; then
+                        echoContent red " ---> 未找到宝塔证书文件，请先检查站点SSL配置"
+                        return
+                    fi
+
+                    mkdir -p /opt/xray-agent/tls
+                    ln -sfn "${certFile}" "/opt/xray-agent/tls/${btDomain}.crt"
+                    ln -sfn "${keyFile}" "/opt/xray-agent/tls/${btDomain}.key"
 
                     nginxStaticPath="/www/wwwroot/${btDomain}/html/"
 
