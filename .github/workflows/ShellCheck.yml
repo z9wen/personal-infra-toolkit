@@ -1,14 +1,29 @@
-name: ShellCheck
+name: Shell Validation
 
-on: [push, pull_request]
+on:
+  push:
+    paths:
+      - "**/*.sh"
+      - "Makefile"
+      - ".github/workflows/ShellCheck.yml"
+  pull_request:
+    paths:
+      - "**/*.sh"
+      - "Makefile"
+      - ".github/workflows/ShellCheck.yml"
 
 jobs:
-  shellcheck:
+  shell-validation:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Run Bash syntax checks
+        run: make syntax
+
       - name: Run ShellCheck
-        uses: ludeeus/action-shellcheck@master
-        with:
-          scandir: './scripts'
+        run: make lint
