@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Local environment files
+.env
+.env.local
+acme/.env
+
+# Runtime data
+acme/data/
+fail2ban/data/
+nginx/certs/
+nginx/html/
+nginx/logs/
+backups/
+docs/
+
+# Logs
+*.log
