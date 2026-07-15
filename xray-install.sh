@@ -242,6 +242,10 @@ initVar() {
     # hysteria端口
     hysteriaPort=
 
+    # Xray-core Hysteria2 UDP端口
+    hysteria2Port=
+    hysteria2MasqueradeConfig=
+
     # hysteria协议
     #    hysteriaProtocol=
 
@@ -282,6 +286,13 @@ initVar() {
     nativeACMEEnabled=
     nativeCertPath=
     nativeKeyPath=
+
+    # 由 acme.sh/acme_manage.sh 管理的现有证书
+    acmeManagedCertSelected=
+    acmeManagedHome=
+    acmeManagedSourceDomain=
+    acmeManagedServiceDomain=
+    acmeManagedEcc=
 
 }
 
@@ -340,7 +351,7 @@ readInstallType() {
     if [[ -d "/opt/xray-agent" ]]; then
         if [[ -f "/opt/xray-agent/xray/xray" ]]; then
             # 检测xray-core
-            if [[ -d "/opt/xray-agent/xray/conf" ]] && [[ -f "/opt/xray-agent/xray/conf/02_VLESS_TCP_inbounds.json" || -f "/opt/xray-agent/xray/conf/07_VLESS_vision_reality_inbounds.json" ]]; then
+            if [[ -d "/opt/xray-agent/xray/conf" ]] && [[ -f "/opt/xray-agent/xray/conf/02_VLESS_TCP_inbounds.json" || -f "/opt/xray-agent/xray/conf/05_hysteria2_inbounds.json" || -f "/opt/xray-agent/xray/conf/07_VLESS_vision_reality_inbounds.json" ]]; then
                 # xray-core
                 configPath=/opt/xray-agent/xray/conf/
                 ctlPath=/opt/xray-agent/xray/xray
@@ -363,6 +374,8 @@ readInstallProtocolType() {
 
     xrayVLESSRealityXHTTPort=
     xrayVLESSRealityXHTTPServerName=
+
+    hysteria2Port=
 
     currentRealityXHTTPPublicKey=
 
@@ -398,6 +411,7 @@ readInstallProtocolType() {
         fi
         if echo "${row}" | grep -q hysteria2_inbounds; then
             currentInstallProtocolType="${currentInstallProtocolType}6,"
+            hysteria2Port=$(jq -r .inbounds[0].port "${row}.json")
         fi
         if echo "${row}" | grep -q VLESS_vision_reality_inbounds; then
             currentInstallProtocolType="${currentInstallProtocolType}3,"
@@ -839,6 +853,18 @@ readConfigHostPathUUID() {
             xrayVLESSRealityVisionPort=$(jq -r .inbounds[0].port ${configPath}07_VLESS_vision_reality_inbounds.json)
             if [[ "${currentPort}" == "${xrayVLESSRealityVisionPort}" ]]; then
                 xrayVLESSRealityVisionPort="${currentDefaultPort}"
+            fi
+        fi
+
+        # Hysteria2-only installations do not have a VLESS fronting config.
+        if [[ -f "${configPath}05_hysteria2_inbounds.json" ]]; then
+            hysteria2Port=$(jq -r '.inbounds[0].port' "${configPath}05_hysteria2_inbounds.json")
+            if [[ -z "${currentHost}" || "${currentHost}" == "null" ]]; then
+                currentHost=$(jq -r '.inbounds[0].streamSettings.tlsSettings.certificates[0].certificateFile' "${configPath}05_hysteria2_inbounds.json" | awk -F '[t][l][s][/]' '{print $2}' | awk -F '[.][c][r][t]' '{print $1}')
+            fi
+            if [[ -z "${currentClients}" || "${currentClients}" == "null" || "${currentClients}" == "[]" ]]; then
+                currentClients=$(jq -c '[.inbounds[0].settings.users[] | {id: .auth, email: .email}]' "${configPath}05_hysteria2_inbounds.json")
+                currentUUID=$(echo "${currentClients}" | jq -r '.[0].id // empty')
             fi
         fi
     fi
@@ -1467,16 +1493,20 @@ initTLSNginxConfig() {
             domain=${currentHost}
             echoContent yellow "\n ---> 域名: ${domain}"
         else
-            echo
-            echoContent yellow "请输入要配置的域名 例: example.com --->"
-            read -r -p "域名:" domain
+            if ! selectLocalAcmeCertificate; then
+                echo
+                echoContent yellow "请输入要配置的域名 例: example.com --->"
+                read -r -p "域名:" domain
+            fi
         fi
     elif [[ -n "${currentHost}" && -n "${lastInstallationConfig}" ]]; then
         domain=${currentHost}
     else
-        echo
-        echoContent yellow "请输入要配置的域名 例: example.com --->"
-        read -r -p "域名:" domain
+        if ! selectLocalAcmeCertificate; then
+            echo
+            echoContent yellow "请输入要配置的域名 例: example.com --->"
+            read -r -p "域名:" domain
+        fi
     fi
 
     if [[ -z ${domain} ]]; then
@@ -1668,26 +1698,143 @@ customSSLEmail() {
 
 }
 
-# 列出本地 acme.sh 已有证书
-listLocalAcmeCertificates() {
-    if [[ ! -d "$HOME/.acme.sh" ]]; then
+# 查找 acme_manage.sh 默认安装的 acme.sh，也兼容 ACME_HOME 和 PATH。
+detectLocalAcmeHome() {
+    local candidate=
+    local -a candidates=("${ACME_HOME:-}" "$HOME/.acme.sh" "/root/.acme.sh")
+    for candidate in "${candidates[@]}"; do
+        if [[ -n "${candidate}" && -x "${candidate}/acme.sh" ]]; then
+            echo "${candidate}"
+            return 0
+        fi
+    done
+
+    if command -v acme.sh >/dev/null 2>&1; then
+        candidate=$(dirname "$(readlink -f "$(command -v acme.sh)")")
+        if [[ -x "${candidate}/acme.sh" ]]; then
+            echo "${candidate}"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# 从 acme.sh 的证书配置目录中选择 RSA/ECC 证书。
+selectLocalAcmeCertificate() {
+    local acmeHome=
+    acmeHome=$(detectLocalAcmeHome) || return 1
+
+    local -a certDomains=()
+    local -a certDirs=()
+    local -a certEcc=()
+    local conf certDir certDomain eccLabel
+    while read -r conf; do
+        certDir=$(dirname "${conf}")
+        certDomain=$(basename "${conf}" .conf)
+        [[ -f "${certDir}/fullchain.cer" && -f "${certDir}/${certDomain}.key" ]] || continue
+
+        if [[ "$(basename "${certDir}")" == *_ecc ]]; then
+            certEcc+=(true)
+        else
+            certEcc+=(false)
+        fi
+        certDomains+=("${certDomain}")
+        certDirs+=("${certDir}")
+    done < <(find "${acmeHome}" -mindepth 2 -maxdepth 2 -type f -name '*.conf' 2>/dev/null | sort)
+
+    if ((${#certDomains[@]} == 0)); then
         return 1
     fi
 
-    echoContent skyBlue "\n---------- 本地 acme.sh 证书 ----------"
-    local found=
-    shopt -s nullglob
-    for certDir in "$HOME/.acme.sh/"*_ecc; do
-        local certName
-        certName=$(basename "${certDir}")
-        certName=${certName%_ecc}
-        echoContent yellow " - ${certName}"
-        found=1
+    echoContent skyBlue "\n---------- acme.sh 已签发证书 ----------"
+    local i
+    for i in "${!certDomains[@]}"; do
+        eccLabel=RSA
+        [[ "${certEcc[$i]}" == "true" ]] && eccLabel=ECC
+        echoContent yellow "$((i + 1)). ${certDomains[$i]} [${eccLabel}]"
     done
-    shopt -u nullglob
-    if [[ -z "${found}" ]]; then
-        echoContent yellow " (未发现证书)"
+    echoContent skyBlue "----------------------------------------"
+    read -r -p "是否使用以上 acme.sh 证书？[y/n]:" useAcmeManagedCert
+    [[ "${useAcmeManagedCert}" == "y" ]] || return 1
+
+    local selectedIndex=
+    read -r -p "请选择证书编号:" selectedIndex
+    if [[ ! "${selectedIndex}" =~ ^[0-9]+$ ]] || ((selectedIndex < 1 || selectedIndex > ${#certDomains[@]})); then
+        echoContent red " ---> 证书编号无效"
+        return 1
     fi
+    selectedIndex=$((selectedIndex - 1))
+
+    acmeManagedHome=${acmeHome}
+    acmeManagedSourceDomain=${certDomains[$selectedIndex]}
+    acmeManagedEcc=${certEcc[$selectedIndex]}
+
+    local serviceDomain=
+    read -r -p "请输入 Xray 使用的域名[默认:${acmeManagedSourceDomain}，通配符证书可填子域名]:" serviceDomain
+    serviceDomain=${serviceDomain:-${acmeManagedSourceDomain}}
+
+    while ! openssl x509 -in "${certDirs[$selectedIndex]}/fullchain.cer" -noout -checkhost "${serviceDomain}" >/dev/null 2>&1; do
+        echoContent red " ---> 所选证书不包含域名 ${serviceDomain}"
+        read -r -p "请重新输入证书覆盖的域名，输入 q 取消:" serviceDomain
+        [[ "${serviceDomain}" == "q" ]] && return 1
+    done
+
+    acmeManagedServiceDomain=${serviceDomain}
+    acmeManagedCertSelected=true
+    domain=${serviceDomain}
+    echoContent green " ---> 已选择 ${acmeManagedSourceDomain} 证书，Xray域名: ${domain}"
+    return 0
+}
+
+# 使用 acme.sh 官方部署接口复制证书，并让后续续期自动更新 Xray 文件。
+deployLocalAcmeCertificate() {
+    local certFile="/opt/xray-agent/tls/${domain}.crt"
+    local keyFile="/opt/xray-agent/tls/${domain}.key"
+    local -a installArgs=(
+        "${acmeManagedHome}/acme.sh" --install-cert
+        -d "${acmeManagedSourceDomain}"
+        --fullchain-file "${certFile}"
+        --key-file "${keyFile}"
+        --reloadcmd "systemctl try-restart xray.service >/dev/null 2>&1 || true"
+    )
+    [[ "${acmeManagedEcc}" == "true" ]] && installArgs+=(--ecc)
+
+    mkdir -p /opt/xray-agent/tls
+    if ! "${installArgs[@]}"; then
+        echoContent red " ---> 从 acme.sh 部署证书失败"
+        return 1
+    fi
+    chmod 600 "${keyFile}"
+
+    if [[ ! -s "${certFile}" || ! -s "${keyFile}" ]] || ! openssl x509 -in "${certFile}" -noout -checkhost "${domain}" >/dev/null 2>&1; then
+        echoContent red " ---> 部署后的证书无效或不包含 ${domain}"
+        return 1
+    fi
+
+    cat <<EOF >/opt/xray-agent/tls/acme_managed.conf
+ACME_HOME=${acmeManagedHome}
+SOURCE_DOMAIN=${acmeManagedSourceDomain}
+SERVICE_DOMAIN=${domain}
+ECC=${acmeManagedEcc}
+EOF
+    echoContent green " ---> 已从 acme.sh 部署证书到 ${certFile}"
+    echoContent green " ---> acme.sh 续期后会自动更新证书并重载 Xray"
+}
+
+# 兼容原有调用：显示本机可被选择的 acme.sh 证书。
+listLocalAcmeCertificates() {
+    local acmeHome=
+    acmeHome=$(detectLocalAcmeHome) || return 1
+    echoContent skyBlue "\n---------- 本地 acme.sh 证书 ----------"
+    find "${acmeHome}" -mindepth 2 -maxdepth 2 -type f -name '*.conf' 2>/dev/null | while read -r conf; do
+        local certDir certName certType
+        certDir=$(dirname "${conf}")
+        certName=$(basename "${conf}" .conf)
+        [[ -f "${certDir}/fullchain.cer" && -f "${certDir}/${certName}.key" ]] || continue
+        certType=RSA
+        [[ "$(basename "${certDir}")" == *_ecc ]] && certType=ECC
+        echoContent yellow " - ${certName} [${certType}]"
+    done
     echoContent skyBlue "--------------------------------------"
 }
 
@@ -1846,6 +1993,97 @@ customPortFunction() {
     fi
 }
 
+# 初始化 Xray-core Hysteria2 UDP 监听端口。
+# TCP/443 与 UDP/443 可以同时监听，因此默认复用主 TLS 端口。
+initHysteria2Port() {
+    local defaultPort=${port:-443}
+    local selectedPort=
+
+    if [[ -n "${hysteria2Port}" && "${hysteria2Port}" != "null" ]]; then
+        read -r -p "读取到上次 Hysteria2 UDP 端口 ${hysteria2Port}，是否继续使用？[y/n]:" historyHysteria2PortStatus
+        if [[ "${historyHysteria2PortStatus}" == "y" ]]; then
+            selectedPort=${hysteria2Port}
+        fi
+    fi
+
+    if [[ -z "${selectedPort}" ]]; then
+        read -r -p "请输入 Hysteria2 UDP 端口[默认:${defaultPort}]:" selectedPort
+        selectedPort=${selectedPort:-${defaultPort}}
+    fi
+
+    if [[ ! "${selectedPort}" =~ ^[0-9]+$ ]] || ((selectedPort < 1 || selectedPort > 65535)); then
+        echoContent red " ---> Hysteria2 UDP端口输入错误"
+        exit 1
+    fi
+
+    hysteria2Port=${selectedPort}
+    allowPort "${hysteria2Port}" udp
+    echoContent yellow "\n ---> Hysteria2 UDP端口: ${hysteria2Port}"
+}
+
+# 选择 Hysteria2 未认证 HTTP/3 请求的伪装方式。
+initHysteria2Masquerade() {
+    echoContent skyBlue "\n---------- Hysteria2 HTTP/3伪装 ----------"
+    echoContent yellow "1.本地静态网站"
+    echoContent yellow "2.301/302跳转"
+    echoContent yellow "3.反向代理现有网站"
+    if [[ -n "${btDomain}" ]]; then
+        echoContent green "检测到aaPanel/面板网站，推荐选择3反向代理"
+    fi
+    echoContent skyBlue "------------------------------------------"
+
+    local masqueradeType=
+    read -r -p "请选择[默认:1]:" masqueradeType
+    masqueradeType=${masqueradeType:-1}
+
+    case ${masqueradeType} in
+    1)
+        hysteria2MasqueradeConfig=$(jq -nc --arg dir "${nginxStaticPath}" '{type:"file",dir:$dir}')
+        echoContent green " ---> 使用本地静态网站: ${nginxStaticPath}"
+        ;;
+    2)
+        local redirectURL=
+        local redirectCode=
+        read -r -p "请输入跳转地址[例:https://v.domain.com/]:" redirectURL
+        if [[ ! "${redirectURL}" =~ ^https?://[^[:space:]]+$ ]]; then
+            echoContent red " ---> 跳转地址格式错误"
+            initHysteria2Masquerade
+            return
+        fi
+        read -r -p "请输入状态码[301/302，默认:302]:" redirectCode
+        redirectCode=${redirectCode:-302}
+        if [[ "${redirectCode}" != "301" && "${redirectCode}" != "302" ]]; then
+            echoContent red " ---> 状态码只能是301或302"
+            initHysteria2Masquerade
+            return
+        fi
+        hysteria2MasqueradeConfig=$(jq -nc --arg url "${redirectURL}" --argjson code "${redirectCode}" '{type:"string",content:"",headers:{Location:$url},statusCode:$code}')
+        echoContent green " ---> HTTP/3未认证访问将${redirectCode}跳转到: ${redirectURL}"
+        ;;
+    3)
+        local proxyURL=
+        local defaultProxyURL=
+        if [[ -n "${btDomain}" ]]; then
+            defaultProxyURL="https://${btDomain}/"
+        fi
+        read -r -p "请输入反向代理地址${defaultProxyURL:+[默认:${defaultProxyURL}]}:" proxyURL
+        proxyURL=${proxyURL:-${defaultProxyURL}}
+        if [[ ! "${proxyURL}" =~ ^https?://[^[:space:]]+$ ]]; then
+            echoContent red " ---> 反向代理地址格式错误"
+            initHysteria2Masquerade
+            return
+        fi
+        hysteria2MasqueradeConfig=$(jq -nc --arg url "${proxyURL}" '{type:"proxy",url:$url,rewriteHost:true,insecure:false}')
+        echoContent green " ---> HTTP/3未认证访问将反向代理到: ${proxyURL}"
+        ;;
+    *)
+        echoContent red " ---> 选择错误"
+        initHysteria2Masquerade
+        return
+        ;;
+    esac
+}
+
 # 检测端口是否占用
 checkPort() {
     if [[ -n "$1" ]] && lsof -i "tcp:$1" | grep -q LISTEN; then
@@ -1891,6 +2129,14 @@ installTLS() {
     
     readAcmeTLS
     local tlsDomain=${domain}
+
+    if [[ "${acmeManagedCertSelected}" == "true" ]]; then
+        echoContent green " ---> 使用 acme_manage.sh / acme.sh 已签发证书"
+        if ! deployLocalAcmeCertificate; then
+            exit 1
+        fi
+        return 0
+    fi
 
     if [[ -d "$HOME/.acme.sh" ]]; then
         listLocalAcmeCertificates
@@ -2166,6 +2412,11 @@ handleNginx() {
 installCronTLS() {
     if [[ -z "${btDomain}" ]]; then
         echoContent skyBlue "\n进度 $1/${totalProgress} : 添加定时维护证书"
+        if [[ "${acmeManagedCertSelected}" == "true" || -f "/opt/xray-agent/tls/acme_managed.conf" ]]; then
+            echoContent green " ---> 证书由 acme.sh 管理，保留 acme.sh 原有续期任务"
+            echoContent green " ---> 续期部署完成后会自动重载 Xray"
+            return 0
+        fi
         crontab -l >/opt/xray-agent/backup_crontab.cron
         local historyCrontab
         historyCrontab=$(sed '/xray-agent/d;/acme.sh/d' /opt/xray-agent/backup_crontab.cron)
@@ -2196,6 +2447,20 @@ renewalTLS() {
     if [[ -n $1 ]]; then
         echoContent skyBlue "\n进度  $1/1 : 更新证书"
     fi
+
+    if [[ -f "/opt/xray-agent/tls/acme_managed.conf" ]]; then
+        local managedAcmeHome=
+        managedAcmeHome=$(awk -F= '$1 == "ACME_HOME" {sub(/^ACME_HOME=/, ""); print; exit}' /opt/xray-agent/tls/acme_managed.conf)
+        if [[ -x "${managedAcmeHome}/acme.sh" ]]; then
+            echoContent green " ---> 使用 acme.sh 原有配置检查并续期证书"
+            "${managedAcmeHome}/acme.sh" --cron --home "${managedAcmeHome}"
+            echoContent green " ---> acme.sh 证书维护完成"
+            return 0
+        fi
+        echoContent red " ---> 找不到已登记的 acme.sh: ${managedAcmeHome}/acme.sh"
+        return 1
+    fi
+
     readAcmeTLS
     local domain=${currentHost}
     if [[ -z "${currentHost}" && -n "${tlsDomain}" ]]; then
@@ -2605,6 +2870,23 @@ initXrayClients() {
     if [[ -z "${users}" ]] || [[ "${users}" == "null" ]]; then
         users="[]"
     fi
+    echo "${users}"
+}
+
+# 将脚本现有的 UUID 用户转换为 Xray-core Hysteria2 用户。
+# UUID 作为 auth 使用，便于所有已安装协议共用同一套账号。
+initXrayHysteria2Users() {
+    local users='[]'
+    local user userId userEmail
+
+    while read -r user; do
+        userId=$(echo "${user}" | jq -r '.id // .uuid // .auth // empty')
+        userEmail=$(echo "${user}" | jq -r '.email // .name // "user"' | awk -F '[-]' '{print $1}')
+        if [[ -n "${userId}" ]]; then
+            users=$(echo "${users}" | jq -c --arg auth "${userId}" --arg email "${userEmail}-Hysteria2" '. += [{auth: $auth, level: 0, email: $email}]')
+        fi
+    done < <(echo "${currentClients:-[]}" | jq -c '.[]')
+
     echo "${users}"
 }
 # 初始化tuic配置
@@ -3068,6 +3350,52 @@ EOF
     elif [[ -z "$3" ]]; then
         rm /opt/xray-agent/xray/conf/12_VLESS_XHTTP_inbounds.json >/dev/null 2>&1
     fi
+
+    # Hysteria2 over QUIC/UDP, implemented directly by Xray-core.
+    if echo "${selectCustomInstallType}" | grep -q ",6," || [[ "$1" == "all" ]]; then
+        echoContent skyBlue "\n===================== 配置Hysteria2+TLS =====================\n"
+        initHysteria2Port
+        initHysteria2Masquerade
+        cat <<EOF >/opt/xray-agent/xray/conf/05_hysteria2_inbounds.json
+{
+  "inbounds": [
+    {
+      "port": ${hysteria2Port},
+      "listen": "0.0.0.0",
+      "protocol": "hysteria",
+      "tag": "Hysteria2",
+      "settings": {
+        "version": 2,
+        "users": $(initXrayHysteria2Users)
+      },
+      "streamSettings": {
+        "network": "hysteria",
+        "security": "tls",
+        "tlsSettings": {
+          "rejectUnknownSni": true,
+          "minVersion": "1.3",
+          "alpn": ["h3"],
+          "certificates": [
+            {
+              "certificateFile": "/opt/xray-agent/tls/${domain}.crt",
+              "keyFile": "/opt/xray-agent/tls/${domain}.key",
+              "ocspStapling": 3600
+            }
+          ]
+        },
+        "hysteriaSettings": {
+          "version": 2,
+          "udpIdleTimeout": 60,
+          "masquerade": ${hysteria2MasqueradeConfig}
+        }
+      }
+    }
+  ]
+}
+EOF
+    elif [[ -z "$3" ]]; then
+        rm /opt/xray-agent/xray/conf/05_hysteria2_inbounds.json >/dev/null 2>&1
+    fi
     # trojan_grpc
     #    if echo "${selectCustomInstallType}" | grep -q ",2," || [[ "$1" == "all" ]]; then
     #        if ! echo "${selectCustomInstallType}" | grep -q ",2," && [[ -n ${selectCustomInstallType} ]]; then
@@ -3375,6 +3703,17 @@ showAccounts() {
 
         done
     fi
+    # Hysteria2
+    if echo ${currentInstallProtocolType} | grep -q ",6,"; then
+        echoContent skyBlue "\n================================ Hysteria2 TLS/QUIC [游戏推荐] ================================\n"
+        jq -c '.inbounds[0].settings.users[]' "${configPath}05_hysteria2_inbounds.json" | while read -r user; do
+            local email=
+            email=$(echo "${user}" | jq -r '.email')
+            echoContent skyBlue "\n ---> 账号:${email}"
+            echo
+            defaultBase64Code hysteria "${hysteria2Port}" "${email}" "$(echo "${user}" | jq -r '.auth')"
+        done
+    fi
     # VLESS reality vision
     if echo ${currentInstallProtocolType} | grep -q ",3,"; then
         echoContent skyBlue "============================= VLESS reality_vision [推荐]  ==============================\n"
@@ -3657,41 +3996,27 @@ EOF
         echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=trojan%3a%2f%2f${id}%40${add}%3a${port}%3Fencryption%3Dnone%26fp%3Dchrome%26security%3Dtls%26peer%3d${currentHost}%26type%3Dgrpc%26sni%3d${currentHost}%26path%3D${currentPath}trojangrpc%26alpn%3Dh2%26serviceName%3D${currentPath}trojangrpc%23${email}\n"
 
     elif [[ "${type}" == "hysteria" ]]; then
-        echoContent yellow " ---> Hysteria(TLS)"
-        local clashMetaPortContent="port: ${port}"
-        local multiPort=
-        local multiPortEncode
-        if echo "${port}" | grep -q "-"; then
-            clashMetaPortContent="ports: ${port}"
-            multiPort="mport=${port}&"
-            multiPortEncode="mport%3D${port}%26"
-        fi
-
-        echoContent green "    hysteria2://${id}@${currentHost}:${singBoxHysteria2Port}?${multiPort}peer=${currentHost}&insecure=0&sni=${currentHost}&alpn=h3#${email}\n"
+        echoContent yellow " ---> 通用格式(Hysteria2+TLS+QUIC)"
+        echoContent green "    hysteria2://${id}@${currentHost}:${port}/?sni=${currentHost}&insecure=0#${email}\n"
         cat <<EOF >>"/opt/xray-agent/subscribe_local/default/${user}"
-hysteria2://${id}@${currentHost}:${singBoxHysteria2Port}?${multiPort}peer=${currentHost}&insecure=0&sni=${currentHost}&alpn=h3#${email}
+hysteria2://${id}@${currentHost}:${port}/?sni=${currentHost}&insecure=0#${email}
 EOF
-        echoContent yellow " ---> v2rayN(hysteria+TLS)"
-        echo "{\"server\": \"${currentHost}:${port}\",\"socks5\": { \"listen\": \"127.0.0.1:7798\", \"timeout\": 300},\"auth\":\"${id}\",\"tls\":{\"sni\":\"${currentHost}\"}}" | jq
 
         cat <<EOF >>"/opt/xray-agent/subscribe_local/clashMeta/${user}"
   - name: "${email}"
     type: hysteria2
     server: ${currentHost}
-    ${clashMetaPortContent}
+    port: ${port}
     password: ${id}
-    alpn:
-        - h3
     sni: ${currentHost}
-    up: "${hysteria2ClientUploadSpeed} Mbps"
-    down: "${hysteria2ClientDownloadSpeed} Mbps"
+    skip-cert-verify: false
 EOF
 
-        singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\":\"hysteria2\",\"server\":\"${currentHost}\",\"server_port\":${singBoxHysteria2Port},\"up_mbps\":${hysteria2ClientUploadSpeed},\"down_mbps\":${hysteria2ClientDownloadSpeed},\"password\":\"${id}\",\"tls\":{\"enabled\":true,\"server_name\":\"${currentHost}\",\"alpn\":[\"h3\"]}}]" "/opt/xray-agent/subscribe_local/sing-box/${user}")
+        singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\":\"hysteria2\",\"server\":\"${currentHost}\",\"server_port\":${port},\"password\":\"${id}\",\"tls\":{\"enabled\":true,\"server_name\":\"${currentHost}\",\"insecure\":false}}]" "/opt/xray-agent/subscribe_local/sing-box/${user}")
         echo "${singBoxSubscribeLocalConfig}" | jq . >"/opt/xray-agent/subscribe_local/sing-box/${user}"
 
         echoContent yellow " ---> 二维码 Hysteria2(TLS)"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=hysteria2%3A%2F%2F${id}%40${currentHost}%3A${singBoxHysteria2Port}%3F${multiPortEncode}peer%3D${currentHost}%26insecure%3D0%26sni%3D${currentHost}%26alpn%3Dh3%23${email}\n"
+        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=hysteria2%3A%2F%2F${id}%40${currentHost}%3A${port}%2F%3Fsni%3D${currentHost}%26insecure%3D0%23${email}\n"
 
     elif [[ "${type}" == "vlessReality" ]]; then
         local realityServerName=${xrayVLESSRealityServerName}
@@ -4413,6 +4738,13 @@ addUser() {
             echo "${clients}" | jq . >${configPath}12_VLESS_XHTTP_inbounds.json
         fi
 
+        # Hysteria2 使用同一个 UUID 作为认证密码
+        if echo "${currentInstallProtocolType}" | grep -q ",6,"; then
+            local hysteria2Config=
+            hysteria2Config=$(jq --arg auth "${uuid}" --arg email "${email}-Hysteria2" '.inbounds[0].settings.users += [{auth: $auth, level: 0, email: $email}]' "${configPath}05_hysteria2_inbounds.json")
+            echo "${hysteria2Config}" | jq . >"${configPath}05_hysteria2_inbounds.json"
+        fi
+
     done
     handleXray stop
     handleXray start
@@ -4464,7 +4796,16 @@ removeUser() {
             echo "${vlessXHTTPResult}" | jq . >${configPath}12_VLESS_XHTTP_inbounds.json
         fi
 
+
+        if echo ${currentInstallProtocolType} | grep -q ",6,"; then
+            local hysteria2Result
+            hysteria2Result=$(jq -r 'del(.inbounds[0].settings.users['${delUserIndex}'])' "${configPath}05_hysteria2_inbounds.json")
+            echo "${hysteria2Result}" | jq . >"${configPath}05_hysteria2_inbounds.json"
+        fi
+
     fi
+    handleXray stop
+    handleXray start
     manageAccount 1
 }
 # 更新脚本
@@ -5447,6 +5788,7 @@ customXrayInstall() {
     echoContent yellow "2.VLESS+TLS+gRPC[仅CDN推荐]"
     echoContent yellow "3.VLESS+Reality+uTLS+Vision[推荐]"
     echoContent yellow "4.VLESS+XHTTP+TLS"
+    echoContent yellow "6.Hysteria2+TLS+QUIC[UDP/游戏推荐]"
     read -r -p "请选择[多选]，[例如:1,2,3]:" selectCustomInstallType
     echoContent skyBlue "--------------------------------------------------------------"
     if echo "${selectCustomInstallType}" | grep -q "，"; then
@@ -5471,7 +5813,7 @@ customXrayInstall() {
     if [[ "${selectCustomInstallType:0:1}" != "," ]]; then
         selectCustomInstallType=",${selectCustomInstallType},"
     fi
-    if [[ "${selectCustomInstallType//,/}" =~ ^[0-4]+$ ]]; then
+    if [[ "${selectCustomInstallType//,/}" =~ ^[012346]+$ ]]; then
         readLastInstallationConfig
         unInstallSubscribe
         checkBTPanel
@@ -5684,7 +6026,7 @@ installSubscribe() {
         echo
         local httpSubscribeStatus=
 
-        if ! echo "${selectCustomInstallType}" | grep -qE ",0,|,1,|,2,|,3,|,4," && ! echo "${currentInstallProtocolType}" | grep -qE ",0,|,1,|,2,|,3,|,4," && [[ -z "${domain}" ]]; then
+        if ! echo "${selectCustomInstallType}" | grep -qE ",0,|,1,|,2,|,3,|,4,|,6," && ! echo "${currentInstallProtocolType}" | grep -qE ",0,|,1,|,2,|,3,|,4,|,6," && [[ -z "${domain}" ]]; then
             httpSubscribeStatus=true
         fi
 
@@ -6491,7 +6833,7 @@ checkRealityDest() {
 
 # 初始化客户端可用的ServersName
 initRealityClientServersName() {
-    local realityDestDomainList="gateway.icloud.com,itunes.apple.com,swdist.apple.com,swcdn.apple.com,updates.cdn-apple.com,mensura.cdn-apple.com,osxapps.itunes.apple.com,aod.itunes.apple.com,download-installer.cdn.mozilla.net,addons.mozilla.org,s0.awsstatic.com,d1.awsstatic.com,images-na.ssl-images-amazon.com,m.media-amazon.com,player.live-video.net,one-piece.com,lol.secure.dyn.riotcdn.net,www.lovelive-anime.jp,www.swift.com,academy.nvidia.com,www.cisco.com,www.asus.com,www.samsung.com,www.amd.com,cdn-dynmedia-1.microsoft.com,software.download.prss.microsoft.com,dl.google.com,www.google-analytics.com"
+    local realityDestDomainList="gateway.icloud.com,itunes.apple.com,swdist.apple.com,swcdn.apple.com,updates.cdn-apple.com,mensura.cdn-apple.com,osxapps.itunes.apple.com,aod.itunes.apple.com,download-installer.cdn.mozilla.net,addons.mozilla.org,s0.awsstatic.com,d1.awsstatic.com,images-na.ssl-images-amazon.com,m.media-amazon.com,player.live-video.net,one-piece.com,lol.secure.dyn.riotcdn.net,www.swift.com,academy.nvidia.com,www.cisco.com,www.asus.com,www.samsung.com,www.amd.com,cdn-dynmedia-1.microsoft.com,software.download.prss.microsoft.com,dl.google.com,www.google-analytics.com"
     # 总是询问是否使用上次域名，不管lastInstallationConfig的值
     if [[ -n "${realityServerName}" ]]; then
         if echo ${realityDestDomainList} | grep -q "${realityServerName}"; then
@@ -6543,7 +6885,6 @@ initRealityClientServersName() {
             
             echoContent yellow "💡 推荐的伪装目标（可直接使用）："
             echoContent green "   • addons.mozilla.org        (Mozilla 插件商店)"
-            echoContent green "   • www.lovelive-anime.jp     (动漫官网)"
             echoContent green "   • gateway.icloud.com        (Apple iCloud)"
             echoContent green "   • download-installer.cdn.mozilla.net"
             echoContent green "   • www.cisco.com             (思科官网)"
