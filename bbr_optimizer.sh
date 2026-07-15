@@ -1,604 +1,478 @@
-#!/bin/bash
-# bbr_optimizer.sh - BBR Optimization Configuration Script
-# Suitable for Gaming + Streaming scenarios
+#!/usr/bin/env bash
+# Xray VLESS + XTLS Vision BBR optimizer
 
-set -e
+set -Eeuo pipefail
 
-# Color definitions
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly NC='\033[0m'
 
-# Print colored messages
+readonly CONFIG_FILE='/etc/sysctl.d/90-xray-vision-bbr.conf'
+readonly MODULE_FILE='/etc/modules-load.d/xray-vision-bbr.conf'
+readonly BACKUP_ROOT='/var/backups/xray-vision-bbr'
+readonly LEGACY_SYSCTL_FILE='/etc/sysctl.conf'
+
+TEMP_CONFIG=
+LAST_BACKUP_DIR=
+PROFILE_NAME=
+
+readonly -a MANAGED_KEYS=(
+    net.core.default_qdisc
+    net.ipv4.tcp_congestion_control
+    net.core.rmem_max
+    net.core.wmem_max
+    net.ipv4.tcp_rmem
+    net.ipv4.tcp_wmem
+    net.core.rmem_default
+    net.core.wmem_default
+    net.ipv4.udp_rmem_min
+    net.ipv4.udp_wmem_min
+    net.ipv4.tcp_notsent_lowat
+    net.ipv4.tcp_limit_output_bytes
+    net.ipv4.tcp_slow_start_after_idle
+    net.ipv4.tcp_fastopen
+    net.ipv4.tcp_moderate_rcvbuf
+    net.ipv4.tcp_retries1
+    net.ipv4.tcp_retries2
+    net.ipv4.tcp_syn_retries
+    net.ipv4.tcp_synack_retries
+    net.ipv4.icmp_echo_ignore_all
+    net.ipv6.icmp.echo_ignore_all
+)
+
 print_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+    printf '%b[INFO]%b %s\n' "${BLUE}" "${NC}" "$1"
 }
 
 print_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
+    printf '%b[SUCCESS]%b %s\n' "${GREEN}" "${NC}" "$1"
 }
 
 print_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
+    printf '%b[WARNING]%b %s\n' "${YELLOW}" "${NC}" "$1"
 }
 
 print_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    printf '%b[ERROR]%b %s\n' "${RED}" "${NC}" "$1" >&2
 }
 
-# Check if running as root
+cleanup() {
+    [[ -z "${TEMP_CONFIG}" || ! -f "${TEMP_CONFIG}" ]] || rm -f "${TEMP_CONFIG}"
+}
+
 check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        print_error "This script must be run as root"
-        echo "Please use: sudo $0"
+    if [[ ${EUID} -ne 0 ]]; then
+        print_error 'This script must be run as root'
+        printf 'Please use: sudo %s\n' "$0"
         exit 1
     fi
 }
 
-# Check kernel version
+check_linux() {
+    if [[ "$(uname -s)" != 'Linux' ]]; then
+        print_error 'This script only supports Linux'
+        exit 1
+    fi
+}
+
 check_kernel() {
-    kernel_version=$(uname -r | cut -d. -f1,2)
-    kernel_major=$(echo $kernel_version | cut -d. -f1)
-    kernel_minor=$(echo $kernel_version | cut -d. -f2)
-    
-    print_info "Current kernel version: $(uname -r)"
-    
-    if [ "$kernel_major" -lt 4 ] || ([ "$kernel_major" -eq 4 ] && [ "$kernel_minor" -lt 9 ]); then
-        print_error "BBR requires kernel version >= 4.9"
-        print_error "Current kernel: $(uname -r)"
+    local kernel_release kernel_major kernel_minor
+    kernel_release=$(uname -r)
+    kernel_major=${kernel_release%%.*}
+    kernel_minor=${kernel_release#*.}
+    kernel_minor=${kernel_minor%%.*}
+
+    print_info "Current kernel: ${kernel_release}"
+    if ((kernel_major < 4 || (kernel_major == 4 && kernel_minor < 9))); then
+        print_error 'TCP BBR requires Linux kernel 4.9 or newer'
         exit 1
     fi
-    
-    print_success "Kernel version check passed"
 }
 
-# Backup current configuration
-backup_config() {
-    backup_file="/etc/sysctl.conf.backup.$(date +%Y%m%d_%H%M%S)"
-    if [ -f /etc/sysctl.conf ]; then
-        cp /etc/sysctl.conf "$backup_file"
-        print_success "Configuration backed up to: $backup_file"
-    else
-        print_info "No existing /etc/sysctl.conf found, skipping backup"
-    fi
-}
-
-# Display menu
-show_menu() {
-    clear
-    echo "======================================"
-    echo "    BBR Optimization Script"
-    echo "======================================"
-    echo ""
-    echo "Select configuration mode:"
-    echo ""
-    echo "1) Balanced Mode (Recommended)"
-    echo "   - tcp_notsent_lowat: 128KB"
-    echo "   - Buffer: 24MB"
-    echo "   - Best for: Gaming + 4K Video"
-    echo ""
-    echo "2) Gaming Priority Mode"
-    echo "   - tcp_notsent_lowat: 64KB"
-    echo "   - Buffer: 16MB"
-    echo "   - Best for: Competitive Gaming"
-    echo ""
-    echo "3) Ultra Low Latency Mode"
-    echo "   - tcp_notsent_lowat: 16KB"
-    echo "   - Buffer: 8MB"
-    echo "   - Best for: Professional Esports"
-    echo ""
-    echo "4) Streaming Priority Mode"
-    echo "   - tcp_notsent_lowat: 256KB"
-    echo "   - Buffer: 32MB"
-    echo "   - Best for: 4K/8K Video"
-    echo ""
-    echo "5) View Current Configuration"
-    echo "6) Restore Backup"
-    echo "0) Exit"
-    echo ""
-    echo "======================================"
-}
-
-# Configuration Mode 1: Balanced
-config_balanced() {
-    cat > /tmp/bbr_config.conf << 'EOF'
-# ==================== BBR Balanced Mode Configuration ====================
-# Best for: CS2 Gaming + YouTube/Netflix 4K Video
-
-# BBR Core
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-
-# Buffer - 24MB
-net.ipv4.tcp_rmem = 4096 131072 25165824
-net.ipv4.tcp_wmem = 4096 87380 25165824
-net.core.rmem_max = 25165824
-net.core.wmem_max = 25165824
-
-# Low Latency Key Parameter
-net.ipv4.tcp_notsent_lowat = 131072
-
-# UDP Optimization
-net.core.rmem_default = 262144
-net.core.wmem_default = 262144
-net.ipv4.udp_rmem_min = 16384
-net.ipv4.udp_wmem_min = 16384
-
-# TCP Basic Optimization
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_fack = 1
-net.ipv4.tcp_moderate_rcvbuf = 1
-
-# Retransmission Strategy
-net.ipv4.tcp_syn_retries = 3
-net.ipv4.tcp_synack_retries = 3
-net.ipv4.tcp_retries1 = 3
-net.ipv4.tcp_retries2 = 8
-net.ipv4.tcp_orphan_retries = 2
-
-# Keepalive
-net.ipv4.tcp_keepalive_time = 300
-net.ipv4.tcp_keepalive_intvl = 3
-net.ipv4.tcp_keepalive_probes = 3
-
-# Connection Reuse
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_max_tw_buckets = 65536
-
-# Port Range
-net.ipv4.ip_local_port_range = 1024 65535
-
-# Queue Settings
-net.core.somaxconn = 32768
-net.core.netdev_max_backlog = 32768
-net.ipv4.tcp_max_syn_backlog = 32768
-
-# Security
-net.ipv4.tcp_syncookies = 1
-
-# Forwarding
-net.ipv4.ip_forward = 1
-
-# File Limits
-fs.file-max = 1048576
-fs.inotify.max_user_instances = 8192
-EOF
-}
-
-# Configuration Mode 2: Gaming Priority
-config_gaming() {
-    cat > /tmp/bbr_config.conf << 'EOF'
-# ==================== BBR Gaming Priority Configuration ====================
-# Best for: Competitive Gaming
-
-# BBR Core
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-
-# Buffer - 16MB (Lower Latency)
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-
-# Low Latency Key Parameter - More Aggressive
-net.ipv4.tcp_notsent_lowat = 65536
-
-# UDP Optimization
-net.core.rmem_default = 262144
-net.core.wmem_default = 262144
-net.ipv4.udp_rmem_min = 16384
-net.ipv4.udp_wmem_min = 16384
-
-# TCP Basic Optimization
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_fack = 1
-net.ipv4.tcp_moderate_rcvbuf = 1
-
-# Retransmission Strategy - Faster
-net.ipv4.tcp_syn_retries = 2
-net.ipv4.tcp_synack_retries = 2
-net.ipv4.tcp_retries1 = 3
-net.ipv4.tcp_retries2 = 5
-net.ipv4.tcp_orphan_retries = 1
-
-# Keepalive - Fast Detection
-net.ipv4.tcp_keepalive_time = 120
-net.ipv4.tcp_keepalive_intvl = 3
-net.ipv4.tcp_keepalive_probes = 3
-
-# Connection Reuse
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 10
-net.ipv4.tcp_max_tw_buckets = 65536
-
-# Port Range
-net.ipv4.ip_local_port_range = 1024 65535
-
-# Queue Settings
-net.core.somaxconn = 32768
-net.core.netdev_max_backlog = 32768
-net.ipv4.tcp_max_syn_backlog = 32768
-
-# Security
-net.ipv4.tcp_syncookies = 1
-
-# Forwarding
-net.ipv4.ip_forward = 1
-
-# File Limits
-fs.file-max = 1048576
-fs.inotify.max_user_instances = 8192
-EOF
-}
-
-# Configuration Mode 3: Ultra Low Latency
-config_ultra_low_latency() {
-    cat > /tmp/bbr_config.conf << 'EOF'
-# ==================== BBR Ultra Low Latency Configuration ====================
-# Best for: Professional Esports
-
-# BBR Core
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-
-# Buffer - 8MB (Minimum Latency)
-net.ipv4.tcp_rmem = 4096 65536 8388608
-net.ipv4.tcp_wmem = 4096 32768 8388608
-net.core.rmem_max = 8388608
-net.core.wmem_max = 8388608
-
-# Low Latency Key Parameter - Extreme
-net.ipv4.tcp_notsent_lowat = 16384
-
-# UDP Optimization
-net.core.rmem_default = 262144
-net.core.wmem_default = 262144
-net.ipv4.udp_rmem_min = 16384
-net.ipv4.udp_wmem_min = 16384
-
-# TCP Basic Optimization
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_fack = 1
-net.ipv4.tcp_moderate_rcvbuf = 1
-
-# Retransmission Strategy - Extremely Fast
-net.ipv4.tcp_syn_retries = 2
-net.ipv4.tcp_synack_retries = 2
-net.ipv4.tcp_retries1 = 2
-net.ipv4.tcp_retries2 = 5
-net.ipv4.tcp_orphan_retries = 1
-
-# Keepalive - Super Fast Detection
-net.ipv4.tcp_keepalive_time = 60
-net.ipv4.tcp_keepalive_intvl = 3
-net.ipv4.tcp_keepalive_probes = 3
-
-# Connection Reuse
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 10
-net.ipv4.tcp_max_tw_buckets = 65536
-
-# Port Range
-net.ipv4.ip_local_port_range = 1024 65535
-
-# Queue Settings
-net.core.somaxconn = 32768
-net.core.netdev_max_backlog = 32768
-net.ipv4.tcp_max_syn_backlog = 32768
-
-# Security
-net.ipv4.tcp_syncookies = 1
-
-# Forwarding
-net.ipv4.ip_forward = 1
-
-# File Limits
-fs.file-max = 1048576
-fs.inotify.max_user_instances = 8192
-EOF
-}
-
-# Configuration Mode 4: Streaming Priority
-config_streaming() {
-    cat > /tmp/bbr_config.conf << 'EOF'
-# ==================== BBR Streaming Priority Configuration ====================
-# Best for: 4K/8K Video
-
-# BBR Core
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-
-# Buffer - 32MB (High Bandwidth)
-net.ipv4.tcp_rmem = 4096 131072 33554432
-net.ipv4.tcp_wmem = 4096 87380 33554432
-net.core.rmem_max = 33554432
-net.core.wmem_max = 33554432
-
-# Low Latency Key Parameter - Favor Throughput
-net.ipv4.tcp_notsent_lowat = 262144
-
-# UDP Optimization
-net.core.rmem_default = 262144
-net.core.wmem_default = 262144
-net.ipv4.udp_rmem_min = 16384
-net.ipv4.udp_wmem_min = 16384
-
-# TCP Basic Optimization
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_fack = 1
-net.ipv4.tcp_moderate_rcvbuf = 1
-
-# Retransmission Strategy
-net.ipv4.tcp_syn_retries = 3
-net.ipv4.tcp_synack_retries = 3
-net.ipv4.tcp_retries1 = 3
-net.ipv4.tcp_retries2 = 8
-net.ipv4.tcp_orphan_retries = 2
-
-# Keepalive
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_intvl = 3
-net.ipv4.tcp_keepalive_probes = 3
-
-# Connection Reuse
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_max_tw_buckets = 65536
-
-# Port Range
-net.ipv4.ip_local_port_range = 1024 65535
-
-# Queue Settings
-net.core.somaxconn = 32768
-net.core.netdev_max_backlog = 32768
-net.ipv4.tcp_max_syn_backlog = 32768
-
-# Security
-net.ipv4.tcp_syncookies = 1
-
-# Forwarding
-net.ipv4.ip_forward = 1
-
-# File Limits
-fs.file-max = 1048576
-fs.inotify.max_user_instances = 8192
-EOF
-}
-
-# Ask about ICMP
-ask_icmp() {
-    echo ""
-    echo "======================================"
-    echo "ICMP Ping Response Settings"
-    echo "======================================"
-    echo ""
-    echo "Disable ICMP ping response?"
-    echo ""
-    echo "If disabled:"
-    echo "  ✓ Server won't respond to ping requests"
-    echo "  ✓ Increases security, prevents scanning"
-    echo "  ✗ Cannot use ping to test server"
-    echo ""
-    read -p "Disable ICMP? (y/N): " disable_icmp
-    
-    if [[ "$disable_icmp" =~ ^[Yy]$ ]]; then
-        echo "" >> /tmp/bbr_config.conf
-        echo "# ICMP Settings - Disable ping response" >> /tmp/bbr_config.conf
-        echo "net.ipv4.icmp_echo_ignore_all = 1" >> /tmp/bbr_config.conf
-        echo "net.ipv6.icmp.echo_ignore_all = 1" >> /tmp/bbr_config.conf
-        print_info "ICMP disable configuration added"
-    else
-        print_info "ICMP response kept enabled"
-    fi
-}
-
-# Apply configuration
-apply_config() {
-    local mode_name=$1
-    
-    # Ask ICMP settings
-    ask_icmp
-    
-    # Display configuration to be applied
-    echo ""
-    echo "======================================"
-    echo "Configuration to be applied:"
-    echo "======================================"
-    cat /tmp/bbr_config.conf
-    echo "======================================"
-    echo ""
-    
-    read -p "Confirm applying this configuration? (y/N): " confirm
-    
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        print_warning "Configuration cancelled"
-        rm -f /tmp/bbr_config.conf
-        return
-    fi
-    
-    # Backup
-    backup_config
-    
-    # Create /etc/sysctl.conf if it doesn't exist
-    if [ ! -f /etc/sysctl.conf ]; then
-        touch /etc/sysctl.conf
-        print_info "Created new /etc/sysctl.conf"
-    fi
-    
-    # Remove old BBR configuration (if exists)
-    sed -i '/# ==================== BBR/,/fs.inotify.max_user_instances/d' /etc/sysctl.conf
-    sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.icmp_echo_ignore_all/d' /etc/sysctl.conf
-    sed -i '/net.ipv6.icmp.echo_ignore_all/d' /etc/sysctl.conf
-    
-    # Add new configuration
-    cat /tmp/bbr_config.conf >> /etc/sysctl.conf
-    
-    # Apply configuration
-    print_info "Applying configuration..."
-    sysctl -p > /dev/null 2>&1
-    
-    # Load BBR module
-    modprobe tcp_bbr
-    
-    # Verify
-    echo ""
-    print_success "Configuration applied!"
-    echo ""
-    echo "======================================"
-    echo "Verification Results:"
-    echo "======================================"
-    echo "Queue Discipline: $(sysctl -n net.core.default_qdisc)"
-    echo "Congestion Control: $(sysctl -n net.ipv4.tcp_congestion_control)"
-    echo "tcp_notsent_lowat: $(sysctl -n net.ipv4.tcp_notsent_lowat) bytes"
-    echo "Max Recv Buffer: $(sysctl -n net.core.rmem_max) bytes ($(awk "BEGIN {printf \"%.2f\", $(sysctl -n net.core.rmem_max)/1024/1024}") MB)"
-    echo "Max Send Buffer: $(sysctl -n net.core.wmem_max) bytes ($(awk "BEGIN {printf \"%.2f\", $(sysctl -n net.core.wmem_max)/1024/1024}") MB)"
-    
-    icmp_status=$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null || echo "0")
-    if [ "$icmp_status" = "1" ]; then
-        echo "ICMP Ping: Disabled"
-    else
-        echo "ICMP Ping: Enabled"
-    fi
-    echo "======================================"
-    
-    rm -f /tmp/bbr_config.conf
-    
-    echo ""
-    print_success "✓ BBR ${mode_name} configuration complete!"
-    echo ""
-}
-
-# View current configuration
-view_current() {
-    echo ""
-    echo "======================================"
-    echo "Current Network Configuration"
-    echo "======================================"
-    echo "Kernel Version: $(uname -r)"
-    echo "Queue Discipline: $(sysctl -n net.core.default_qdisc 2>/dev/null || echo 'Not set')"
-    echo "Congestion Control: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 'Not set')"
-    echo "Available Algorithms: $(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo 'Unknown')"
-    echo ""
-    echo "tcp_notsent_lowat: $(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || echo 'Default') bytes"
-    echo "Max Recv Buffer: $(sysctl -n net.core.rmem_max 2>/dev/null || echo 'Unknown') bytes"
-    echo "Max Send Buffer: $(sysctl -n net.core.wmem_max 2>/dev/null || echo 'Unknown') bytes"
-    echo ""
-    
-    icmp_status=$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null || echo "0")
-    if [ "$icmp_status" = "1" ]; then
-        echo "ICMP Ping: Disabled ✗"
-    else
-        echo "ICMP Ping: Enabled ✓"
-    fi
-    echo "======================================"
-    echo ""
-    
-    read -p "Press Enter to continue..."
-}
-
-# Restore backup
-restore_backup() {
-    echo ""
-    echo "======================================"
-    echo "Available Backup Files:"
-    echo "======================================"
-    
-    backup_files=$(ls -t /etc/sysctl.conf.backup.* 2>/dev/null || echo "")
-    
-    if [ -z "$backup_files" ]; then
-        print_warning "No backup files found"
-        read -p "Press Enter to continue..."
-        return
-    fi
-    
-    select backup in $backup_files "Cancel"; do
-        if [ "$backup" = "Cancel" ]; then
-            return
-        fi
-        
-        if [ -n "$backup" ]; then
-            read -p "Confirm restore backup $backup? (y/N): " confirm
-            if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                cp "$backup" /etc/sysctl.conf
-                sysctl -p > /dev/null 2>&1
-                print_success "Backup restored: $backup"
-            fi
-            break
+check_commands() {
+    local command_name
+    for command_name in sysctl modprobe ip awk sed grep mktemp install; do
+        if ! command -v "${command_name}" >/dev/null 2>&1; then
+            print_error "Required command not found: ${command_name}"
+            exit 1
         fi
     done
-    
-    read -p "Press Enter to continue..."
 }
 
-# Main program
+prepare_bbr() {
+    local available_algorithms
+    if ! modprobe tcp_bbr 2>/dev/null; then
+        print_error 'Unable to load tcp_bbr; the current kernel may not include CONFIG_TCP_CONG_BBR'
+        return 1
+    fi
+
+    available_algorithms=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    if [[ " ${available_algorithms} " != *' bbr '* ]]; then
+        print_error "BBR is unavailable. Available algorithms: ${available_algorithms:-unknown}"
+        return 1
+    fi
+    print_success "BBR is available: ${available_algorithms}"
+}
+
+show_menu() {
+    clear 2>/dev/null || true
+    cat <<'EOF'
+============================================================
+        Xray Vision TCP BBR Optimizer
+============================================================
+
+1) Vision Balanced (Recommended)
+   - 16 MB socket buffer ceiling
+   - 128 KB unsent-data threshold
+   - Good balance for CN2 GIA, browsing and streaming
+
+2) Vision Low Latency (Moderately Aggressive)
+   - 16 MB socket buffer ceiling
+   - 32 KB unsent-data threshold
+   - Smaller TCP output queue; may reduce peak throughput
+
+3) Vision High Bandwidth
+   - 32 MB socket buffer ceiling
+   - 256 KB unsent-data threshold
+   - Better for high-bandwidth, high-RTT streaming/downloads
+
+4) View Current Status
+5) Restore Backup
+0) Exit
+
+Notes:
+- Linux TCP BBR applies to VLESS Vision's TCP transport.
+- Hysteria2 uses QUIC/UDP and its own congestion controller.
+- ICMP echo response can be disabled optionally when applying a profile.
+- This script does not change IP forwarding or unrelated file limits.
+============================================================
+EOF
+}
+
+create_profile() {
+    local profile=$1
+    local buffer_max notsent_lowat output_limit
+
+    case "${profile}" in
+    balanced)
+        PROFILE_NAME='Vision Balanced'
+        buffer_max=16777216
+        notsent_lowat=131072
+        output_limit=1048576
+        ;;
+    latency)
+        PROFILE_NAME='Vision Low Latency'
+        buffer_max=16777216
+        notsent_lowat=32768
+        output_limit=262144
+        ;;
+    bandwidth)
+        PROFILE_NAME='Vision High Bandwidth'
+        buffer_max=33554432
+        notsent_lowat=262144
+        output_limit=1048576
+        ;;
+    *)
+        print_error "Unknown profile: ${profile}"
+        return 1
+        ;;
+    esac
+
+    [[ -z "${TEMP_CONFIG}" || ! -f "${TEMP_CONFIG}" ]] || rm -f "${TEMP_CONFIG}"
+    TEMP_CONFIG=$(mktemp /tmp/xray-vision-bbr.XXXXXX.conf)
+    cat >"${TEMP_CONFIG}" <<EOF
+# Managed by bbr_optimizer.sh - ${PROFILE_NAME}
+# Remove this file and restore a backup through the script to undo the settings.
+
+# BBR and fair queue pacing for VLESS Vision TCP
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# Socket buffer ceilings; memory is allocated on demand, not reserved up front
+net.core.rmem_max = ${buffer_max}
+net.core.wmem_max = ${buffer_max}
+net.ipv4.tcp_rmem = 4096 131072 ${buffer_max}
+net.ipv4.tcp_wmem = 4096 65536 ${buffer_max}
+
+# Also provide reasonable defaults for QUIC/UDP services such as Hysteria2
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+
+# Control local TCP queuing without using unsafe retransmission timeouts
+net.ipv4.tcp_notsent_lowat = ${notsent_lowat}
+net.ipv4.tcp_limit_output_bytes = ${output_limit}
+
+# Long-lived proxy connection behavior
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_moderate_rcvbuf = 1
+
+# Moderately aggressive failure detection; retries2=8 preserves RFC minimum
+net.ipv4.tcp_retries1 = 3
+net.ipv4.tcp_retries2 = 8
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_synack_retries = 3
+EOF
+
+}
+
+validate_profile() {
+    local key value proc_path
+    while IFS='=' read -r key value; do
+        key=${key//[[:space:]]/}
+        [[ -n "${key}" && "${key}" != \#* ]] || continue
+        proc_path="/proc/sys/${key//./\/}"
+        if [[ ! -e "${proc_path}" ]]; then
+            print_error "The current kernel does not expose sysctl key: ${key}"
+            return 1
+        fi
+    done <"${TEMP_CONFIG}"
+}
+
+configure_icmp() {
+    local disable_icmp
+    printf '\nICMP echo response controls whether the VPS replies to ordinary ping.\n'
+    printf 'Disabling it reduces basic visibility but does not prevent port scanning.\n'
+    read -r -p 'Disable ICMP echo response? [y/N]: ' disable_icmp
+
+    printf '\n# Optional ICMP echo response policy\n' >>"${TEMP_CONFIG}"
+    if [[ "${disable_icmp}" =~ ^[Yy]$ ]]; then
+        printf 'net.ipv4.icmp_echo_ignore_all = 1\n' >>"${TEMP_CONFIG}"
+        if [[ -e /proc/sys/net/ipv6/icmp/echo_ignore_all ]]; then
+            printf 'net.ipv6.icmp.echo_ignore_all = 1\n' >>"${TEMP_CONFIG}"
+        fi
+        print_warning 'ICMP echo response will be disabled; ping monitoring will no longer work'
+    else
+        printf 'net.ipv4.icmp_echo_ignore_all = 0\n' >>"${TEMP_CONFIG}"
+        if [[ -e /proc/sys/net/ipv6/icmp/echo_ignore_all ]]; then
+            printf 'net.ipv6.icmp.echo_ignore_all = 0\n' >>"${TEMP_CONFIG}"
+        fi
+        print_info 'ICMP echo response will remain enabled'
+    fi
+}
+
+backup_current_state() {
+    local backup_dir timestamp key value
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    backup_dir="${BACKUP_ROOT}/${timestamp}_$$"
+    mkdir -p "${backup_dir}"
+
+    if [[ -f "${CONFIG_FILE}" ]]; then
+        cp -a "${CONFIG_FILE}" "${backup_dir}/managed.conf"
+        touch "${backup_dir}/had_managed_config"
+    fi
+    if [[ -f "${MODULE_FILE}" ]]; then
+        cp -a "${MODULE_FILE}" "${backup_dir}/modules.conf"
+        touch "${backup_dir}/had_module_config"
+    fi
+    if [[ -f "${LEGACY_SYSCTL_FILE}" ]]; then
+        cp -a "${LEGACY_SYSCTL_FILE}" "${backup_dir}/sysctl.conf"
+        touch "${backup_dir}/had_sysctl_conf"
+    fi
+
+    : >"${backup_dir}/runtime.conf"
+    for key in "${MANAGED_KEYS[@]}"; do
+        if value=$(sysctl -n "${key}" 2>/dev/null); then
+            printf '%s = %s\n' "${key}" "${value}" >>"${backup_dir}/runtime.conf"
+        fi
+    done
+
+    LAST_BACKUP_DIR=${backup_dir}
+    print_success "Backup created: ${backup_dir}"
+}
+
+remove_legacy_config() {
+    [[ -f "${LEGACY_SYSCTL_FILE}" ]] || return 0
+    if grep -q '^# ==================== BBR .* Configuration' "${LEGACY_SYSCTL_FILE}"; then
+        sed -i '/^# ==================== BBR .* Configuration/,/^fs\.inotify\.max_user_instances[[:space:]]*=/d' "${LEGACY_SYSCTL_FILE}"
+        sed -i '/^[[:space:]]*net\.ipv[46]\.icmp.*echo_ignore_all[[:space:]]*=/d' "${LEGACY_SYSCTL_FILE}"
+        print_info 'Removed the legacy optimizer block from /etc/sysctl.conf'
+    fi
+}
+
+restore_snapshot() {
+    local backup_dir=$1
+
+    if [[ -f "${backup_dir}/had_managed_config" ]]; then
+        cp -a "${backup_dir}/managed.conf" "${CONFIG_FILE}"
+    else
+        rm -f "${CONFIG_FILE}"
+    fi
+
+    if [[ -f "${backup_dir}/had_module_config" ]]; then
+        cp -a "${backup_dir}/modules.conf" "${MODULE_FILE}"
+    else
+        rm -f "${MODULE_FILE}"
+    fi
+
+    if [[ -f "${backup_dir}/had_sysctl_conf" ]]; then
+        cp -a "${backup_dir}/sysctl.conf" "${LEGACY_SYSCTL_FILE}"
+    else
+        rm -f "${LEGACY_SYSCTL_FILE}"
+    fi
+
+    sysctl --system >/dev/null 2>&1 || true
+    if [[ -s "${backup_dir}/runtime.conf" ]]; then
+        sysctl -p "${backup_dir}/runtime.conf" >/dev/null 2>&1 || true
+    fi
+}
+
+apply_profile() {
+    local profile=$1 profile_name confirm apply_output
+
+    create_profile "${profile}" || return 1
+    profile_name=${PROFILE_NAME}
+    configure_icmp
+    validate_profile || return 1
+
+    printf '\nConfiguration to be installed at %s:\n\n' "${CONFIG_FILE}"
+    sed -n '1,240p' "${TEMP_CONFIG}"
+    printf '\n'
+    read -r -p "Apply ${profile_name}? [y/N]: " confirm
+    if [[ ! "${confirm}" =~ ^[Yy]$ ]]; then
+        print_warning 'Configuration cancelled'
+        return 0
+    fi
+
+    prepare_bbr || return 1
+    backup_current_state
+    if ! remove_legacy_config ||
+        ! mkdir -p "$(dirname "${CONFIG_FILE}")" "$(dirname "${MODULE_FILE}")" ||
+        ! install -m 0644 "${TEMP_CONFIG}" "${CONFIG_FILE}" ||
+        ! printf 'tcp_bbr\n' >"${MODULE_FILE}"; then
+        print_error 'Failed to install the persistent BBR configuration'
+        print_warning 'Restoring the pre-change state'
+        restore_snapshot "${LAST_BACKUP_DIR}"
+        return 1
+    fi
+
+    if ! apply_output=$(sysctl -p "${CONFIG_FILE}" 2>&1); then
+        print_error 'Failed to apply the new sysctl configuration:'
+        printf '%s\n' "${apply_output}" >&2
+        print_warning 'Restoring the pre-change state'
+        restore_snapshot "${LAST_BACKUP_DIR}"
+        return 1
+    fi
+
+    print_success "${profile_name} applied"
+    verify_status
+}
+
+get_default_interface() {
+    local interface_name
+    interface_name=$(ip -4 route show default 2>/dev/null | awk '/default/ {for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')
+    if [[ -z "${interface_name}" ]]; then
+        interface_name=$(ip -6 route show default 2>/dev/null | awk '/default/ {for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')
+    fi
+    printf '%s\n' "${interface_name}"
+}
+
+verify_status() {
+    local interface_name qdisc_status bbr_module
+    interface_name=$(get_default_interface)
+    bbr_module=
+    if command -v lsmod >/dev/null 2>&1; then
+        bbr_module=$(lsmod 2>/dev/null | awk '$1 == "tcp_bbr" {print $1; exit}' || true)
+    fi
+
+    printf '\n============================================================\n'
+    printf 'Kernel:              %s\n' "$(uname -r)"
+    printf 'BBR module:          %s\n' "${bbr_module:-built-in or not shown}"
+    printf 'Available CC:        %s\n' "$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo unknown)"
+    printf 'Configured CC:       %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
+    printf 'Default qdisc:       %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
+    printf 'tcp_notsent_lowat:   %s bytes\n' "$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || echo unknown)"
+    printf 'tcp output limit:    %s bytes\n' "$(sysctl -n net.ipv4.tcp_limit_output_bytes 2>/dev/null || echo unknown)"
+    printf 'Receive buffer max:  %s bytes\n' "$(sysctl -n net.core.rmem_max 2>/dev/null || echo unknown)"
+    printf 'Send buffer max:     %s bytes\n' "$(sysctl -n net.core.wmem_max 2>/dev/null || echo unknown)"
+    if [[ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null || echo 0)" == '1' ]]; then
+        printf 'ICMP echo response:  disabled\n'
+    else
+        printf 'ICMP echo response:  enabled\n'
+    fi
+
+    if [[ -n "${interface_name}" ]] && command -v tc >/dev/null 2>&1; then
+        qdisc_status=$(tc qdisc show dev "${interface_name}" 2>/dev/null || true)
+        printf 'Active qdisc (%s):\n%s\n' "${interface_name}" "${qdisc_status:-unknown}"
+        if [[ "${qdisc_status}" != *'qdisc fq '* ]]; then
+            print_warning 'The active interface has not adopted fq yet; a reboot may be required'
+        fi
+    fi
+    printf '============================================================\n\n'
+}
+
+restore_backup() {
+    local -a backups=()
+    local backup selection confirm
+
+    if [[ -d "${BACKUP_ROOT}" ]]; then
+        while IFS= read -r backup; do
+            backups+=("${backup}")
+        done < <(find "${BACKUP_ROOT}" -mindepth 1 -maxdepth 1 -type d | sort -r)
+    fi
+
+    if ((${#backups[@]} == 0)); then
+        print_warning 'No optimizer backups found'
+        return 0
+    fi
+
+    printf '\nAvailable backups:\n'
+    for selection in "${!backups[@]}"; do
+        printf '%d) %s\n' "$((selection + 1))" "${backups[selection]}"
+    done
+    printf '0) Cancel\n'
+    read -r -p 'Select backup: ' selection
+    if [[ "${selection}" == '0' ]]; then
+        return 0
+    fi
+    if [[ ! "${selection}" =~ ^[0-9]+$ ]] || ((selection < 1 || selection > ${#backups[@]})); then
+        print_error 'Invalid backup selection'
+        return 1
+    fi
+
+    backup=${backups[selection - 1]}
+    read -r -p "Restore ${backup}? [y/N]: " confirm
+    if [[ "${confirm}" =~ ^[Yy]$ ]]; then
+        restore_snapshot "${backup}"
+        print_success "Backup restored: ${backup}"
+        verify_status
+    fi
+}
+
 main() {
+    local choice
+    trap cleanup EXIT
     check_root
+    check_linux
     check_kernel
-    
+    check_commands
+
     while true; do
         show_menu
-        read -p "Please select [0-6]: " choice
-        
-        case $choice in
-            1)
-                config_balanced
-                apply_config "Balanced Mode"
-                read -p "Press Enter to continue..."
-                ;;
-            2)
-                config_gaming
-                apply_config "Gaming Priority"
-                read -p "Press Enter to continue..."
-                ;;
-            3)
-                config_ultra_low_latency
-                apply_config "Ultra Low Latency"
-                read -p "Press Enter to continue..."
-                ;;
-            4)
-                config_streaming
-                apply_config "Streaming Priority"
-                read -p "Press Enter to continue..."
-                ;;
-            5)
-                view_current
-                ;;
-            6)
-                restore_backup
-                ;;
-            0)
-                print_info "Exiting script"
-                exit 0
-                ;;
-            *)
-                print_error "Invalid selection, please try again"
-                sleep 2
-                ;;
+        read -r -p 'Please select [0-5]: ' choice
+        case "${choice}" in
+        1) apply_profile balanced || true ;;
+        2) apply_profile latency || true ;;
+        3) apply_profile bandwidth || true ;;
+        4) verify_status ;;
+        5) restore_backup || true ;;
+        0)
+            print_info 'Exiting script'
+            return 0
+            ;;
+        *)
+            print_error 'Invalid selection'
+            sleep 1
+            ;;
         esac
+        read -r -p 'Press Enter to continue...'
     done
 }
 
-# Run main program
-main
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
