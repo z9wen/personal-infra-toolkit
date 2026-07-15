@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Xray VLESS + XTLS Vision BBR optimizer
+# BBR optimizer
 
 set -Eeuo pipefail
 
@@ -9,10 +9,13 @@ readonly YELLOW='\033[1;33m'
 readonly BLUE='\033[0;34m'
 readonly NC='\033[0m'
 
-readonly CONFIG_FILE='/etc/sysctl.d/90-xray-vision-bbr.conf'
+readonly CONFIG_FILE='/etc/sysctl.d/90-bbr-optimizer.conf'
 readonly ICMP_CONFIG_FILE='/etc/sysctl.d/91-vps-icmp-policy.conf'
-readonly MODULE_FILE='/etc/modules-load.d/xray-vision-bbr.conf'
-readonly BACKUP_ROOT='/var/backups/xray-vision-bbr'
+readonly MODULE_FILE='/etc/modules-load.d/bbr-optimizer.conf'
+readonly BACKUP_ROOT='/var/backups/bbr-optimizer'
+readonly OLD_CONFIG_FILE='/etc/sysctl.d/90-xray-vision-bbr.conf'
+readonly OLD_MODULE_FILE='/etc/modules-load.d/xray-vision-bbr.conf'
+readonly OLD_BACKUP_ROOT='/var/backups/xray-vision-bbr'
 readonly LEGACY_SYSCTL_FILE='/etc/sysctl.conf'
 
 TEMP_CONFIG=
@@ -35,6 +38,10 @@ readonly -a MANAGED_KEYS=(
     net.ipv4.tcp_slow_start_after_idle
     net.ipv4.tcp_fastopen
     net.ipv4.tcp_moderate_rcvbuf
+    net.ipv4.tcp_recovery
+    net.ipv4.tcp_early_retrans
+    net.ipv4.tcp_thin_linear_timeouts
+    net.ipv4.tcp_mtu_probing
     net.ipv4.tcp_retries1
     net.ipv4.tcp_retries2
     net.ipv4.tcp_syn_retries
@@ -119,20 +126,20 @@ show_menu() {
     clear 2>/dev/null || true
     cat <<'EOF'
 ============================================================
-        Xray Vision TCP BBR Optimizer
+                    BBR Optimizer
 ============================================================
 
-1) Vision Balanced (Recommended)
+1) Balanced (Recommended)
    - 16 MB socket buffer ceiling
    - 128 KB unsent-data threshold
-   - Good balance for CN2 GIA, browsing and streaming
+   - Good balance for general-purpose VPS traffic
 
-2) Vision Low Latency (Moderately Aggressive)
+2) Low Latency (Moderately Aggressive)
    - 16 MB socket buffer ceiling
    - 32 KB unsent-data threshold
    - Smaller TCP output queue; may reduce peak throughput
 
-3) Vision High Bandwidth
+3) High Bandwidth
    - 32 MB socket buffer ceiling
    - 256 KB unsent-data threshold
    - Better for high-bandwidth, high-RTT streaming/downloads
@@ -141,12 +148,6 @@ show_menu() {
 5) View Current Status
 6) Restore BBR Backup
 0) Exit
-
-Notes:
-- Linux TCP BBR applies to VLESS Vision's TCP transport.
-- Hysteria2 uses QUIC/UDP and its own congestion controller.
-- ICMP echo response is managed separately from BBR profiles.
-- This script does not change IP forwarding or unrelated file limits.
 ============================================================
 EOF
 }
@@ -157,19 +158,19 @@ create_profile() {
 
     case "${profile}" in
     balanced)
-        PROFILE_NAME='Vision Balanced'
+        PROFILE_NAME='Balanced'
         buffer_max=16777216
         notsent_lowat=131072
         output_limit=1048576
         ;;
     latency)
-        PROFILE_NAME='Vision Low Latency'
+        PROFILE_NAME='Low Latency'
         buffer_max=16777216
         notsent_lowat=32768
         output_limit=262144
         ;;
     bandwidth)
-        PROFILE_NAME='Vision High Bandwidth'
+        PROFILE_NAME='High Bandwidth'
         buffer_max=33554432
         notsent_lowat=262144
         output_limit=1048576
@@ -181,12 +182,12 @@ create_profile() {
     esac
 
     [[ -z "${TEMP_CONFIG}" || ! -f "${TEMP_CONFIG}" ]] || rm -f "${TEMP_CONFIG}"
-    TEMP_CONFIG=$(mktemp /tmp/xray-vision-bbr.XXXXXX.conf)
+    TEMP_CONFIG=$(mktemp /tmp/bbr-optimizer.XXXXXX.conf)
     cat >"${TEMP_CONFIG}" <<EOF
 # Managed by bbr_optimizer.sh - ${PROFILE_NAME}
 # Remove this file and restore a backup through the script to undo the settings.
 
-# BBR and fair queue pacing for VLESS Vision TCP
+# BBR and fair queue pacing for TCP
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 
@@ -202,22 +203,38 @@ net.core.wmem_default = 262144
 net.ipv4.udp_rmem_min = 16384
 net.ipv4.udp_wmem_min = 16384
 
-# Control local TCP queuing without using unsafe retransmission timeouts
+# Control local TCP queuing
 net.ipv4.tcp_notsent_lowat = ${notsent_lowat}
 net.ipv4.tcp_limit_output_bytes = ${output_limit}
 
-# Long-lived proxy connection behavior
+# TCP connection behavior
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_moderate_rcvbuf = 1
 
-# Moderately aggressive failure detection; retries2=8 preserves RFC minimum
+# Tolerate transient packet loss without abandoning connections too early
 net.ipv4.tcp_retries1 = 3
-net.ipv4.tcp_retries2 = 8
-net.ipv4.tcp_syn_retries = 3
-net.ipv4.tcp_synack_retries = 3
+net.ipv4.tcp_retries2 = 12
+net.ipv4.tcp_syn_retries = 4
+net.ipv4.tcp_synack_retries = 4
 EOF
 
+    # These recovery controls are common to all profiles. Keep older BBR-capable
+    # kernels usable by writing only the sysctls they actually expose.
+    printf '\n# Aggressive loss recovery (enabled when supported by the kernel)\n' >>"${TEMP_CONFIG}"
+    append_supported_sysctl net.ipv4.tcp_recovery 1
+    append_supported_sysctl net.ipv4.tcp_early_retrans 3
+    append_supported_sysctl net.ipv4.tcp_thin_linear_timeouts 1
+    append_supported_sysctl net.ipv4.tcp_mtu_probing 1
+
+}
+
+append_supported_sysctl() {
+    local key=$1 value=$2 proc_path
+    proc_path="/proc/sys/${key//./\/}"
+    if [[ -e "${proc_path}" ]]; then
+        printf '%s = %s\n' "${key}" "${value}" >>"${TEMP_CONFIG}"
+    fi
 }
 
 validate_profile() {
@@ -243,9 +260,17 @@ backup_current_state() {
         cp -a "${CONFIG_FILE}" "${backup_dir}/managed.conf"
         touch "${backup_dir}/had_managed_config"
     fi
+    if [[ -f "${OLD_CONFIG_FILE}" ]]; then
+        cp -a "${OLD_CONFIG_FILE}" "${backup_dir}/old-managed.conf"
+        touch "${backup_dir}/had_old_managed_config"
+    fi
     if [[ -f "${MODULE_FILE}" ]]; then
         cp -a "${MODULE_FILE}" "${backup_dir}/modules.conf"
         touch "${backup_dir}/had_module_config"
+    fi
+    if [[ -f "${OLD_MODULE_FILE}" ]]; then
+        cp -a "${OLD_MODULE_FILE}" "${backup_dir}/old-modules.conf"
+        touch "${backup_dir}/had_old_module_config"
     fi
     if [[ -f "${LEGACY_SYSCTL_FILE}" ]]; then
         cp -a "${LEGACY_SYSCTL_FILE}" "${backup_dir}/sysctl.conf"
@@ -273,9 +298,11 @@ remove_legacy_config() {
 }
 
 migrate_embedded_icmp_policy() {
-    local ipv4_value ipv6_value temporary_icmp
-    [[ -f "${CONFIG_FILE}" ]] || return 0
-    grep -q 'icmp.*echo_ignore_all' "${CONFIG_FILE}" || return 0
+    local ipv4_value ipv6_value temporary_icmp managed_config
+    managed_config=${CONFIG_FILE}
+    [[ -f "${managed_config}" ]] || managed_config=${OLD_CONFIG_FILE}
+    [[ -f "${managed_config}" ]] || return 0
+    grep -q 'icmp.*echo_ignore_all' "${managed_config}" || return 0
 
     ipv4_value=$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null || echo 0)
     ipv6_value=$(sysctl -n net.ipv6.icmp.echo_ignore_all 2>/dev/null || echo 0)
@@ -289,7 +316,7 @@ migrate_embedded_icmp_policy() {
     } >"${temporary_icmp}"
     mkdir -p "$(dirname "${ICMP_CONFIG_FILE}")"
     install -m 0644 "${temporary_icmp}" "${ICMP_CONFIG_FILE}"
-    sed -i '/^[[:space:]]*net\.ipv[46]\.icmp.*echo_ignore_all[[:space:]]*=/d' "${CONFIG_FILE}"
+    sed -i '/^[[:space:]]*net\.ipv[46]\.icmp.*echo_ignore_all[[:space:]]*=/d' "${managed_config}"
     rm -f "${temporary_icmp}"
     print_info "Migrated the existing ICMP policy to ${ICMP_CONFIG_FILE}"
 }
@@ -386,10 +413,22 @@ restore_snapshot() {
         rm -f "${CONFIG_FILE}"
     fi
 
+    if [[ -f "${backup_dir}/had_old_managed_config" ]]; then
+        cp -a "${backup_dir}/old-managed.conf" "${OLD_CONFIG_FILE}"
+    else
+        rm -f "${OLD_CONFIG_FILE}"
+    fi
+
     if [[ -f "${backup_dir}/had_module_config" ]]; then
         cp -a "${backup_dir}/modules.conf" "${MODULE_FILE}"
     else
         rm -f "${MODULE_FILE}"
+    fi
+
+    if [[ -f "${backup_dir}/had_old_module_config" ]]; then
+        cp -a "${backup_dir}/old-modules.conf" "${OLD_MODULE_FILE}"
+    else
+        rm -f "${OLD_MODULE_FILE}"
     fi
 
     if [[ -f "${backup_dir}/had_sysctl_conf" ]]; then
@@ -429,6 +468,7 @@ apply_profile() {
     backup_current_state
     if ! remove_legacy_config ||
         ! mkdir -p "$(dirname "${CONFIG_FILE}")" "$(dirname "${MODULE_FILE}")" ||
+        ! rm -f "${OLD_CONFIG_FILE}" "${OLD_MODULE_FILE}" ||
         ! install -m 0644 "${TEMP_CONFIG}" "${CONFIG_FILE}" ||
         ! printf 'tcp_bbr\n' >"${MODULE_FILE}"; then
         print_error 'Failed to install the persistent BBR configuration'
@@ -474,6 +514,11 @@ verify_status() {
     printf 'Default qdisc:       %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
     printf 'tcp_notsent_lowat:   %s bytes\n' "$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || echo unknown)"
     printf 'tcp output limit:    %s bytes\n' "$(sysctl -n net.ipv4.tcp_limit_output_bytes 2>/dev/null || echo unknown)"
+    printf 'TCP retries2:        %s\n' "$(sysctl -n net.ipv4.tcp_retries2 2>/dev/null || echo unknown)"
+    printf 'RACK recovery:       %s\n' "$(sysctl -n net.ipv4.tcp_recovery 2>/dev/null || echo unavailable)"
+    printf 'Tail loss probe:     %s\n' "$(sysctl -n net.ipv4.tcp_early_retrans 2>/dev/null || echo unavailable)"
+    printf 'Thin stream recovery: %s\n' "$(sysctl -n net.ipv4.tcp_thin_linear_timeouts 2>/dev/null || echo unavailable)"
+    printf 'TCP MTU probing:     %s\n' "$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || echo unavailable)"
     printf 'Receive buffer max:  %s bytes\n' "$(sysctl -n net.core.rmem_max 2>/dev/null || echo unknown)"
     printf 'Send buffer max:     %s bytes\n' "$(sysctl -n net.core.wmem_max 2>/dev/null || echo unknown)"
     if [[ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null || echo 0)" == '1' ]]; then
@@ -496,11 +541,14 @@ restore_backup() {
     local -a backups=()
     local backup selection confirm
 
-    if [[ -d "${BACKUP_ROOT}" ]]; then
-        while IFS= read -r backup; do
-            backups+=("${backup}")
-        done < <(find "${BACKUP_ROOT}" -mindepth 1 -maxdepth 1 -type d | sort -r)
-    fi
+    while IFS= read -r backup; do
+        [[ -n "${backup}" ]] && backups+=("${backup}")
+    done < <(
+        {
+            [[ ! -d "${BACKUP_ROOT}" ]] || find "${BACKUP_ROOT}" -mindepth 1 -maxdepth 1 -type d
+            [[ ! -d "${OLD_BACKUP_ROOT}" ]] || find "${OLD_BACKUP_ROOT}" -mindepth 1 -maxdepth 1 -type d
+        } | sort -r
+    )
 
     if ((${#backups[@]} == 0)); then
         print_warning 'No optimizer backups found'
