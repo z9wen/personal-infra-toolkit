@@ -782,7 +782,7 @@ readConfigHostPathUUID() {
                 currentHost=$(jq -r '.inbounds[0].streamSettings.tlsSettings.certificates[0].certificateFile' "${configPath}05_hysteria2_inbounds.json" | awk -F '[t][l][s][/]' '{print $2}' | awk -F '[.][c][r][t]' '{print $1}')
             fi
             if [[ -z "${currentClients}" || "${currentClients}" == "null" || "${currentClients}" == "[]" ]]; then
-                currentClients=$(jq -c '[.inbounds[0].settings.users[] | {id: .auth, email: .email}]' "${configPath}05_hysteria2_inbounds.json")
+                currentClients=$(jq -c '[(.inbounds[0].settings.clients // .inbounds[0].settings.users // [])[] | {id: .auth, email: .email}]' "${configPath}05_hysteria2_inbounds.json")
                 currentUUID=$(echo "${currentClients}" | jq -r '.[0].id // empty')
             fi
         fi
@@ -956,7 +956,9 @@ checkCPUVendor
 
 # 面板path早期检测（无需用户输入，仅设置 nginxConfigPath）
 detectPanelNginxPath() {
-    if [[ -n $(pgrep -f "BT-Panel") ]] && [[ -d "/www/server/panel/vhost/nginx" ]]; then
+    # aaPanel/宝塔的面板进程可能未运行或进程名不同，Nginx 与 vhost 目录
+    # 才是判断配置位置的可靠依据。
+    if [[ -x "/www/server/nginx/sbin/nginx" ]] && [[ -d "/www/server/panel/vhost/nginx" ]]; then
         nginxConfigPath="/www/server/panel/vhost/nginx/"
     elif [[ -d "/opt/1panel/apps/openresty/openresty/conf/conf.d" ]]; then
         nginxConfigPath="/opt/1panel/apps/openresty/openresty/conf/conf.d/"
@@ -1375,7 +1377,7 @@ initTLSNginxConfig() {
         initTLSNginxConfig 3
     else
         # 检查域名是否已在 Nginx 中配置
-        if grep -r "server_name.*${domain}" /etc/nginx/conf.d/ /etc/nginx/sites-enabled/ 2>/dev/null | grep -v "xray-agent.conf" | grep -q "${domain}"; then
+        if grep -r "server_name.*${domain}" "${nginxConfigPath}" /etc/nginx/sites-enabled/ 2>/dev/null | grep -v "xray-agent.conf" | grep -q "${domain}"; then
             echoContent red "\n=============================================================="
             echoContent yellow "警告：检测到域名 ${domain} 已在 Nginx 中配置"
             echoContent yellow "这可能会导致配置冲突！"
@@ -1406,10 +1408,18 @@ removeNginxDefaultConf() {
 }
 # 修改nginx重定向配置
 updateRedirectNginxConf() {
+    local nginxConfFile="${nginxConfigPath}xray-agent.conf"
+    local nginxConfTmp="${nginxConfFile}.tmp.$$"
+
+    if [[ ! -d "${nginxConfigPath}" ]]; then
+        echoContent red " ---> Nginx配置目录不存在: ${nginxConfigPath}"
+        return 1
+    fi
+
     # 备份现有配置
-    if [[ -f "${nginxConfigPath}xray-agent.conf" ]]; then
-        local backupFile="${nginxConfigPath}xray-agent.conf.bak_$(date +%Y%m%d_%H%M%S)"
-        cp "${nginxConfigPath}xray-agent.conf" "${backupFile}"
+    if [[ -f "${nginxConfFile}" ]]; then
+        local backupFile="${nginxConfFile}.bak_$(date +%Y%m%d_%H%M%S)"
+        cp "${nginxConfFile}" "${backupFile}"
         echoContent skyBlue " ---> 已备份原配置: ${backupFile}"
     fi
     
@@ -1428,15 +1438,12 @@ updateRedirectNginxConf() {
         nginxH2Conf="listen 127.0.0.1:31302 so_keepalive=on proxy_protocol;http2 on;"
     fi
 
-    cat <<EOF >${nginxConfigPath}xray-agent.conf
+    if ! cat <<EOF >"${nginxConfTmp}"
     server {
     		listen 127.0.0.1:31300;
     		server_name _;
     		return 403;
     }
-EOF
-
-    cat <<EOF >>${nginxConfigPath}xray-agent.conf
 server {
 	${nginxH2Conf}
 
@@ -1449,9 +1456,6 @@ server {
 	location / {
 	}
 }
-EOF
-
-    cat <<EOF >>${nginxConfigPath}xray-agent.conf
 server {
 	listen 127.0.0.1:31300 proxy_protocol;
 	server_name ${domain};
@@ -1464,7 +1468,19 @@ server {
 	}
 }
 EOF
-    handleNginx stop
+    then
+        rm -f "${nginxConfTmp}"
+        echoContent red " ---> 写入Nginx配置失败: ${nginxConfFile}"
+        return 1
+    fi
+
+    if ! mv "${nginxConfTmp}" "${nginxConfFile}"; then
+        rm -f "${nginxConfTmp}"
+        echoContent red " ---> 保存Nginx配置失败: ${nginxConfFile}"
+        return 1
+    fi
+
+    echoContent green " ---> Nginx配置已写入: ${nginxConfFile}"
 }
 # 检查ip
 
@@ -1849,11 +1865,29 @@ initHysteria2Port() {
     echoContent yellow "\n ---> Hysteria2 UDP端口: ${hysteria2Port}"
 }
 
+# 将裸域名补全为 HTTPS URL，同时拒绝非 HTTP(S) 协议和空白字符。
+normalizeHTTPURL() {
+    local inputURL=$1
+
+    [[ -n "${inputURL}" && "${inputURL}" != *[[:space:]]* ]] || return 1
+    case "${inputURL}" in
+    http://* | https://*) ;;
+    *://*) return 1 ;;
+    *) inputURL="https://${inputURL}" ;;
+    esac
+
+    [[ "${inputURL}" =~ ^https?://[^/[:space:]]+(/[^[:space:]]*)?$ ]] || return 1
+    if [[ "${inputURL#*://}" != */* ]]; then
+        inputURL="${inputURL}/"
+    fi
+    printf '%s\n' "${inputURL}"
+}
+
 # 选择 Hysteria2 未认证 HTTP/3 请求的伪装方式。
 initHysteria2Masquerade() {
     echoContent skyBlue "\n---------- Hysteria2 HTTP/3伪装 ----------"
     echoContent yellow "1.本地静态网站"
-    echoContent yellow "2.301/302跳转"
+    echoContent yellow "2.301跳转"
     echoContent yellow "3.反向代理现有网站"
     if [[ -n "${btDomain}" ]]; then
         echoContent green "检测到aaPanel/面板网站，推荐选择3反向代理"
@@ -1868,25 +1902,17 @@ initHysteria2Masquerade() {
     1)
         hysteria2MasqueradeConfig=$(jq -nc --arg dir "${nginxStaticPath}" '{type:"file",dir:$dir}')
         echoContent green " ---> 使用本地静态网站: ${nginxStaticPath}"
-        ;;
+    ;;
     2)
         local redirectURL=
-        local redirectCode=
-        read -r -p "请输入跳转地址[例:https://v.domain.com/]:" redirectURL
-        if [[ ! "${redirectURL}" =~ ^https?://[^[:space:]]+$ ]]; then
-            echoContent red " ---> 跳转地址格式错误"
+        read -r -p "请输入跳转域名[例:v.domain.com]:" redirectURL
+        if ! redirectURL=$(normalizeHTTPURL "${redirectURL}"); then
+            echoContent red " ---> 跳转域名格式错误"
             initHysteria2Masquerade
             return
         fi
-        read -r -p "请输入状态码[301/302，默认:302]:" redirectCode
-        redirectCode=${redirectCode:-302}
-        if [[ "${redirectCode}" != "301" && "${redirectCode}" != "302" ]]; then
-            echoContent red " ---> 状态码只能是301或302"
-            initHysteria2Masquerade
-            return
-        fi
-        hysteria2MasqueradeConfig=$(jq -nc --arg url "${redirectURL}" --argjson code "${redirectCode}" '{type:"string",content:"",headers:{Location:$url},statusCode:$code}')
-        echoContent green " ---> HTTP/3未认证访问将${redirectCode}跳转到: ${redirectURL}"
+        hysteria2MasqueradeConfig=$(jq -nc --arg url "${redirectURL}" '{type:"string",content:"",headers:{Location:$url},statusCode:301}')
+        echoContent green " ---> HTTP/3未认证访问将301跳转到: ${redirectURL}"
         ;;
     3)
         local proxyURL=
@@ -1896,8 +1922,8 @@ initHysteria2Masquerade() {
         fi
         read -r -p "请输入反向代理地址${defaultProxyURL:+[默认:${defaultProxyURL}]}:" proxyURL
         proxyURL=${proxyURL:-${defaultProxyURL}}
-        if [[ ! "${proxyURL}" =~ ^https?://[^[:space:]]+$ ]]; then
-            echoContent red " ---> 反向代理地址格式错误"
+        if ! proxyURL=$(normalizeHTTPURL "${proxyURL}"); then
+            echoContent red " ---> 反向代理地址格式错误，请输入域名或完整的 http(s) URL"
             initHysteria2Masquerade
             return
         fi
@@ -2468,6 +2494,14 @@ checkWgetShowProgress() {
         wgetShowProgressStatus="--show-progress"
     fi
 }
+
+xrayVersionAtLeast() {
+    local currentVersion=${1#v}
+    local requiredVersion=${2#v}
+    [[ -n "${currentVersion}" && -n "${requiredVersion}" ]] || return 1
+    [[ "$(printf '%s\n%s\n' "${requiredVersion}" "${currentVersion}" | sort -V | head -n 1)" == "${requiredVersion}" ]]
+}
+
 # 安装xray
 installXray() {
     readInstallType
@@ -2774,9 +2808,9 @@ buildXrayClient() {
     esac
 }
 
-# 将脚本现有的 UUID 用户转换为 Xray-core Hysteria2 用户。
+# 将脚本现有的 UUID 用户转换为 Xray-core Hysteria2 认证客户端。
 # UUID 作为 auth 使用，便于所有已安装协议共用同一套账号。
-initXrayHysteria2Users() {
+initXrayHysteria2Clients() {
     local users='[]'
     local user userId userEmail
 
@@ -3101,6 +3135,12 @@ EOF
         echoContent skyBlue "\n===================== 配置Hysteria2+TLS =====================\n"
         initHysteria2Port
         initHysteria2Masquerade
+        local hysteria2UserField="clients"
+        local installedXrayVersion=
+        installedXrayVersion=$(/opt/xray-agent/xray/xray --version 2>/dev/null | awk 'NR == 1 {print $2}')
+        if xrayVersionAtLeast "${installedXrayVersion}" "26.5.9"; then
+            hysteria2UserField="users"
+        fi
         cat <<EOF >/opt/xray-agent/xray/conf/05_hysteria2_inbounds.json
 {
   "inbounds": [
@@ -3111,7 +3151,7 @@ EOF
       "tag": "Hysteria2",
       "settings": {
         "version": 2,
-        "users": $(initXrayHysteria2Users)
+        "${hysteria2UserField}": $(initXrayHysteria2Clients)
       },
       "streamSettings": {
         "network": "hysteria",
@@ -3296,7 +3336,7 @@ showAccounts() {
     # Hysteria2
     if echo ${currentInstallProtocolType} | grep -q ",6,"; then
         echoContent skyBlue "\n================================ Hysteria2 TLS/QUIC [游戏推荐] ================================\n"
-        jq -c '.inbounds[0].settings.users[]' "${configPath}05_hysteria2_inbounds.json" | while read -r user; do
+        jq -c '(.inbounds[0].settings.clients // .inbounds[0].settings.users // [])[]' "${configPath}05_hysteria2_inbounds.json" | while read -r user; do
             local email=
             email=$(echo "${user}" | jq -r '.email')
             echoContent skyBlue "\n ---> 账号:${email}"
@@ -3367,7 +3407,7 @@ EOF
         echo "${singBoxSubscribeLocalConfig}" | jq . >"/opt/xray-agent/subscribe_local/sing-box/${user}"
 
         echoContent yellow " ---> 二维码 VLESS(VLESS+TCP+TLS_Vision)"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40${currentHost}%3A${port}%3Fencryption%3Dnone%26fp%3Dchrome%26security%3Dtls%26type%3Dtcp%26${currentHost}%3D${currentHost}%26headerType%3Dnone%26sni%3D${currentHost}%26flow%3Dxtls-rprx-vision%23${email}\n"
+        echoContent green "    https://api-qr-server.zew9.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40${currentHost}%3A${port}%3Fencryption%3Dnone%26fp%3Dchrome%26security%3Dtls%26type%3Dtcp%26${currentHost}%3D${currentHost}%26headerType%3Dnone%26sni%3D${currentHost}%26flow%3Dxtls-rprx-vision%23${email}\n"
 
     elif [[ "${type}" == "vlessws" ]]; then
 
@@ -3401,13 +3441,13 @@ EOF
         echo "${singBoxSubscribeLocalConfig}" | jq . >"/opt/xray-agent/subscribe_local/sing-box/${user}"
 
         echoContent yellow " ---> 二维码 VLESS(VLESS+WS+TLS)"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40${add}%3A${port}%3Fencryption%3Dnone%26security%3Dtls%26type%3Dws%26host%3D${currentHost}%26fp%3Dchrome%26sni%3D${currentHost}%26path%3D${path}%23${email}"
+        echoContent green "    https://api-qr-server.zew9.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40${add}%3A${port}%3Fencryption%3Dnone%26security%3Dtls%26type%3Dws%26host%3D${currentHost}%26fp%3Dchrome%26sni%3D${currentHost}%26path%3D${path}%23${email}"
 
     elif [[ "${type}" == "hysteria" ]]; then
         echoContent yellow " ---> 通用格式(Hysteria2+TLS+QUIC)"
-        echoContent green "    hysteria2://${id}@${currentHost}:${port}/?sni=${currentHost}&insecure=0#${email}\n"
+        echoContent green "    hysteria2://${id}@${currentHost}:${port}/?sni=${currentHost}&alpn=h3&insecure=0#${email}\n"
         cat <<EOF >>"/opt/xray-agent/subscribe_local/default/${user}"
-hysteria2://${id}@${currentHost}:${port}/?sni=${currentHost}&insecure=0#${email}
+hysteria2://${id}@${currentHost}:${port}/?sni=${currentHost}&alpn=h3&insecure=0#${email}
 EOF
 
         cat <<EOF >>"/opt/xray-agent/subscribe_local/clashMeta/${user}"
@@ -3417,14 +3457,16 @@ EOF
     port: ${port}
     password: ${id}
     sni: ${currentHost}
+    alpn:
+      - h3
     skip-cert-verify: false
 EOF
 
-        singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\":\"hysteria2\",\"server\":\"${currentHost}\",\"server_port\":${port},\"password\":\"${id}\",\"tls\":{\"enabled\":true,\"server_name\":\"${currentHost}\",\"insecure\":false}}]" "/opt/xray-agent/subscribe_local/sing-box/${user}")
+        singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\":\"hysteria2\",\"server\":\"${currentHost}\",\"server_port\":${port},\"password\":\"${id}\",\"tls\":{\"enabled\":true,\"server_name\":\"${currentHost}\",\"alpn\":[\"h3\"],\"insecure\":false}}]" "/opt/xray-agent/subscribe_local/sing-box/${user}")
         echo "${singBoxSubscribeLocalConfig}" | jq . >"/opt/xray-agent/subscribe_local/sing-box/${user}"
 
         echoContent yellow " ---> 二维码 Hysteria2(TLS)"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=hysteria2%3A%2F%2F${id}%40${currentHost}%3A${port}%2F%3Fsni%3D${currentHost}%26insecure%3D0%23${email}\n"
+        echoContent green "    https://api-qr-server.zew9.com/v1/create-qr-code/?size=400x400&data=hysteria2%3A%2F%2F${id}%40${currentHost}%3A${port}%2F%3Fsni%3D${currentHost}%26alpn%3Dh3%26insecure%3D0%23${email}\n"
 
     elif [[ "${type}" == "vlessReality" ]]; then
         local realityServerName=${xrayVLESSRealityServerName}
@@ -3460,7 +3502,7 @@ EOF
         echo "${singBoxSubscribeLocalConfig}" | jq . >"/opt/xray-agent/subscribe_local/sing-box/${user}"
 
         echoContent yellow " ---> 二维码 VLESS(VLESS+reality+uTLS+Vision)"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40$(getPublicIP)%3A${port}%3Fencryption%3Dnone%26security%3Dreality%26type%3Dtcp%26sni%3D${realityServerName}%26fp%3Dchrome%26pbk%3D${publicKey}%26sid%3D6ba85179e30d4fc2%26flow%3Dxtls-rprx-vision%23${email}\n"
+        echoContent green "    https://api-qr-server.zew9.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40$(getPublicIP)%3A${port}%3Fencryption%3Dnone%26security%3Dreality%26type%3Dtcp%26sni%3D${realityServerName}%26fp%3Dchrome%26pbk%3D${publicKey}%26sid%3D6ba85179e30d4fc2%26flow%3Dxtls-rprx-vision%23${email}\n"
 
     fi
 
@@ -3845,7 +3887,7 @@ customUUID() {
         local userConfigFile=
         while IFS= read -r userConfigFile; do
             if jq -e --arg currentUUID "${currentCustomUUID}" '
-                any(.inbounds[]?.settings.clients[]?; (.id // .uuid // "") == $currentUUID) or
+                any(.inbounds[]?.settings.clients[]?; (.auth // .id // .uuid // "") == $currentUUID) or
                 any(.inbounds[]?.settings.users[]?; (.auth // .id // .uuid // "") == $currentUUID)
             ' "${userConfigFile}" >/dev/null 2>&1; then
                 checkUUID=true
@@ -3938,7 +3980,13 @@ addUser() {
         # Hysteria2 使用同一个 UUID 作为认证密码
         if echo "${currentInstallProtocolType}" | grep -q ",6,"; then
             local hysteria2Config=
-            hysteria2Config=$(jq --arg auth "${uuid}" --arg email "${email}-Hysteria2" '.inbounds[0].settings.users += [{auth: $auth, level: 0, email: $email}]' "${configPath}05_hysteria2_inbounds.json")
+            hysteria2Config=$(jq --arg auth "${uuid}" --arg email "${email}-Hysteria2" '
+                if .inbounds[0].settings.clients != null then
+                    .inbounds[0].settings.clients += [{auth: $auth, level: 0, email: $email}]
+                else
+                    .inbounds[0].settings.users += [{auth: $auth, level: 0, email: $email}]
+                end
+            ' "${configPath}05_hysteria2_inbounds.json")
             echo "${hysteria2Config}" | jq . >"${configPath}05_hysteria2_inbounds.json"
         fi
 
@@ -5240,7 +5288,11 @@ customXrayInstall() {
             nginxBlog 6
         fi
         if [[ "${selectCustomInstallType}" != ",3," ]]; then
-            updateRedirectNginxConf
+            if ! updateRedirectNginxConf; then
+                echoContent red " ---> 无法生成Nginx配置，已中止安装并尝试恢复Nginx"
+                handleNginx start
+                return 1
+            fi
             handleNginx start
         fi
 
@@ -5309,7 +5361,11 @@ xrayCoreInstall() {
     else
         nginxBlog 10
     fi
-    updateRedirectNginxConf
+    if ! updateRedirectNginxConf; then
+        echoContent red " ---> 无法生成Nginx配置，已中止安装并尝试恢复Nginx"
+        handleNginx start
+        return 1
+    fi
     handleXray stop
     sleep 2
     handleXray start
@@ -6013,7 +6069,7 @@ subscribe() {
                     echoContent skyBlue "\n----------默认订阅----------\n"
                     echoContent green "email:${email}\n"
                     echoContent yellow "url:${subscribeType}://${currentDomain}/s/default/${emailMd5}\n"
-                    echoContent yellow "在线二维码:https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${subscribeType}://${currentDomain}/s/default/${emailMd5}\n"
+                    echoContent yellow "在线二维码:https://api-qr-server.zew9.com/v1/create-qr-code/?size=400x400&data=${subscribeType}://${currentDomain}/s/default/${emailMd5}\n"
                     echo "${subscribeType}://${currentDomain}/s/default/${emailMd5}" | qrencode -s 10 -m 1 -t UTF8
 
                     # clashMeta
@@ -6027,7 +6083,7 @@ subscribe() {
                         clashMetaConfig "${clashProxyUrl}" "${emailMd5}"
                         echoContent skyBlue "\n----------clashMeta订阅----------\n"
                         echoContent yellow "url:${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}\n"
-                        echoContent yellow "在线二维码:https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}\n"
+                        echoContent yellow "在线二维码:https://api-qr-server.zew9.com/v1/create-qr-code/?size=400x400&data=${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}\n"
                         echo "${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}" | qrencode -s 10 -m 1 -t UTF8
 
                     fi
