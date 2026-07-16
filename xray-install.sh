@@ -202,7 +202,9 @@ initVar() {
 
     # Xray-core Hysteria2 UDP端口
     hysteria2Port=
+    hysteria2BbrProfile=
     hysteria2MasqueradeConfig=
+    selectedHysteria2BbrProfile=
 
     # Reality
     realityPrivateKey=
@@ -390,25 +392,56 @@ readInstallProtocolType() {
     fi
 }
 
-# 检查是否安装宝塔
+# 检查是否安装宝塔/aaPanel。面板进程名在不同版本中并不固定，
+# 因此同时依据 Nginx、vhost 目录和面板进程判断。
+isBTPanelEnvironment() {
+    [[ -d "/www/server/panel/vhost/nginx" ]] || return 1
+    [[ -x "/www/server/nginx/sbin/nginx" ]] || pgrep -f "BT-Panel|aaPanel" >/dev/null 2>&1
+}
+
+# 仅保留具有合法域名文件名并已配置可用 TLS 证书的面板站点。
+isBTPanelSiteConfig() {
+    local confFile=$1
+    local siteDomain=
+    local certFile=
+    local keyFile=
+
+    siteDomain=$(basename "${confFile}" .conf)
+    [[ "${siteDomain}" != 0.* ]] || return 1
+    [[ "${siteDomain}" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+
+    certFile=$(awk '$1 == "ssl_certificate" {gsub(/[;\"]/, "", $2); print $2; exit}' "${confFile}" 2>/dev/null)
+    keyFile=$(awk '$1 == "ssl_certificate_key" {gsub(/[;\"]/, "", $2); print $2; exit}' "${confFile}" 2>/dev/null)
+    certFile=${certFile:-/www/server/panel/vhost/cert/${siteDomain}/fullchain.pem}
+    keyFile=${keyFile:-/www/server/panel/vhost/cert/${siteDomain}/privkey.pem}
+
+    [[ -f "${certFile}" && -f "${keyFile}" ]]
+}
 
 # ===== Module 02_preflight.sh =====
 # 模块 02：面板检测、防火墙与配置读取
 
 checkBTPanel() {
-    if [[ -n $(pgrep -f "BT-Panel") ]]; then
+    if isBTPanelEnvironment; then
         # 读取域名
-        if [[ -d '/www/server/panel/vhost/nginx/' ]] && [[ -n $(find /www/server/panel/vhost/nginx -maxdepth 1 -name "*.conf" ! -name "xray-agent.conf" ! -name "phpmyadmin.conf") ]]; then
+        if [[ -d '/www/server/panel/vhost/nginx/' ]]; then
             local -a btDomains=()
-            mapfile -t btDomains < <(find /www/server/panel/vhost/nginx -maxdepth 1 -name "*.conf" ! -name "xray-agent.conf" ! -name "phpmyadmin.conf" -printf "%f\n" 2>/dev/null | sed 's/\.conf$//' | sort)
+            local panelConfFile=
+            while IFS= read -r panelConfFile; do
+                if isBTPanelSiteConfig "${panelConfFile}"; then
+                    btDomains+=("$(basename "${panelConfFile}" .conf)")
+                fi
+            done < <(find /www/server/panel/vhost/nginx -maxdepth 1 -type f -name "*.conf" ! -name "xray-agent.conf" -print 2>/dev/null | sort)
             local btDomainCount=${#btDomains[@]}
             if ((btDomainCount == 0)); then
+                echoContent yellow " ---> 未发现配置了有效TLS证书的宝塔/aaPanel网站"
                 return
             fi
+            local selectBTDomain=
 
             # 如果用户选择不使用上次配置或currentHost为空，则提示用户选择
             if [[ "${forceSelectDomain}" == "true" ]] || [[ -z "${currentHost}" ]]; then
-                echoContent skyBlue "\n读取宝塔配置\n"
+                echoContent skyBlue "\n读取宝塔/aaPanel配置\n"
 
                 local displayIndex
                 for ((displayIndex = 0; displayIndex < btDomainCount; displayIndex++)); do
@@ -427,6 +460,14 @@ checkBTPanel() {
                         break
                     fi
                 done
+                if [[ -z "${selectBTDomain}" ]]; then
+                    echoContent yellow " ---> 上次域名 ${currentHost} 不在面板站点中，请重新选择"
+                    for ((displayIndex = 0; displayIndex < btDomainCount; displayIndex++)); do
+                        local printIndex=$((displayIndex + 1))
+                        echo "${printIndex}:${btDomains[displayIndex]}"
+                    done
+                    read -r -p "请输入编号选择:" selectBTDomain
+                fi
             fi
 
             if [[ -n "${selectBTDomain}" && "${selectBTDomain}" =~ ^[0-9]+$ ]]; then
@@ -434,26 +475,29 @@ checkBTPanel() {
                 if ((selectedIndex < 0 || selectedIndex >= btDomainCount)); then
                     echoContent red " ---> 选择错误，请重新选择"
                     checkBTPanel
+                    return
                 else
-                    btDomain=${btDomains[selectedIndex]}
-                    domain=${btDomain}
-                    local btConfFile="/www/server/panel/vhost/nginx/${btDomain}.conf"
+                    local selectedBTDomain=${btDomains[selectedIndex]}
+                    local btConfFile="/www/server/panel/vhost/nginx/${selectedBTDomain}.conf"
                     local certFile=
                     local keyFile=
-                    certFile=$(awk '$1 == "ssl_certificate" {gsub(/;/, "", $2); print $2; exit}' "${btConfFile}" 2>/dev/null)
-                    keyFile=$(awk '$1 == "ssl_certificate_key" {gsub(/;/, "", $2); print $2; exit}' "${btConfFile}" 2>/dev/null)
+                    certFile=$(awk '$1 == "ssl_certificate" {gsub(/[;\"]/, "", $2); print $2; exit}' "${btConfFile}" 2>/dev/null)
+                    keyFile=$(awk '$1 == "ssl_certificate_key" {gsub(/[;\"]/, "", $2); print $2; exit}' "${btConfFile}" 2>/dev/null)
 
                     if [[ -z "${certFile}" ]]; then
-                        certFile="/www/server/panel/vhost/cert/${btDomain}/fullchain.pem"
+                        certFile="/www/server/panel/vhost/cert/${selectedBTDomain}/fullchain.pem"
                     fi
                     if [[ -z "${keyFile}" ]]; then
-                        keyFile="/www/server/panel/vhost/cert/${btDomain}/privkey.pem"
+                        keyFile="/www/server/panel/vhost/cert/${selectedBTDomain}/privkey.pem"
                     fi
 
                     if [[ ! -f "${certFile}" || ! -f "${keyFile}" ]]; then
-                        echoContent red " ---> 未找到宝塔证书文件，请先检查站点SSL配置"
+                        echoContent yellow " ---> 未找到 ${selectedBTDomain} 的面板证书，将使用普通TLS证书流程"
                         return
                     fi
+
+                    btDomain=${selectedBTDomain}
+                    domain=${btDomain}
 
                     mkdir -p /opt/xray-agent/tls
                     ln -sfn "${certFile}" "/opt/xray-agent/tls/${btDomain}.crt"
@@ -471,6 +515,7 @@ checkBTPanel() {
             else
                 echoContent red " ---> 选择错误，请重新选择"
                 checkBTPanel
+                return
             fi
         fi
     fi
@@ -778,6 +823,7 @@ readConfigHostPathUUID() {
         # Hysteria2-only installations do not have a VLESS fronting config.
         if [[ -f "${configPath}05_hysteria2_inbounds.json" ]]; then
             hysteria2Port=$(jq -r '.inbounds[0].port' "${configPath}05_hysteria2_inbounds.json")
+            hysteria2BbrProfile=$(jq -r '.inbounds[0].streamSettings.finalmask.quicParams.bbrProfile // "standard"' "${configPath}05_hysteria2_inbounds.json")
             if [[ -z "${currentHost}" || "${currentHost}" == "null" ]]; then
                 currentHost=$(jq -r '.inbounds[0].streamSettings.tlsSettings.certificates[0].certificateFile' "${configPath}05_hysteria2_inbounds.json" | awk -F '[t][l][s][/]' '{print $2}' | awk -F '[.][c][r][t]' '{print $1}')
             fi
@@ -1438,6 +1484,21 @@ updateRedirectNginxConf() {
         nginxH2Conf="listen 127.0.0.1:31302 so_keepalive=on proxy_protocol;http2 on;"
     fi
 
+    local fallbackLocationConfig=
+    if [[ -n "${btDomain}" ]]; then
+        fallbackLocationConfig=$(printf '%s\n' \
+            '        proxy_pass https://127.0.0.1:443;' \
+            '        proxy_http_version 1.1;' \
+            "        proxy_set_header Host ${btDomain};" \
+            '        proxy_set_header X-Real-IP $remote_addr;' \
+            '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;' \
+            '        proxy_set_header X-Forwarded-Proto https;' \
+            '        proxy_ssl_server_name on;' \
+            "        proxy_ssl_name ${btDomain};" \
+            '        proxy_ssl_verify off;')
+        echoContent green " ---> Vision普通HTTPS回落将反向代理到面板站点: https://${btDomain}/"
+    fi
+
     if ! cat <<EOF >"${nginxConfTmp}"
     server {
     		listen 127.0.0.1:31300;
@@ -1454,6 +1515,7 @@ server {
 	root ${nginxStaticPath};
 
 	location / {
+	${fallbackLocationConfig}
 	}
 }
 server {
@@ -1465,6 +1527,7 @@ server {
 
 	root ${nginxStaticPath};
 	location / {
+	${fallbackLocationConfig}
 	}
 }
 EOF
@@ -1865,6 +1928,45 @@ initHysteria2Port() {
     echoContent yellow "\n ---> Hysteria2 UDP端口: ${hysteria2Port}"
 }
 
+# 选择 Xray QUIC BBR 的行为档位，结果写入 selectedHysteria2BbrProfile。
+selectHysteria2BbrProfile() {
+    local defaultProfile=${1:-standard}
+    local contextLabel=${2:-Hysteria2}
+    local defaultChoice=2
+    local profileChoice=
+
+    case ${defaultProfile} in
+    conservative) defaultChoice=1 ;;
+    aggressive) defaultChoice=3 ;;
+    *) defaultProfile=standard ;;
+    esac
+
+    echoContent skyBlue "\n---------- ${contextLabel} QUIC BBR Profile ----------"
+    echoContent yellow "1.conservative [低抖动/保守]"
+    echoContent yellow "2.standard [均衡/推荐]"
+    echoContent yellow "3.aggressive [吞吐优先]"
+    echoContent skyBlue "------------------------------------------------------"
+    read -r -p "请选择[默认:${defaultChoice}]：" profileChoice
+    profileChoice=${profileChoice:-${defaultChoice}}
+
+    case ${profileChoice} in
+    1) selectedHysteria2BbrProfile=conservative ;;
+    2) selectedHysteria2BbrProfile=standard ;;
+    3) selectedHysteria2BbrProfile=aggressive ;;
+    *)
+        echoContent red " ---> 请选择 1-3"
+        selectHysteria2BbrProfile "${defaultProfile}" "${contextLabel}"
+        return
+        ;;
+    esac
+    echoContent green " ---> ${contextLabel} QUIC拥塞控制: BBR/${selectedHysteria2BbrProfile}"
+}
+
+initHysteria2BbrProfile() {
+    selectHysteria2BbrProfile "${hysteria2BbrProfile:-standard}" "Hysteria2"
+    hysteria2BbrProfile=${selectedHysteria2BbrProfile}
+}
+
 # 将裸域名补全为 HTTPS URL，同时拒绝非 HTTP(S) 协议和空白字符。
 normalizeHTTPURL() {
     local inputURL=$1
@@ -1885,13 +1987,23 @@ normalizeHTTPURL() {
 
 # 选择 Hysteria2 未认证 HTTP/3 请求的伪装方式。
 initHysteria2Masquerade() {
+    # 面板站点已提供完整网站和有效 TLS，直接作为 Hysteria2 伪装目标。
+    # Hysteria2 使用 UDP 入站，目标网站使用 TCP/443，不会产生端口冲突。
+    if [[ -n "${btDomain}" ]]; then
+        local panelProxyURL=
+        if panelProxyURL=$(normalizeHTTPURL "${btDomain}"); then
+            hysteria2MasqueradeConfig=$(jq -nc --arg url "${panelProxyURL}" '{type:"proxy",url:$url,rewriteHost:true,insecure:false}')
+            echoContent skyBlue "\n---------- Hysteria2 HTTP/3伪装 ----------"
+            echoContent green " ---> 检测到宝塔/aaPanel站点，自动反向代理到: ${panelProxyURL}"
+            return
+        fi
+        echoContent yellow " ---> 面板站点域名无效，改为手动选择Hysteria2伪装"
+    fi
+
     echoContent skyBlue "\n---------- Hysteria2 HTTP/3伪装 ----------"
     echoContent yellow "1.本地静态网站"
     echoContent yellow "2.301跳转"
     echoContent yellow "3.反向代理现有网站"
-    if [[ -n "${btDomain}" ]]; then
-        echoContent green "检测到aaPanel/面板网站，推荐选择3反向代理"
-    fi
     echoContent skyBlue "------------------------------------------"
 
     local masqueradeType=
@@ -1917,9 +2029,6 @@ initHysteria2Masquerade() {
     3)
         local proxyURL=
         local defaultProxyURL=
-        if [[ -n "${btDomain}" ]]; then
-            defaultProxyURL="https://${btDomain}/"
-        fi
         read -r -p "请输入反向代理地址${defaultProxyURL:+[默认:${defaultProxyURL}]}:" proxyURL
         proxyURL=${proxyURL:-${defaultProxyURL}}
         if ! proxyURL=$(normalizeHTTPURL "${proxyURL}"); then
@@ -3134,6 +3243,7 @@ EOF
     if echo "${selectCustomInstallType}" | grep -q ",6," || [[ "$1" == "all" ]]; then
         echoContent skyBlue "\n===================== 配置Hysteria2+TLS =====================\n"
         initHysteria2Port
+        initHysteria2BbrProfile
         initHysteria2Masquerade
         local hysteria2UserField="clients"
         local installedXrayVersion=
@@ -3172,6 +3282,12 @@ EOF
           "version": 2,
           "udpIdleTimeout": 60,
           "masquerade": ${hysteria2MasqueradeConfig}
+        },
+        "finalmask": {
+          "quicParams": {
+            "congestion": "bbr",
+            "bbrProfile": "${hysteria2BbrProfile}"
+          }
         }
       }
     }
@@ -4706,7 +4822,8 @@ buildRelayOutbound() {
     local outboundTag=$1 outputFile=$2 carriesUdp=$3 forcedProtocol=${4:-}
     local protocolChoice=${forcedProtocol}
     local relayAddress relayPort relayUUID relaySNI relayFlow
-    local relayPath relayHost relayPublicKey relayShortId relayMldsa65Verify relayAuth
+    local relayPath relayHost relayPublicKey relayShortId relayMldsa65Verify relayAuth relayBbrProfile
+    relayBuiltBbrProfile=
 
     if [[ -z "${protocolChoice}" ]]; then
         echoContent skyBlue "\n请选择上游节点已安装的协议"
@@ -4788,11 +4905,14 @@ buildRelayOutbound() {
         [[ -z "${relayAuth}" ]] && echoContent red " ---> Hysteria2 认证密码不能为空" && return 1
         read -r -p "SNI[默认使用上游地址]:" relaySNI
         relaySNI=${relaySNI:-${relayAddress}}
+        selectHysteria2BbrProfile "standard" "上游Hysteria2"
+        relayBbrProfile=${selectedHysteria2BbrProfile}
         jq -n --arg tag "${outboundTag}" --arg address "${relayAddress}" --argjson port "${relayPort}" \
-            --arg auth "${relayAuth}" --arg sni "${relaySNI}" '
-            {outbounds:[{tag:$tag,protocol:"hysteria",settings:{version:2,address:$address,port:$port},streamSettings:{network:"hysteria",security:"tls",tlsSettings:{serverName:$sni,allowInsecure:false,alpn:["h3"]},hysteriaSettings:{version:2,auth:$auth,udpIdleTimeout:60}}}]}' >"${outputFile}"
+            --arg auth "${relayAuth}" --arg sni "${relaySNI}" --arg bbrProfile "${relayBbrProfile}" '
+            {outbounds:[{tag:$tag,protocol:"hysteria",settings:{version:2,address:$address,port:$port},streamSettings:{network:"hysteria",security:"tls",tlsSettings:{serverName:$sni,allowInsecure:false,alpn:["h3"]},hysteriaSettings:{version:2,auth:$auth,udpIdleTimeout:60},finalmask:{quicParams:{congestion:"bbr",bbrProfile:$bbrProfile}}}}]}' >"${outputFile}"
         relayBuiltProtocol="hysteria2"
         relayBuiltLabel="Hysteria2 + TLS + QUIC"
+        relayBuiltBbrProfile=${relayBbrProfile}
         ;;
     esac
 
@@ -4869,6 +4989,7 @@ setupRelay() {
     mkdir -p "${backupDir}"
     local tcpProtocol="" tcpLabel="直连" tcpAddress="" tcpPort=""
     local udpProtocol="" udpLabel="直连" udpAddress="" udpPort=""
+    local tcpBbrProfile="" udpBbrProfile=""
 
     buildRelayOutbound "relay_tcp_outbound" "${tcpTemp}" "$([[ "${udpMode}" == "shared" ]] && echo true || echo false)" || {
         rm -rf "${tempDir}"
@@ -4878,12 +4999,14 @@ setupRelay() {
     tcpLabel=${relayBuiltLabel}
     tcpAddress=${relayBuiltAddress}
     tcpPort=${relayBuiltPort}
+    tcpBbrProfile=${relayBuiltBbrProfile}
 
     if [[ "${udpMode}" == "shared" ]]; then
         udpProtocol=${tcpProtocol}
         udpLabel=${tcpLabel}
         udpAddress=${tcpAddress}
         udpPort=${tcpPort}
+        udpBbrProfile=${tcpBbrProfile}
     fi
 
     # 只在所有输入都验证成功后替换现有配置，并保留可回滚副本。
@@ -4909,9 +5032,9 @@ setupRelay() {
     }
 
     jq -n --argjson inboundTags "${relaySelectedInboundTags}" \
-        --arg tcpMode "${tcpMode}" --arg tcpProtocol "${tcpProtocol}" --arg tcpLabel "${tcpLabel}" --arg tcpAddress "${tcpAddress}" --arg tcpPort "${tcpPort}" \
-        --arg udpMode "${udpMode}" --arg udpProtocol "${udpProtocol}" --arg udpLabel "${udpLabel}" --arg udpAddress "${udpAddress}" --arg udpPort "${udpPort}" \
-        '{inboundTags:$inboundTags,tcp:{mode:$tcpMode,protocol:$tcpProtocol,label:$tcpLabel,address:$tcpAddress,port:$tcpPort},udp:{mode:$udpMode,protocol:$udpProtocol,label:$udpLabel,address:$udpAddress,port:$udpPort}}' \
+        --arg tcpMode "${tcpMode}" --arg tcpProtocol "${tcpProtocol}" --arg tcpLabel "${tcpLabel}" --arg tcpAddress "${tcpAddress}" --arg tcpPort "${tcpPort}" --arg tcpBbrProfile "${tcpBbrProfile}" \
+        --arg udpMode "${udpMode}" --arg udpProtocol "${udpProtocol}" --arg udpLabel "${udpLabel}" --arg udpAddress "${udpAddress}" --arg udpPort "${udpPort}" --arg udpBbrProfile "${udpBbrProfile}" \
+        '{inboundTags:$inboundTags,tcp:{mode:$tcpMode,protocol:$tcpProtocol,label:$tcpLabel,address:$tcpAddress,port:$tcpPort,bbrProfile:$tcpBbrProfile},udp:{mode:$udpMode,protocol:$udpProtocol,label:$udpLabel,address:$udpAddress,port:$udpPort,bbrProfile:$udpBbrProfile}}' \
         >"/opt/xray-agent/relay_config.json"
     rm -f /opt/xray-agent/relay_config
 
@@ -4930,8 +5053,8 @@ setupRelay() {
     echo
     echoContent green " ---> 链式代理已启用！"
     echoContent yellow " ---> 入站: $(jq -r '.inboundTags | join(", ")' /opt/xray-agent/relay_config.json)"
-    echoContent yellow " ---> TCP: ${tcpLabel}${tcpAddress:+ → ${tcpAddress}:${tcpPort}}"
-    echoContent yellow " ---> UDP: ${udpLabel}${udpAddress:+ → ${udpAddress}:${udpPort}}"
+    echoContent yellow " ---> TCP: ${tcpLabel}${tcpAddress:+ → ${tcpAddress}:${tcpPort}}${tcpBbrProfile:+ [BBR/${tcpBbrProfile}]}"
+    echoContent yellow " ---> UDP: ${udpLabel}${udpAddress:+ → ${udpAddress}:${udpPort}}${udpBbrProfile:+ [BBR/${udpBbrProfile}]}"
 }
 
 showRelayConfig() {
@@ -4947,8 +5070,8 @@ showRelayConfig() {
     echoContent skyBlue "\n当前链式代理配置"
     echoContent red "=============================================================="
     echoContent yellow "入站: $(jq -r '.inboundTags | join(", ")' "${stateFile}")"
-    echoContent yellow "TCP : $(jq -r 'if .tcp.mode == "direct" then "直连" else (.tcp.label + " -> " + .tcp.address + ":" + .tcp.port) end' "${stateFile}")"
-    echoContent yellow "UDP : $(jq -r 'if .udp.mode == "direct" then "直连" else (.udp.label + " -> " + .udp.address + ":" + .udp.port) end' "${stateFile}")"
+    echoContent yellow "TCP : $(jq -r 'if .tcp.mode == "direct" then "直连" else (.tcp.label + " -> " + .tcp.address + ":" + .tcp.port + if (.tcp.bbrProfile // "") != "" then " [BBR/" + .tcp.bbrProfile + "]" else "" end) end' "${stateFile}")"
+    echoContent yellow "UDP : $(jq -r 'if .udp.mode == "direct" then "直连" else (.udp.label + " -> " + .udp.address + ":" + .udp.port + if (.udp.bbrProfile // "") != "" then " [BBR/" + .udp.bbrProfile + "]" else "" end) end' "${stateFile}")"
     echoContent red "=============================================================="
 }
 
@@ -6424,6 +6547,94 @@ realityScanner() {
     fi
 }
 # hysteria管理
+setHysteria2BbrProfile() {
+    local profile=$1
+    local hysteriaConfig="${configPath}05_hysteria2_inbounds.json"
+    local tempConfig=
+    local backupConfig=
+    local validationOutput=
+
+    [[ "${profile}" =~ ^(conservative|standard|aggressive)$ ]] || return 1
+    if [[ ! -f "${hysteriaConfig}" ]]; then
+        echoContent red " ---> 未安装Hysteria2"
+        return 1
+    fi
+
+    tempConfig=$(mktemp "${hysteriaConfig}.tmp.XXXXXX") || return 1
+    if ! jq --arg profile "${profile}" '
+        .inbounds[0].streamSettings.finalmask //= {} |
+        .inbounds[0].streamSettings.finalmask.quicParams //= {} |
+        .inbounds[0].streamSettings.finalmask.quicParams.congestion = "bbr" |
+        .inbounds[0].streamSettings.finalmask.quicParams.bbrProfile = $profile
+    ' "${hysteriaConfig}" >"${tempConfig}"; then
+        rm -f "${tempConfig}"
+        echoContent red " ---> Hysteria2配置更新失败"
+        return 1
+    fi
+
+    backupConfig=$(mktemp "${hysteriaConfig}.bak.XXXXXX") || {
+        rm -f "${tempConfig}"
+        return 1
+    }
+    if ! cp "${hysteriaConfig}" "${backupConfig}"; then
+        rm -f "${tempConfig}" "${backupConfig}"
+        echoContent red " ---> Hysteria2配置备份失败"
+        return 1
+    fi
+    chmod --reference="${hysteriaConfig}" "${tempConfig}" 2>/dev/null || chmod 644 "${tempConfig}"
+    if ! mv "${tempConfig}" "${hysteriaConfig}"; then
+        rm -f "${tempConfig}" "${backupConfig}"
+        echoContent red " ---> Hysteria2配置保存失败"
+        return 1
+    fi
+
+    if ! validationOutput=$(/opt/xray-agent/xray/xray run -test -confdir "${configPath}" 2>&1); then
+        mv "${backupConfig}" "${hysteriaConfig}"
+        echoContent red " ---> Xray拒绝了新配置，已自动恢复"
+        echoContent yellow "${validationOutput}"
+        return 1
+    fi
+
+    rm -f "${backupConfig}"
+    handleXray stop
+    handleXray start
+    hysteria2BbrProfile=${profile}
+    echoContent green " ---> Hysteria2 QUIC拥塞控制已切换为: BBR/${profile}"
+}
+
+manageHysteria2() {
+    local hysteriaConfig="${configPath}05_hysteria2_inbounds.json"
+    if [[ ! -f "${hysteriaConfig}" ]]; then
+        echoContent red " ---> 当前未安装Hysteria2，请先通过任意组合安装"
+        return
+    fi
+
+    while true; do
+        local currentCongestion=
+        local currentProfile=
+        local manageChoice=
+        currentCongestion=$(jq -r '.inbounds[0].streamSettings.finalmask.quicParams.congestion // "默认"' "${hysteriaConfig}")
+        currentProfile=$(jq -r '.inbounds[0].streamSettings.finalmask.quicParams.bbrProfile // "standard"' "${hysteriaConfig}")
+
+        echoContent skyBlue "\n===================== Hysteria2管理 ====================="
+        echoContent yellow "当前QUIC拥塞控制: ${currentCongestion}/${currentProfile}"
+        echoContent green "# 此处调整本机Hysteria2入站；链式上游在中转管理中单独设置"
+        echoContent yellow "1.切换为 conservative [低抖动/保守]"
+        echoContent yellow "2.切换为 standard [均衡/推荐]"
+        echoContent yellow "3.切换为 aggressive [吞吐优先]"
+        echoContent yellow "0.返回主菜单"
+        echoContent red "========================================================="
+        read -r -p "请选择:" manageChoice
+
+        case ${manageChoice} in
+        1) setHysteria2BbrProfile conservative ;;
+        2) setHysteria2BbrProfile standard ;;
+        3) setHysteria2BbrProfile aggressive ;;
+        0) return ;;
+        *) echoContent red " ---> 请输入 0-3" ;;
+        esac
+    done
+}
 
 # ===== Module 11_menu.sh =====
 # 模块 11：交互菜单与入口逻辑
@@ -6432,7 +6643,7 @@ realityScanner() {
 menu() {
     cd "$HOME" || exit
     echoContent red "\n=============================================================="
-    echoContent green "当前版本：v26.07.15"
+    echoContent green "当前版本：v26.07.16"
     echoContent green "描述：Xray 一键安装管理脚本\c"
     showInstallStatus
     checkWgetShowProgress
@@ -6453,13 +6664,14 @@ menu() {
     echoContent yellow "6.证书管理"
     echoContent yellow "7.分流工具"
     echoContent yellow "8.添加新端口"
+    echoContent yellow "9.Hysteria2管理"
     echoContent skyBlue "-------------------------版本管理-----------------------------"
-    echoContent yellow "9.Xray版本管理"
-    echoContent yellow "10.更新脚本"
+    echoContent yellow "10.Xray版本管理"
+    echoContent yellow "11.更新脚本"
     echoContent skyBlue "-------------------------脚本管理-----------------------------"
-    echoContent yellow "11.卸载脚本"
+    echoContent yellow "12.卸载脚本"
     echoContent skyBlue "-------------------------中转管理-----------------------------"
-    echoContent yellow "12.中转管理（链式代理）"
+    echoContent yellow "13.中转管理（链式代理）"
     echoContent red "=============================================================="
     mkdirTools
     aliasInstall
@@ -6490,15 +6702,18 @@ menu() {
         addCorePort 1
         ;;
     9)
-        coreVersionManageMenu 1
+        manageHysteria2
         ;;
     10)
-        updateXrayAgent 1
+        coreVersionManageMenu 1
         ;;
     11)
-        unInstall 1
+        updateXrayAgent 1
         ;;
     12)
+        unInstall 1
+        ;;
+    13)
         manageRelay 1
         ;;
     esac
