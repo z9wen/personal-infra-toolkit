@@ -1,0 +1,58 @@
+name: Repository Quality
+
+on:
+  push:
+    paths:
+      - "**/*.sh"
+      - "**/*.yml"
+      - "**/*.yaml"
+      - "Makefile"
+      - ".yamllint.yml"
+  pull_request:
+    paths:
+      - "**/*.sh"
+      - "**/*.yml"
+      - "**/*.yaml"
+      - "Makefile"
+      - ".yamllint.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Shell, YAML and workflow validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install quality tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck shfmt yamllint
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Check generated Xray installer
+        run: make xray-check
+
+      - name: Check Bash syntax
+        run: make syntax
+
+      - name: Run ShellCheck
+        run: make lint
+
+      - name: Check shell formatting
+        run: make format-check
+
+      - name: Validate YAML
+        run: make yaml-lint
+
+      - name: Validate GitHub Actions
+        run: make actionlint
