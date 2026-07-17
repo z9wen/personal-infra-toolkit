@@ -12,7 +12,7 @@ This repository covers common small-scale infrastructure tasks:
 - Basic security hardening with `fail2ban`
 - Backup workflows with `rclone`
 - Operational support for HestiaCP
-- MySQL/MariaDB dump and restore workflows
+- MySQL/MariaDB and PostgreSQL backup and restore workflows
 
 ## Why this repo exists
 
@@ -35,7 +35,7 @@ It focuses on common operational work such as:
 - `acme.sh`
 - `fail2ban`
 - `rclone`
-- MySQL / MariaDB
+- MySQL / MariaDB / PostgreSQL
 - GitHub Actions
 
 ## Repository Layout
@@ -45,14 +45,14 @@ It focuses on common operational work such as:
 ├── acme/                     # acme.sh container setup and env example
 ├── fail2ban/                # fail2ban Compose deployment
 ├── hestiash/                # HestiaCP certificate and backup helpers
+├── networking/              # Linux networking and edge-service automation
 ├── nginx/                   # Nginx Compose deployment and site manager
 ├── acme_manage.sh           # acme.sh install / uninstall / CA switching
 ├── bbr_optimizer.sh         # BBR tuning helper
 ├── copy_user_key_to_root.sh # merge user SSH keys into root authorized_keys
 ├── fix_acme_serverauth.sh   # repair polluted acme.sh serverAuth config
 ├── rclone-backup.sh         # simple site + db backup sync example
-├── sql_manage.sh            # MySQL/MariaDB backup and restore helper
-└── xray-install.sh          # large Xray deployment installer
+└── sql_manage.sh            # MySQL/MariaDB/PostgreSQL menu-based backup helper
 ```
 
 ## Key Scripts
@@ -61,8 +61,9 @@ It focuses on common operational work such as:
 | --- | --- | --- |
 | `nginx/site_manager.sh` | create sites, reverse proxies, SSL, reload/test Nginx | reverse proxy, web ops, validation |
 | `acme_manage.sh` | install `acme.sh`, switch CA provider, inspect status | PKI, TLS automation, CA operations |
-| `sql_manage.sh` | backup, restore, list, clean MySQL dumps | data safety, DB operations, recovery |
+| `sql_manage.sh` | menu-based MySQL/MariaDB/PostgreSQL backup and restore | data safety, DB operations, recovery |
 | `bbr_optimizer.sh` | apply BBR-related kernel tuning presets | Linux networking, sysctl tuning |
+| `networking/` | advanced edge-service automation | TLS/QUIC, systemd, firewall, rollback |
 | `hestiash/sync-cert-to-hestia.sh` | copy ACME certs into HestiaCP paths | platform ops, certificate distribution |
 | `hestiash/hestia_rclone_backup.sh` | sync Hestia backups to remote storage | backup retention, remote sync |
 | `copy_user_key_to_root.sh` | safely merge SSH keys | access management, Linux permissions |
@@ -83,24 +84,21 @@ Run local checks:
 make check
 ```
 
-`make syntax` checks every shell script with `bash -n`, and `make lint` runs `shellcheck` on the currently maintained core helpers.
+`make syntax` checks every shell script with `bash -n`, and `make lint` runs ShellCheck across all maintained source scripts while excluding generated bundles.
 
 Inspect the main operational helpers:
 
 ```bash
 bash nginx/site_manager.sh help
-bash sql_manage.sh help
+./sql_manage.sh
 ```
+
+`sql_manage.sh` opens an interactive menu for MySQL/MariaDB and PostgreSQL
+connection checks, backups, restores, and retention cleanup.
 
 ## Optional Direct Download
 
 If you want to fetch a single script to a server:
-
-```bash
-curl -fsSL \
-  https://raw.githubusercontent.com/z9wen/personal-infra-toolkit/main/xray-install.sh \
-  -o xray-install.sh && chmod +x xray-install.sh
-```
 
 ```bash
 curl -fsSL \
@@ -126,8 +124,8 @@ If you want a quick tour of the repository:
 1. Start from this `README` and explain the project goal.
 2. Show `nginx/site_manager.sh` and explain virtual host + TLS automation.
 3. Show `acme/docker-compose.yml` and `acme/.env.example` to discuss certificate automation.
-4. Show `sql_manage.sh help` to explain backup and restore workflow.
-5. Show `.github/workflows/ShellCheck.yml` and `Makefile` to demonstrate basic CI quality checks.
+4. Show the `sql_manage.sh` menu to explain MySQL and PostgreSQL recovery workflows.
+5. Show `.github/workflows/quality.yml` and `Makefile` to demonstrate repository quality checks.
 
 ## What this repo demonstrates well
 
@@ -147,7 +145,7 @@ Current gaps:
 - no Ansible-based fleet management yet
 - no Kubernetes deployment layer
 - some scripts are tightly coupled to local filesystem conventions
-- large scripts such as `xray-install.sh` would benefit from further modularization
+- some networking workflows remain tightly coupled to specific VPS and panel paths
 
 ## Roadmap
 
@@ -156,7 +154,7 @@ Practical next improvements:
 1. convert repeated host setup into Ansible roles
 2. add Terraform for DNS / VM / security group provisioning
 3. add integration tests for critical Bash flows
-4. split large scripts into reusable modules
+4. expand integration coverage for networking and panel adapters
 5. add secrets management patterns beyond local env files
 
 ## License

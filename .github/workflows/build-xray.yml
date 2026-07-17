@@ -1,0 +1,46 @@
+name: Build Xray Installer
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "networking/xray/src/**"
+      - "networking/xray/build.sh"
+      - ".github/workflows/build-xray.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-xray-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build single-file installer
+        run: ./networking/xray/build.sh
+
+      - name: Validate shell syntax
+        run: make syntax
+
+      - name: Commit generated installer
+        run: |
+          if git diff --quiet -- networking/xray-install.sh; then
+            echo "Xray installer is already up to date"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add networking/xray-install.sh
+          git commit -m "chore(xray): rebuild installer"
+          git push

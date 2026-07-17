@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
 
-# ===== Module 01_bootstrap.sh =====
-# 模块 01：环境检测与初始化
 # 检测区
 # -------------------------------------------------------------
 # 检查系统
@@ -418,8 +416,6 @@ isBTPanelSiteConfig() {
     [[ -f "${certFile}" && -f "${keyFile}" ]]
 }
 
-# ===== Module 02_preflight.sh =====
-# 模块 02：面板检测、防火墙与配置读取
 
 checkBTPanel() {
     if isBTPanelEnvironment; then
@@ -955,8 +951,6 @@ useNativeACMECert() {
 # 检测 Nginx 环境并生成报告
 # 检测 Docker 中的 Nginx 容器
 
-# ===== Module 03_nginx.sh =====
-# 模块 03：Nginx 环境与工具安装
 
 # Nginx 环境检测
 checkNginxEnvironment() {
@@ -1547,8 +1541,6 @@ EOF
 }
 # 检查ip
 
-# ===== Module 04_tls.sh =====
-# 模块 04：TLS/ACME、DNS 以及端口管理
 
 checkIP() {
     echoContent skyBlue "\n ---> 检查域名ip中"
@@ -2179,8 +2171,6 @@ installTLS() {
 
 # 初始化随机字符串
 
-# ===== Module 05_core_runtime.sh =====
-# 模块 05：核心随机路径与运行时处理
 
 initRandomPath() {
     local chars="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -2859,8 +2849,6 @@ handleXray() {
 
 # 读取Xray用户数据并初始化
 
-# ===== Module 06_client_config.sh =====
-# 模块 06：客户端/入站配置生成
 
 normalizeXrayEmail() {
     local value=$1 suffix
@@ -3086,7 +3074,6 @@ removeXrayOutbound() {
 }
 # 初始化Xray 配置文件
 
-# ===== Module 07_services.sh =====
 initXrayConfig() {
     echoContent skyBlue "\n进度 $2/${totalProgress} : 初始化Xray配置"
     echo
@@ -3627,8 +3614,6 @@ EOF
 
 # 移除nginx302配置
 
-# ===== Module 08_ops_tools.sh =====
-# 模块 08：运维工具、Nginx 站点与端口管理
 
 removeNginx302() {
     # 检查配置文件是否存在
@@ -4457,8 +4442,6 @@ showIPv6Routing() {
 }
 # 域名黑名单
 
-# ===== Module 09_routing.sh =====
-# 模块 09：路由、解锁与 WARP 相关功能
 
 # 添加routing配置
 addInstallRouting() {
@@ -5438,8 +5421,6 @@ customXrayInstall() {
     fi
 }
 
-# ===== Module 10_install_manage.sh =====
-# 模块 10：核心安装、版本与订阅管理
 
 selectCoreInstall() {
     # 现在只支持 Xray-core，直接进入安装
@@ -6636,8 +6617,6 @@ manageHysteria2() {
     done
 }
 
-# ===== Module 11_menu.sh =====
-# 模块 11：交互菜单与入口逻辑
 
 # 主菜单
 menu() {
