@@ -4900,7 +4900,12 @@ removeCronRelaySubscription() {
 
 # 使用 sing-box JSON 订阅配置 Shadowsocks 中转。
 setupRelaySubscription() {
-    selectRelayInbounds || return
+    local udpMode="direct" udpRelayStatus udpOutboundTag=""
+    read -r -p "UDP 也通过订阅的 Shadowsocks 上游转发吗？[y/N]:" udpRelayStatus
+    if [[ "${udpRelayStatus}" =~ ^[Yy]$ ]]; then
+        udpMode="shared"
+        udpOutboundTag="relay_tcp_outbound"
+    fi
 
     local subscriptionUrl tempDir subscriptionFile nodeCount nodeIndex selectedTag outboundFile backupDir
     read -r -p "请输入 sing-box JSON 订阅地址:" subscriptionUrl
@@ -4950,7 +4955,7 @@ setupRelaySubscription() {
 
     rm -f "${configPath}relay_outbound.json" "${configPath}relay_tcp_outbound.json" "${configPath}relay_udp_outbound.json"
     mv "${outboundFile}" "${configPath}relay_tcp_outbound.json"
-    addRelayRouting "${relaySelectedInboundTags}" "relay_tcp_outbound" "relay_tcp_outbound" || {
+    addRelayRouting "${relaySelectedInboundTags}" "relay_tcp_outbound" "${udpOutboundTag}" || {
         restoreRelayBackup "${backupDir}"
         rm -rf "${tempDir}"
         return 1
@@ -4961,8 +4966,8 @@ setupRelaySubscription() {
     nodePort=$(jq -r --arg tag "${selectedTag}" 'first(.outbounds[] | select(.type == "shadowsocks" and .tag == $tag)).server_port' "${subscriptionFile}")
     nodeMethod=$(jq -r --arg tag "${selectedTag}" 'first(.outbounds[] | select(.type == "shadowsocks" and .tag == $tag)).method' "${subscriptionFile}")
     jq -n --argjson inboundTags "${relaySelectedInboundTags}" --arg url "${subscriptionUrl}" --arg selectedTag "${selectedTag}" \
-        --arg address "${nodeAddress}" --arg port "${nodePort}" --arg method "${nodeMethod}" \
-        '{source:"subscription",inboundTags:$inboundTags,subscription:{format:"sing-box-json",url:$url,selectedTag:$selectedTag},tcp:{mode:"relay",protocol:"shadowsocks",label:("Shadowsocks (" + $method + ")"),address:$address,port:$port,bbrProfile:""},udp:{mode:"shared",protocol:"shadowsocks",label:("Shadowsocks (" + $method + ")"),address:$address,port:$port,bbrProfile:""}}' \
+        --arg address "${nodeAddress}" --arg port "${nodePort}" --arg method "${nodeMethod}" --arg udpMode "${udpMode}" \
+        '{source:"subscription",inboundTags:$inboundTags,subscription:{format:"sing-box-json",url:$url,selectedTag:$selectedTag},tcp:{mode:"relay",protocol:"shadowsocks",label:("Shadowsocks (" + $method + ")"),address:$address,port:$port,bbrProfile:""},udp:(if $udpMode == "shared" then {mode:"shared",protocol:"shadowsocks",label:("Shadowsocks (" + $method + ")"),address:$address,port:$port,bbrProfile:""} else {mode:"direct",protocol:"",label:"直连",address:"",port:"",bbrProfile:""} end)}' \
         >/opt/xray-agent/relay_config.json
     chmod 600 /opt/xray-agent/relay_config.json "${configPath}relay_tcp_outbound.json"
 
@@ -4979,6 +4984,7 @@ setupRelaySubscription() {
     handleXray start
     echoContent green " ---> Shadowsocks 订阅中转已启用"
     echoContent yellow " ---> 上游: ${selectedTag} -> ${nodeAddress}:${nodePort}"
+    [[ "${udpMode}" == "shared" ]] && echoContent yellow " ---> UDP: 通过 Shadowsocks 上游" || echoContent yellow " ---> UDP: 直连"
     echoContent yellow " ---> 已添加每日 04:17 自动更新任务"
 }
 
@@ -5046,7 +5052,9 @@ updateRelaySubscription() {
     newState=$(jq --arg tag "${selectedTag}" --arg address "${nodeAddress}" --arg port "${nodePort}" --arg method "${nodeMethod}" '
         .subscription.selectedTag = $tag |
         .tcp.label = ("Shadowsocks (" + $method + ")") | .tcp.address = $address | .tcp.port = $port |
-        .udp.label = ("Shadowsocks (" + $method + ")") | .udp.address = $address | .udp.port = $port
+        if .udp.mode == "shared" then
+            .udp.label = ("Shadowsocks (" + $method + ")") | .udp.address = $address | .udp.port = $port
+        else . end
     ' "${stateFile}") || {
         [[ -f "${backupFile}" ]] && cp "${backupFile}" "${oldOutbound}"
         rm -rf "${tempDir}"
@@ -5224,17 +5232,6 @@ restoreRelayBackup() {
 
 # 配置中转：入站可多选，TCP 默认走上游，UDP 可选择是否跟随。
 setupRelayManual() {
-    if [[ -z "${configPath}" ]]; then
-        echoContent red " ---> 未安装，请使用脚本安装"
-        menu
-        return
-    fi
-
-    echoContent skyBlue "\n配置链式代理"
-    echoContent yellow "# 路径：用户 → 本机入站 → 上游节点 → 目标"
-    echoContent yellow "# 所选入站的 TCP 默认走上游，本机 nginx 流量不受影响\n"
-    selectRelayInbounds || return
-
     local tcpMode="relay" udpMode="direct" udpRelayStatus
     read -r -p "UDP 也通过上游转发吗？[y/N]:" udpRelayStatus
     [[ "${udpRelayStatus}" =~ ^[Yy]$ ]] && udpMode="shared"
@@ -5316,6 +5313,16 @@ setupRelayManual() {
 }
 
 setupRelay() {
+    if [[ -z "${configPath}" ]]; then
+        echoContent red " ---> 未安装，请使用脚本安装"
+        return
+    fi
+
+    echoContent skyBlue "\n配置链式代理"
+    echoContent yellow "# 路径：用户 → 本机入站 → 上游节点 → 目标"
+    echoContent yellow "# 所选入站的 TCP 默认走上游，本机 nginx 流量不受影响\n"
+    selectRelayInbounds || return
+
     echoContent skyBlue "\n请选择上游配置来源"
     echoContent yellow "1.sing-box JSON 订阅中的 Shadowsocks 节点"
     echoContent yellow "2.手动输入上游节点"
@@ -6922,7 +6929,7 @@ manageHysteria2() {
 menu() {
     cd "$HOME" || exit
     echoContent red "\n=============================================================="
-    echoContent green "当前版本：v2026.07.18.1784356807"
+    echoContent green "当前版本：v2026.07.18.1784357264"
     echoContent green "描述：Xray 一键安装管理脚本\c"
     showInstallStatus
     checkWgetShowProgress
