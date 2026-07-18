@@ -65,6 +65,7 @@ buildRelayOutbound() {
     local protocolChoice=${forcedProtocol}
     local relayAddress relayPort relayUUID relaySNI relayFlow
     local relayPath relayHost relayPublicKey relayShortId relayMldsa65Verify relayAuth relayBbrProfile
+    local relayMethod relayPassword
     relayBuiltBbrProfile=
 
     if [[ -z "${protocolChoice}" ]]; then
@@ -73,9 +74,10 @@ buildRelayOutbound() {
         echoContent yellow "2.VLESS + WebSocket + TLS"
         echoContent yellow "3.VLESS + Reality + Vision"
         echoContent yellow "4.Hysteria2 + TLS + QUIC [推荐用于游戏 UDP]"
+        echoContent yellow "5.Shadowsocks [原生支持 TCP/UDP]"
         read -r -p "请选择:" protocolChoice
     fi
-    if [[ ! "${protocolChoice}" =~ ^[1-4]$ ]]; then
+    if [[ ! "${protocolChoice}" =~ ^[1-5]$ ]]; then
         echoContent red " ---> 上游协议选择无效"
         return 1
     fi
@@ -155,6 +157,18 @@ buildRelayOutbound() {
         relayBuiltProtocol="hysteria2"
         relayBuiltLabel="Hysteria2 + TLS + QUIC"
         relayBuiltBbrProfile=${relayBbrProfile}
+        ;;
+    5)
+        read -r -p "Shadowsocks 加密方式[aes-256-gcm]:" relayMethod
+        relayMethod=${relayMethod:-aes-256-gcm}
+        read -r -s -p "Shadowsocks 密码:" relayPassword
+        echo
+        [[ -z "${relayPassword}" ]] && echoContent red " ---> Shadowsocks 密码不能为空" && return 1
+        jq -n --arg tag "${outboundTag}" --arg address "${relayAddress}" --argjson port "${relayPort}" \
+            --arg method "${relayMethod}" --arg password "${relayPassword}" '
+            {outbounds:[{tag:$tag,protocol:"shadowsocks",settings:{address:$address,port:$port,method:$method,password:$password}}]}' >"${outputFile}"
+        relayBuiltProtocol="shadowsocks"
+        relayBuiltLabel="Shadowsocks (${relayMethod})"
         ;;
     esac
 
@@ -364,4 +378,3 @@ manageRelay() {
         read -r -p "按回车键继续..."
     done
 }
-

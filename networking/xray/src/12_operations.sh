@@ -548,9 +548,44 @@ removeUser() {
 # 更新脚本
 updateXrayAgent() {
     echoContent skyBlue "\n进度  $1/${totalProgress} : 更新脚本"
-    echoContent red " ---> 此脚本为私有维护版本，不支持自动更新"
-    echoContent yellow " ---> 请联系管理员获取最新版本\n"
-    exit 0
+    local scriptUrl="https://raw.githubusercontent.com/z9wen/personal-infra-toolkit/main/networking/xray-install.sh"
+    local targetScript="/opt/xray-agent/install.sh"
+    local temporaryScript
+
+    mkdir -p "$(dirname "${targetScript}")"
+    temporaryScript=$(mktemp "${targetScript}.update.XXXXXX") || {
+        echoContent red " ---> 无法创建更新临时文件"
+        return 1
+    }
+
+    echoContent yellow " ---> 正在从 GitHub 获取最新脚本..."
+    if ! downloadFile "${scriptUrl}" "${temporaryScript}"; then
+        rm -f "${temporaryScript}"
+        echoContent red " ---> 下载失败，当前脚本未变更"
+        return 1
+    fi
+
+    if ! bash -n "${temporaryScript}" || ! grep -q '^updateXrayAgent() {' "${temporaryScript}" || ! grep -q '^menu() {' "${temporaryScript}"; then
+        rm -f "${temporaryScript}"
+        echoContent red " ---> 下载内容校验失败，当前脚本未变更"
+        return 1
+    fi
+
+    if [[ -f "${targetScript}" ]] && cmp -s "${targetScript}" "${temporaryScript}"; then
+        rm -f "${temporaryScript}"
+        echoContent green " ---> 当前已经是最新脚本"
+        return 0
+    fi
+
+    chmod 755 "${temporaryScript}"
+    if ! mv -f "${temporaryScript}" "${targetScript}"; then
+        rm -f "${temporaryScript}"
+        echoContent red " ---> 替换脚本失败，当前脚本未变更"
+        return 1
+    fi
+
+    echoContent green " ---> 脚本更新成功，正在重新启动..."
+    exec /bin/bash "${targetScript}"
 }
 
 # 防火墙
@@ -719,4 +754,3 @@ aliasInstall() {
         echoContent red " ---> 快捷方式创建失败"
     fi
 }
-
