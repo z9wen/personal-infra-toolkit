@@ -117,46 +117,6 @@ Most scripts assume:
 
 This is intentionally a pragmatic ops toolkit, not a fully abstracted platform product.
 
-## Suggested Starting Points
-
-If you want a quick tour of the repository:
-
-1. Start from this `README` and explain the project goal.
-2. Show `nginx/site_manager.sh` and explain virtual host + TLS automation.
-3. Show `acme/docker-compose.yml` and `acme/.env.example` to discuss certificate automation.
-4. Show the `sql_manage.sh` menu to explain MySQL and PostgreSQL recovery workflows.
-5. Show `.github/workflows/quality.yml` and `Makefile` to demonstrate repository quality checks.
-
-## What this repo demonstrates well
-
-- turning repetitive server work into scripts
-- thinking about recoverability, not just deployment
-- mixing containerized services with host-level operations
-- documenting assumptions and operational boundaries
-- adding lightweight CI to shell-heavy repos
-
-## Current Limitations
-
-This repo is strong as a single-host and homelab portfolio project, but it is not yet a full platform engineering stack.
-
-Current gaps:
-
-- no Terraform or cloud IaC yet
-- no Ansible-based fleet management yet
-- no Kubernetes deployment layer
-- some scripts are tightly coupled to local filesystem conventions
-- some networking workflows remain tightly coupled to specific VPS and panel paths
-
-## Roadmap
-
-Practical next improvements:
-
-1. convert repeated host setup into Ansible roles
-2. add Terraform for DNS / VM / security group provisioning
-3. add integration tests for critical Bash flows
-4. expand integration coverage for networking and panel adapters
-5. add secrets management patterns beyond local env files
-
 ## License
 
 Released under the [GPL-3.0 license](LICENSE).
