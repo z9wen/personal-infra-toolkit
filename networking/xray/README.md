@@ -29,7 +29,7 @@ The source modules follow runtime dependency order:
 | `11_client_output.sh` | Share links, QR links and client-facing output |
 | `12_operations.sh` | Site, port, account, uninstall and log operations |
 | `13_network_routing.sh` | IPv6, WARP and WireGuard routing helpers |
-| `14_relay.sh` | Chained-proxy outbound and routing management |
+| `14_relay.sh` | Chained-proxy outbound, sing-box JSON subscription updates and routing management |
 | `15_routing_tools.sh` | SNI, DNS and routing-tool menus |
 | `16_install_management.sh` | Install/reinstall workflows and core management |
 | `17_subscriptions.sh` | Local and remote subscription generation |
@@ -73,3 +73,8 @@ chmod +x xray-install.sh
 
 The script is intended for Debian/Ubuntu VPS environments and performs
 privileged system, firewall, Nginx and systemd changes. Review it before use.
+
+The relay manager can import Shadowsocks outbounds from a sing-box JSON
+subscription. It preserves the selected local inbound tags and installs a
+daily refresh job; changed upstream credentials are validated before Xray is
+restarted, while failed refreshes keep the last working outbound.

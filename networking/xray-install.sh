@@ -158,7 +158,7 @@ initVar() {
 
     localIP=
 
-    # 定时任务执行任务名称 RenewTLS-更新证书 UpdateGeo-更新geo文件
+    # 定时任务执行任务名称 RenewTLS-更新证书 UpdateGeo-更新geo文件 UpdateRelay-更新中转订阅
     cronName=$1
 
     # tls安装失败后尝试的次数
@@ -245,7 +245,6 @@ initVar() {
     dnsTLSAcmeKeyPath=
 
 }
-
 # 读取tls证书详情
 readAcmeTLS() {
     local readAcmeDomain=
@@ -4834,6 +4833,233 @@ validateRelayPort() {
     [[ "${value}" =~ ^[0-9]+$ ]] && ((value >= 1 && value <= 65535))
 }
 
+# 从 sing-box JSON 订阅中读取 Shadowsocks 出站并转换为 Xray 配置。
+buildRelayOutboundFromSingBoxSubscription() {
+    local subscriptionFile=$1 selectedTag=$2 outboundTag=$3 outputFile=$4
+    local node
+    node=$(jq -c --arg tag "${selectedTag}" '
+        first(.outbounds[]? | select(.type == "shadowsocks" and .tag == $tag))
+    ' "${subscriptionFile}") || return 1
+    [[ -n "${node}" && "${node}" != "null" ]] || return 1
+
+    if ! jq -e '
+        (.server | type == "string" and length > 0) and
+        (.server_port | type == "number" and . >= 1 and . <= 65535) and
+        (.method | type == "string" and length > 0) and
+        (.password | type == "string" and length > 0)
+    ' <<<"${node}" >/dev/null; then
+        return 1
+    fi
+
+    jq -n --arg tag "${outboundTag}" --argjson node "${node}" '
+        {outbounds:[{
+            tag:$tag,
+            protocol:"shadowsocks",
+            settings:{
+                address:$node.server,
+                port:$node.server_port,
+                method:$node.method,
+                password:$node.password
+            }
+        }]}
+    ' >"${outputFile}"
+}
+
+fetchRelaySubscription() {
+    local url=$1 destination=$2
+    if [[ ! "${url}" =~ ^https?:// ]]; then
+        echoContent red " ---> 订阅地址必须以 http:// 或 https:// 开头"
+        return 1
+    fi
+    if ! downloadFile "${url}" "${destination}"; then
+        echoContent red " ---> 中转订阅下载失败"
+        return 1
+    fi
+    if ! jq -e '.outbounds | type == "array"' "${destination}" >/dev/null 2>&1; then
+        echoContent red " ---> 订阅内容不是有效的 sing-box JSON"
+        return 1
+    fi
+}
+
+installCronRelaySubscription() {
+    crontab -l >/opt/xray-agent/backup_crontab.cron 2>/dev/null || true
+    local historyCrontab
+    historyCrontab=$(sed '/xray-agent-update-relay/d;/xray-agent\/install.sh UpdateRelay/d' /opt/xray-agent/backup_crontab.cron)
+    echo "${historyCrontab}" >/opt/xray-agent/backup_crontab.cron
+    echo "17 4 * * * /bin/bash /opt/xray-agent/install.sh UpdateRelay >> /opt/xray-agent/crontab_relay.log 2>&1 # xray-agent-update-relay" >>/opt/xray-agent/backup_crontab.cron
+    crontab /opt/xray-agent/backup_crontab.cron
+}
+
+removeCronRelaySubscription() {
+    crontab -l >/opt/xray-agent/backup_crontab.cron 2>/dev/null || true
+    local historyCrontab
+    historyCrontab=$(sed '/xray-agent-update-relay/d;/xray-agent\/install.sh UpdateRelay/d' /opt/xray-agent/backup_crontab.cron)
+    echo "${historyCrontab}" >/opt/xray-agent/backup_crontab.cron
+    crontab /opt/xray-agent/backup_crontab.cron
+}
+
+# 使用 sing-box JSON 订阅配置 Shadowsocks 中转。
+setupRelaySubscription() {
+    selectRelayInbounds || return
+
+    local subscriptionUrl tempDir subscriptionFile nodeCount nodeIndex selectedTag outboundFile backupDir
+    read -r -p "请输入 sing-box JSON 订阅地址:" subscriptionUrl
+    [[ -z "${subscriptionUrl}" ]] && echoContent red " ---> 订阅地址不能为空" && return 1
+
+    tempDir=$(mktemp -d /tmp/xray-relay-subscription.XXXXXX) || return 1
+    subscriptionFile="${tempDir}/subscription.json"
+    outboundFile="${tempDir}/relay_tcp_outbound.json"
+    backupDir="${tempDir}/backup"
+    mkdir -p "${backupDir}"
+    fetchRelaySubscription "${subscriptionUrl}" "${subscriptionFile}" || {
+        rm -rf "${tempDir}"
+        return 1
+    }
+
+    nodeCount=$(jq '[.outbounds[]? | select(.type == "shadowsocks")] | length' "${subscriptionFile}")
+    if ((nodeCount == 0)); then
+        echoContent red " ---> 订阅中没有 Shadowsocks 节点"
+        rm -rf "${tempDir}"
+        return 1
+    fi
+    if ((nodeCount == 1)); then
+        selectedTag=$(jq -r 'first(.outbounds[] | select(.type == "shadowsocks")) | .tag' "${subscriptionFile}")
+    else
+        echoContent skyBlue "\n订阅中的 Shadowsocks 节点"
+        jq -r '[.outbounds[] | select(.type == "shadowsocks")] | to_entries[] | "\(.key + 1).\(.value.tag) -> \(.value.server):\(.value.server_port)"' "${subscriptionFile}"
+        read -r -p "请选择上游节点:" nodeIndex
+        if [[ ! "${nodeIndex}" =~ ^[0-9]+$ ]] || ((nodeIndex < 1 || nodeIndex > nodeCount)); then
+            echoContent red " ---> 节点选项无效"
+            rm -rf "${tempDir}"
+            return 1
+        fi
+        selectedTag=$(jq -r --argjson index "$((nodeIndex - 1))" '[.outbounds[] | select(.type == "shadowsocks")][$index].tag' "${subscriptionFile}")
+    fi
+
+    buildRelayOutboundFromSingBoxSubscription "${subscriptionFile}" "${selectedTag}" "relay_tcp_outbound" "${outboundFile}" || {
+        echoContent red " ---> Shadowsocks 节点字段不完整"
+        rm -rf "${tempDir}"
+        return 1
+    }
+
+    local backupFile
+    for backupFile in relay_outbound.json relay_tcp_outbound.json relay_udp_outbound.json 09_routing.json; do
+        [[ -f "${configPath}${backupFile}" ]] && cp "${configPath}${backupFile}" "${backupDir}/${backupFile}"
+    done
+    [[ -f /opt/xray-agent/relay_config.json ]] && cp /opt/xray-agent/relay_config.json "${backupDir}/relay_config.json"
+
+    rm -f "${configPath}relay_outbound.json" "${configPath}relay_tcp_outbound.json" "${configPath}relay_udp_outbound.json"
+    mv "${outboundFile}" "${configPath}relay_tcp_outbound.json"
+    addRelayRouting "${relaySelectedInboundTags}" "relay_tcp_outbound" "relay_tcp_outbound" || {
+        restoreRelayBackup "${backupDir}"
+        rm -rf "${tempDir}"
+        return 1
+    }
+
+    local nodeAddress nodePort nodeMethod validationOutput
+    nodeAddress=$(jq -r --arg tag "${selectedTag}" 'first(.outbounds[] | select(.type == "shadowsocks" and .tag == $tag)).server' "${subscriptionFile}")
+    nodePort=$(jq -r --arg tag "${selectedTag}" 'first(.outbounds[] | select(.type == "shadowsocks" and .tag == $tag)).server_port' "${subscriptionFile}")
+    nodeMethod=$(jq -r --arg tag "${selectedTag}" 'first(.outbounds[] | select(.type == "shadowsocks" and .tag == $tag)).method' "${subscriptionFile}")
+    jq -n --argjson inboundTags "${relaySelectedInboundTags}" --arg url "${subscriptionUrl}" --arg selectedTag "${selectedTag}" \
+        --arg address "${nodeAddress}" --arg port "${nodePort}" --arg method "${nodeMethod}" \
+        '{source:"subscription",inboundTags:$inboundTags,subscription:{format:"sing-box-json",url:$url,selectedTag:$selectedTag},tcp:{mode:"relay",protocol:"shadowsocks",label:("Shadowsocks (" + $method + ")"),address:$address,port:$port,bbrProfile:""},udp:{mode:"shared",protocol:"shadowsocks",label:("Shadowsocks (" + $method + ")"),address:$address,port:$port,bbrProfile:""}}' \
+        >/opt/xray-agent/relay_config.json
+    chmod 600 /opt/xray-agent/relay_config.json "${configPath}relay_tcp_outbound.json"
+
+    if ! validationOutput=$(/opt/xray-agent/xray/xray run -test -confdir "${configPath}" 2>&1); then
+        echoContent red " ---> Xray 拒绝了订阅生成的配置，已恢复上一版"
+        echoContent yellow "${validationOutput}"
+        restoreRelayBackup "${backupDir}"
+        rm -rf "${tempDir}"
+        return 1
+    fi
+    rm -rf "${tempDir}"
+    installCronRelaySubscription
+    handleXray stop
+    handleXray start
+    echoContent green " ---> Shadowsocks 订阅中转已启用"
+    echoContent yellow " ---> 上游: ${selectedTag} -> ${nodeAddress}:${nodePort}"
+    echoContent yellow " ---> 已添加每日 04:17 自动更新任务"
+}
+
+# 非交互更新订阅中转。保留既有 inboundTags 和路由，只替换上游出站。
+updateRelaySubscription() {
+    local stateFile=/opt/xray-agent/relay_config.json
+    [[ -f "${stateFile}" ]] || return 0
+    [[ $(jq -r '.source // "manual"' "${stateFile}") == "subscription" ]] || return 0
+
+    local lockFile=/opt/xray-agent/update-relay.lock
+    exec 9>"${lockFile}"
+    if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
+        echoContent yellow " ---> 中转订阅更新任务正在运行"
+        return 0
+    fi
+
+    local subscriptionUrl selectedTag tempDir subscriptionFile outboundFile oldOutbound backupFile validationOutput
+    subscriptionUrl=$(jq -r '.subscription.url' "${stateFile}")
+    selectedTag=$(jq -r '.subscription.selectedTag' "${stateFile}")
+    tempDir=$(mktemp -d /tmp/xray-relay-update.XXXXXX) || return 1
+    subscriptionFile="${tempDir}/subscription.json"
+    outboundFile="${tempDir}/relay_tcp_outbound.json"
+    oldOutbound="${configPath}relay_tcp_outbound.json"
+
+    fetchRelaySubscription "${subscriptionUrl}" "${subscriptionFile}" || {
+        rm -rf "${tempDir}"
+        return 1
+    }
+    if ! jq -e --arg tag "${selectedTag}" 'any(.outbounds[]?; .type == "shadowsocks" and .tag == $tag)' "${subscriptionFile}" >/dev/null; then
+        selectedTag=$(jq -r 'first(.outbounds[]? | select(.type == "shadowsocks")) | .tag // empty' "${subscriptionFile}")
+        if [[ -z "${selectedTag}" ]]; then
+            echoContent red " ---> 更新后的订阅中没有 Shadowsocks 节点，保留旧配置"
+            rm -rf "${tempDir}"
+            return 1
+        fi
+        echoContent yellow " ---> 原节点已移除，自动切换到 ${selectedTag}"
+    fi
+    buildRelayOutboundFromSingBoxSubscription "${subscriptionFile}" "${selectedTag}" "relay_tcp_outbound" "${outboundFile}" || {
+        echoContent red " ---> 新订阅的 Shadowsocks 节点无效，保留旧配置"
+        rm -rf "${tempDir}"
+        return 1
+    }
+    if [[ -f "${oldOutbound}" ]] && cmp -s "${outboundFile}" "${oldOutbound}"; then
+        echoContent green " ---> 中转订阅没有变化"
+        rm -rf "${tempDir}"
+        return 0
+    fi
+
+    backupFile="${tempDir}/relay_tcp_outbound.backup.json"
+    [[ -f "${oldOutbound}" ]] && cp "${oldOutbound}" "${backupFile}"
+    mv "${outboundFile}" "${oldOutbound}"
+    chmod 600 "${oldOutbound}"
+    if ! validationOutput=$(/opt/xray-agent/xray/xray run -test -confdir "${configPath}" 2>&1); then
+        [[ -f "${backupFile}" ]] && cp "${backupFile}" "${oldOutbound}"
+        echoContent red " ---> 新订阅配置验证失败，已保留旧配置"
+        echoContent yellow "${validationOutput}"
+        rm -rf "${tempDir}"
+        return 1
+    fi
+
+    local nodeAddress nodePort nodeMethod newState
+    nodeAddress=$(jq -r --arg tag "${selectedTag}" 'first(.outbounds[] | select(.type == "shadowsocks" and .tag == $tag)).server' "${subscriptionFile}")
+    nodePort=$(jq -r --arg tag "${selectedTag}" 'first(.outbounds[] | select(.type == "shadowsocks" and .tag == $tag)).server_port' "${subscriptionFile}")
+    nodeMethod=$(jq -r --arg tag "${selectedTag}" 'first(.outbounds[] | select(.type == "shadowsocks" and .tag == $tag)).method' "${subscriptionFile}")
+    newState=$(jq --arg tag "${selectedTag}" --arg address "${nodeAddress}" --arg port "${nodePort}" --arg method "${nodeMethod}" '
+        .subscription.selectedTag = $tag |
+        .tcp.label = ("Shadowsocks (" + $method + ")") | .tcp.address = $address | .tcp.port = $port |
+        .udp.label = ("Shadowsocks (" + $method + ")") | .udp.address = $address | .udp.port = $port
+    ' "${stateFile}") || {
+        [[ -f "${backupFile}" ]] && cp "${backupFile}" "${oldOutbound}"
+        rm -rf "${tempDir}"
+        return 1
+    }
+    echo "${newState}" >"${stateFile}"
+    chmod 600 "${stateFile}"
+    rm -rf "${tempDir}"
+    handleXray stop
+    handleXray start
+    echoContent green " ---> 中转订阅已更新: ${selectedTag} -> ${nodeAddress}:${nodePort}"
+}
+
 # 生成一个上游出站。第三个参数表示该出站是否承载 UDP。
 buildRelayOutbound() {
     local outboundTag=$1 outputFile=$2 carriesUdp=$3 forcedProtocol=${4:-}
@@ -4997,7 +5223,7 @@ restoreRelayBackup() {
 }
 
 # 配置中转：入站可多选，TCP 默认走上游，UDP 可选择是否跟随。
-setupRelay() {
+setupRelayManual() {
     if [[ -z "${configPath}" ]]; then
         echoContent red " ---> 未安装，请使用脚本安装"
         menu
@@ -5081,11 +5307,25 @@ setupRelay() {
 
     handleXray stop
     handleXray start
+    removeCronRelaySubscription
     echo
     echoContent green " ---> 链式代理已启用！"
     echoContent yellow " ---> 入站: $(jq -r '.inboundTags | join(", ")' /opt/xray-agent/relay_config.json)"
     echoContent yellow " ---> TCP: ${tcpLabel}${tcpAddress:+ → ${tcpAddress}:${tcpPort}}${tcpBbrProfile:+ [BBR/${tcpBbrProfile}]}"
     echoContent yellow " ---> UDP: ${udpLabel}${udpAddress:+ → ${udpAddress}:${udpPort}}${udpBbrProfile:+ [BBR/${udpBbrProfile}]}"
+}
+
+setupRelay() {
+    echoContent skyBlue "\n请选择上游配置来源"
+    echoContent yellow "1.sing-box JSON 订阅中的 Shadowsocks 节点"
+    echoContent yellow "2.手动输入上游节点"
+    local relaySource
+    read -r -p "请选择:" relaySource
+    case ${relaySource} in
+    1) setupRelaySubscription ;;
+    2) setupRelayManual ;;
+    *) echoContent red " ---> 请输入 1-2" ;;
+    esac
 }
 
 showRelayConfig() {
@@ -5109,6 +5349,7 @@ showRelayConfig() {
 removeRelay() {
     rm -f "${configPath}relay_outbound.json" "${configPath}relay_tcp_outbound.json" "${configPath}relay_udp_outbound.json"
     rm -f /opt/xray-agent/relay_config /opt/xray-agent/relay_config.json
+    removeCronRelaySubscription
     removeRelayRouting
     handleXray stop
     handleXray start
@@ -5135,7 +5376,10 @@ manageRelay() {
         echoContent yellow "# 当前状态: ${relayStatus}\n"
         echoContent yellow "1.启用中转"
         echoContent yellow "2.查看当前配置"
-        echoContent yellow "3.停用中转"
+        if [[ -f "/opt/xray-agent/relay_config.json" ]] && [[ $(jq -r '.source // "manual"' /opt/xray-agent/relay_config.json) == "subscription" ]]; then
+            echoContent yellow "3.立即更新中转订阅"
+        fi
+        echoContent yellow "4.停用中转"
         echoContent yellow "0.返回主菜单"
         echoContent red "=============================================================="
         read -r -p "请选择:" relayType
@@ -5143,12 +5387,19 @@ manageRelay() {
         case ${relayType} in
         1) setupRelay ;;
         2) showRelayConfig ;;
-        3) removeRelay ;;
+        3)
+            if [[ -f "/opt/xray-agent/relay_config.json" ]] && [[ $(jq -r '.source // "manual"' /opt/xray-agent/relay_config.json) == "subscription" ]]; then
+                updateRelaySubscription
+            else
+                echoContent red " ---> 当前中转不是订阅模式"
+            fi
+            ;;
+        4) removeRelay ;;
         0)
             menu
             return
             ;;
-        *) echoContent red " ---> 请输入 0-3" ;;
+        *) echoContent red " ---> 请输入 0-4" ;;
         esac
         read -r -p "按回车键继续..."
     done
@@ -5547,6 +5798,9 @@ cronFunction() {
         updateGeoSite >>/opt/xray-agent/crontab_updateGeoSite.log
         echoContent green " ---> geo更新日期:$(date "+%F %H:%M:%S")" >>/opt/xray-agent/crontab_updateGeoSite.log
         exit 0
+    elif [[ "${cronName}" == "UpdateRelay" ]]; then
+        updateRelaySubscription
+        exit $?
     fi
 }
 # 账号管理
@@ -5581,7 +5835,6 @@ manageAccount() {
         echoContent red " ---> 选择错误"
     fi
 }
-
 # 安装订阅
 installSubscribe() {
     readNginxSubscribe
@@ -6669,7 +6922,7 @@ manageHysteria2() {
 menu() {
     cd "$HOME" || exit
     echoContent red "\n=============================================================="
-    echoContent green "当前版本：v2026.07.18.1784355084"
+    echoContent green "当前版本：v2026.07.18.1784356498"
     echoContent green "描述：Xray 一键安装管理脚本\c"
     showInstallStatus
     checkWgetShowProgress

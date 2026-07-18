@@ -188,6 +188,9 @@ cronFunction() {
         updateGeoSite >>/opt/xray-agent/crontab_updateGeoSite.log
         echoContent green " ---> geo更新日期:$(date "+%F %H:%M:%S")" >>/opt/xray-agent/crontab_updateGeoSite.log
         exit 0
+    elif [[ "${cronName}" == "UpdateRelay" ]]; then
+        updateRelaySubscription
+        exit $?
     fi
 }
 # 账号管理
@@ -222,4 +225,3 @@ manageAccount() {
         echoContent red " ---> 选择错误"
     fi
 }
-

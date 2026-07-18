@@ -158,7 +158,7 @@ initVar() {
 
     localIP=
 
-    # 定时任务执行任务名称 RenewTLS-更新证书 UpdateGeo-更新geo文件
+    # 定时任务执行任务名称 RenewTLS-更新证书 UpdateGeo-更新geo文件 UpdateRelay-更新中转订阅
     cronName=$1
 
     # tls安装失败后尝试的次数
@@ -245,4 +245,3 @@ initVar() {
     dnsTLSAcmeKeyPath=
 
 }
-
