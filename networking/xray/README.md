@@ -46,6 +46,9 @@ Edit files in `src/`, then rebuild the deployable script:
 ./networking/xray/build.sh --check
 ```
 
+Each build stamps the generated installer with
+`vYYYY.MM.DD.<Unix timestamp>` using the UTC+8 calendar date.
+
 Do not edit `networking/xray-install.sh` directly. A push to `main` that changes
 the source modules or build script automatically rebuilds and commits the
 single-file artifact.

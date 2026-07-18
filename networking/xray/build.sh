@@ -6,6 +6,7 @@ project_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source_dir="${project_dir}/src"
 output_file="${project_dir}/../xray-install.sh"
 mode=${1:-build}
+version_marker="__XRAY_AGENT_VERSION__"
 
 modules=(
     01_common.sh
@@ -37,6 +38,35 @@ for module in "${modules[@]}"; do
     cat "${source_dir}/${module}" >>"${temp_file}"
 done
 
+case ${mode} in
+--check)
+    if [[ ! -f "${output_file}" ]]; then
+        echo "xray-install.sh does not exist; run networking/xray/build.sh" >&2
+        exit 1
+    fi
+    build_version=$(sed -n 's/.*当前版本：v\([0-9][0-9.]*\)".*/\1/p' "${output_file}" | head -1)
+    if [[ -z "${build_version}" ]]; then
+        echo "xray-install.sh does not contain a generated version" >&2
+        exit 1
+    fi
+    ;;
+build | --stdout)
+    build_version="$(TZ=Asia/Shanghai date '+%Y.%m.%d').$(date '+%s')"
+    ;;
+*)
+    echo "Usage: $0 [build|--check|--stdout]" >&2
+    exit 2
+    ;;
+esac
+
+if ! grep -q "${version_marker}" "${temp_file}"; then
+    echo "Xray version marker is missing from source modules" >&2
+    exit 1
+fi
+versioned_temp="${temp_file}.versioned"
+sed "s/${version_marker}/${build_version}/g" "${temp_file}" >"${versioned_temp}"
+mv "${versioned_temp}" "${temp_file}"
+
 bash -n "${temp_file}"
 
 case ${mode} in
@@ -56,9 +86,5 @@ case ${mode} in
         mv "${temp_file}" "${output_file}"
         trap - EXIT
         echo "Built ${output_file}"
-        ;;
-    *)
-        echo "Usage: $0 [build|--check|--stdout]" >&2
-        exit 2
         ;;
 esac
