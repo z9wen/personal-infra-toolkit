@@ -4164,9 +4164,44 @@ removeUser() {
 # 更新脚本
 updateXrayAgent() {
     echoContent skyBlue "\n进度  $1/${totalProgress} : 更新脚本"
-    echoContent red " ---> 此脚本为私有维护版本，不支持自动更新"
-    echoContent yellow " ---> 请联系管理员获取最新版本\n"
-    exit 0
+    local scriptUrl="https://raw.githubusercontent.com/z9wen/personal-infra-toolkit/main/networking/xray-install.sh"
+    local targetScript="/opt/xray-agent/install.sh"
+    local temporaryScript
+
+    mkdir -p "$(dirname "${targetScript}")"
+    temporaryScript=$(mktemp "${targetScript}.update.XXXXXX") || {
+        echoContent red " ---> 无法创建更新临时文件"
+        return 1
+    }
+
+    echoContent yellow " ---> 正在从 GitHub 获取最新脚本..."
+    if ! downloadFile "${scriptUrl}" "${temporaryScript}"; then
+        rm -f "${temporaryScript}"
+        echoContent red " ---> 下载失败，当前脚本未变更"
+        return 1
+    fi
+
+    if ! bash -n "${temporaryScript}" || ! grep -q '^updateXrayAgent() {' "${temporaryScript}" || ! grep -q '^menu() {' "${temporaryScript}"; then
+        rm -f "${temporaryScript}"
+        echoContent red " ---> 下载内容校验失败，当前脚本未变更"
+        return 1
+    fi
+
+    if [[ -f "${targetScript}" ]] && cmp -s "${targetScript}" "${temporaryScript}"; then
+        rm -f "${temporaryScript}"
+        echoContent green " ---> 当前已经是最新脚本"
+        return 0
+    fi
+
+    chmod 755 "${temporaryScript}"
+    if ! mv -f "${temporaryScript}" "${targetScript}"; then
+        rm -f "${temporaryScript}"
+        echoContent red " ---> 替换脚本失败，当前脚本未变更"
+        return 1
+    fi
+
+    echoContent green " ---> 脚本更新成功，正在重新启动..."
+    exec /bin/bash "${targetScript}"
 }
 
 # 防火墙
@@ -4335,7 +4370,6 @@ aliasInstall() {
         echoContent red " ---> 快捷方式创建失败"
     fi
 }
-
 # 检查ipv6、ipv4
 checkIPv6() {
     currentIPv6IP=$(curl -s -6 -m 4 http://www.cloudflare.com/cdn-cgi/trace | grep "ip" | cut -d "=" -f 2)
@@ -4806,6 +4840,7 @@ buildRelayOutbound() {
     local protocolChoice=${forcedProtocol}
     local relayAddress relayPort relayUUID relaySNI relayFlow
     local relayPath relayHost relayPublicKey relayShortId relayMldsa65Verify relayAuth relayBbrProfile
+    local relayMethod relayPassword
     relayBuiltBbrProfile=
 
     if [[ -z "${protocolChoice}" ]]; then
@@ -4814,9 +4849,10 @@ buildRelayOutbound() {
         echoContent yellow "2.VLESS + WebSocket + TLS"
         echoContent yellow "3.VLESS + Reality + Vision"
         echoContent yellow "4.Hysteria2 + TLS + QUIC [推荐用于游戏 UDP]"
+        echoContent yellow "5.Shadowsocks [原生支持 TCP/UDP]"
         read -r -p "请选择:" protocolChoice
     fi
-    if [[ ! "${protocolChoice}" =~ ^[1-4]$ ]]; then
+    if [[ ! "${protocolChoice}" =~ ^[1-5]$ ]]; then
         echoContent red " ---> 上游协议选择无效"
         return 1
     fi
@@ -4896,6 +4932,18 @@ buildRelayOutbound() {
         relayBuiltProtocol="hysteria2"
         relayBuiltLabel="Hysteria2 + TLS + QUIC"
         relayBuiltBbrProfile=${relayBbrProfile}
+        ;;
+    5)
+        read -r -p "Shadowsocks 加密方式[aes-256-gcm]:" relayMethod
+        relayMethod=${relayMethod:-aes-256-gcm}
+        read -r -s -p "Shadowsocks 密码:" relayPassword
+        echo
+        [[ -z "${relayPassword}" ]] && echoContent red " ---> Shadowsocks 密码不能为空" && return 1
+        jq -n --arg tag "${outboundTag}" --arg address "${relayAddress}" --argjson port "${relayPort}" \
+            --arg method "${relayMethod}" --arg password "${relayPassword}" '
+            {outbounds:[{tag:$tag,protocol:"shadowsocks",settings:{address:$address,port:$port,method:$method,password:$password}}]}' >"${outputFile}"
+        relayBuiltProtocol="shadowsocks"
+        relayBuiltLabel="Shadowsocks (${relayMethod})"
         ;;
     esac
 
@@ -5105,7 +5153,6 @@ manageRelay() {
         read -r -p "按回车键继续..."
     done
 }
-
 # ==================== 分流工具 ====================
 
 # 分流工具
