@@ -6929,7 +6929,7 @@ manageHysteria2() {
 menu() {
     cd "$HOME" || exit
     echoContent red "\n=============================================================="
-    echoContent green "当前版本：v2026.07.18.1784357264"
+    echoContent green "当前版本：v2026.07.18.1784357286"
     echoContent green "描述：Xray 一键安装管理脚本\c"
     showInstallStatus
     checkWgetShowProgress
