@@ -5401,7 +5401,7 @@ removeRelay() {
     done < <(jq -r '.profiles[]?.outboundFile' "${relayStateFile}")
     writeRelayState '{"version":2,"profiles":[]}'
     rebuildRelayRouting
-    rm -f "${relayStateFile}" /opt/xray-agent/relay_config
+    rm -f /opt/xray-agent/relay_config
     removeCronRelaySubscription
     handleXray stop
     handleXray start
@@ -5416,6 +5416,7 @@ manageRelay() {
     ensureRelayStateV2 || return
     local relayType profileCount
     while true; do
+        ensureRelayStateV2 || return
         profileCount=$(jq '.profiles | length' "${relayStateFile}")
         echoContent skyBlue "\n功能 1/${totalProgress} : 多规则中转管理"
         echoContent red "\n=============================================================="
@@ -6958,7 +6959,7 @@ manageHysteria2() {
 menu() {
     cd "$HOME" || exit
     echoContent red "\n=============================================================="
-    echoContent green "当前版本：v2026.07.20.1784501791"
+    echoContent green "当前版本：v2026.07.20.1784502213"
     echoContent green "描述：Xray 一键安装管理脚本\c"
     showInstallStatus
     checkWgetShowProgress
