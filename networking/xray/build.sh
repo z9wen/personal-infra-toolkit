@@ -39,24 +39,24 @@ for module in "${modules[@]}"; do
 done
 
 case ${mode} in
---check)
-    if [[ ! -f "${output_file}" ]]; then
-        echo "xray-install.sh does not exist; run networking/xray/build.sh" >&2
-        exit 1
-    fi
-    build_version=$(sed -n 's/.*当前版本：v\([0-9][0-9.]*\)".*/\1/p' "${output_file}" | head -1)
-    if [[ -z "${build_version}" ]]; then
-        echo "xray-install.sh does not contain a generated version" >&2
-        exit 1
-    fi
-    ;;
-build | --stdout)
-    build_version="$(TZ=Asia/Shanghai date '+%Y.%m.%d').$(date '+%s')"
-    ;;
-*)
-    echo "Usage: $0 [build|--check|--stdout]" >&2
-    exit 2
-    ;;
+    --check)
+        if [[ ! -f "${output_file}" ]]; then
+            echo "xray-install.sh does not exist; run networking/xray/build.sh" >&2
+            exit 1
+        fi
+        build_version=$(sed -n 's/.*当前版本：v\([0-9][0-9.]*\)".*/\1/p' "${output_file}" | head -1)
+        if [[ -z "${build_version}" ]]; then
+            echo "xray-install.sh does not contain a generated version" >&2
+            exit 1
+        fi
+        ;;
+    build | --stdout)
+        build_version="$(TZ=Asia/Taipei date '+%Y.%m.%d').$(date '+%s')"
+        ;;
+    *)
+        echo "Usage: $0 [build|--check|--stdout]" >&2
+        exit 2
+        ;;
 esac
 
 if ! grep -q "${version_marker}" "${temp_file}"; then

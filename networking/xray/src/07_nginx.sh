@@ -83,7 +83,7 @@ EOF
                 echoContent yellow " ---> 请关闭云朵后等待三分钟重新尝试"
             else
                 if [[ -z "${checkPortOpenResult}" ]]; then
-                    echoContent red " ---> 请检查是否有网页防火墙，比如Oracle等云服务商"
+                    echoContent red " ---> 请检查云服务商是否启用了网页防火墙"
                     echoContent red " ---> 检查是否自己安装过nginx并且有配置冲突，可以尝试DD纯净系统后重新尝试"
                 else
                     echoContent red " ---> 错误日志：${checkPortOpenResult}，请将此错误日志通过issues提交反馈"
@@ -250,4 +250,3 @@ EOF
     echoContent green " ---> Nginx配置已写入: ${nginxConfFile}"
 }
 # 检查ip
-

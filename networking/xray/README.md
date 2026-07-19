@@ -74,7 +74,10 @@ chmod +x xray-install.sh
 The script is intended for Debian/Ubuntu VPS environments and performs
 privileged system, firewall, Nginx and systemd changes. Review it before use.
 
-The relay manager can import Shadowsocks outbounds from a sing-box JSON
-subscription. It preserves the selected local inbound tags and installs a
-daily refresh job; changed upstream credentials are validated before Xray is
-restarted, while failed refreshes keep the last working outbound.
+The relay manager supports multiple independent inbound-to-upstream profiles.
+Each local inbound tag can be assigned to one manual upstream or to a
+Shadowsocks node imported from a sing-box JSON subscription, with separate TCP
+and UDP routing choices. Subscription profiles share a daily refresh job;
+changed credentials are validated before Xray is restarted, while failed
+refreshes keep the last working outbound. Existing single-profile relay state
+is migrated automatically.
