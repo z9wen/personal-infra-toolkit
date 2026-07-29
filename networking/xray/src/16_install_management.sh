@@ -195,33 +195,31 @@ cronFunction() {
 }
 # 账号管理
 manageAccount() {
-    echoContent skyBlue "\n功能 1/${totalProgress} : 账号管理"
     if [[ -z "${configPath}" ]]; then
         echoContent red " ---> 未安装"
-        exit 0
+        return
     fi
 
-    echoContent red "\n=============================================================="
-    echoContent yellow "# 添加单个用户时可自定义email和uuid"
-    echoContent yellow "# 如安装了Hysteria2，账号会同步添加到Hysteria2入站\n"
-    echoContent yellow "1.查看账号"
-    echoContent yellow "2.查看订阅"
-    echoContent yellow "3.管理其他订阅"
-    echoContent yellow "4.添加用户"
-    echoContent yellow "5.删除用户"
-    echoContent red "=============================================================="
-    read -r -p "请输入:" manageAccountStatus
-    if [[ "${manageAccountStatus}" == "1" ]]; then
-        showAccounts 1
-    elif [[ "${manageAccountStatus}" == "2" ]]; then
-        subscribe
-    elif [[ "${manageAccountStatus}" == "3" ]]; then
-        addSubscribeMenu 1
-    elif [[ "${manageAccountStatus}" == "4" ]]; then
-        addUser
-    elif [[ "${manageAccountStatus}" == "5" ]]; then
-        removeUser
-    else
-        echoContent red " ---> 选择错误"
-    fi
+    local manageAccountStatus
+    while true; do
+        echoContent skyBlue "\n功能 1/${totalProgress} : 账号管理"
+        echoContent red "\n=============================================================="
+        echoContent yellow "# 这里只管理服务端账号，不生成或修改订阅"
+        echoContent yellow "# 添加账号时可自定义 UUID、tag 和目标协议\n"
+        echoContent yellow "# 删除账号会从该 UUID 所属的全部协议中移除\n"
+        echoContent yellow "1.查看账号"
+        echoContent yellow "2.添加账号"
+        echoContent yellow "3.删除账号"
+        echoContent yellow "0.返回主菜单"
+        echoContent red "=============================================================="
+        read -r -p "请输入:" manageAccountStatus
+        case ${manageAccountStatus} in
+        1) listAccounts ;;
+        2) addUser ;;
+        3) removeUser ;;
+        0) return ;;
+        *) echoContent red " ---> 选择错误" ;;
+        esac
+        read -r -p "按回车键继续..."
+    done
 }

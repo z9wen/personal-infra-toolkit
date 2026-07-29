@@ -382,19 +382,23 @@ customUUID() {
 
         if [[ -n "${checkUUID}" ]]; then
             echoContent red " ---> UUID不可重复"
-            exit 0
+            return 1
         fi
     fi
 }
 
-# 自定义email
+# 自定义账号标签。Xray 内部会按协议追加 email 后缀，订阅中也用它标识节点。
 customUserEmail() {
-    read -r -p "请输入合法的email，[回车]随机email:" currentCustomEmail
+    read -r -p "请输入账号标签(tag)，例如 vision_jp_us，[回车]使用 UUID 前缀:" currentCustomEmail
     echo
     if [[ -z "${currentCustomEmail}" ]]; then
-        currentCustomEmail="${currentCustomUUID}"
-        echoContent yellow "email: ${currentCustomEmail}\n"
+        currentCustomEmail=$(echo "${currentCustomUUID}" | cut -d "-" -f 1)
+        echoContent yellow "账号标签: ${currentCustomEmail}\n"
     else
+        if ! validateXrayUserTag "${currentCustomEmail}"; then
+            echoContent red " ---> 标签仅支持字母、数字、点、下划线和连字符，且最长 64 位"
+            return 1
+        fi
         local checkEmail=
         local userConfigFile=
         while IFS= read -r userConfigFile; do
@@ -411,114 +415,246 @@ customUserEmail() {
         done < <(find "${configPath}" -maxdepth 1 -type f -name '*inbounds.json' 2>/dev/null)
 
         if [[ -n "${checkEmail}" ]]; then
-            echoContent red " ---> email不可重复"
-            exit 0
+            echoContent red " ---> 账号标签不可重复"
+            return 1
         fi
     fi
+}
+
+# 扫描实际入站配置，只返回当前已安装且支持账号写入的协议。
+# 协议识别来自 JSON 内容；clientType 仅作为各协议账号结构的适配器。
+discoverAccountProtocols() {
+    accountProtocolFiles=()
+    accountProtocolKinds=()
+    accountProtocolClientTypes=()
+    accountProtocolLabels=()
+
+    local inboundConfig protocol network security version inboundTag port
+    local kind clientType label
+    while IFS= read -r inboundConfig; do
+        protocol=$(jq -r '.inbounds[0].protocol // empty' "${inboundConfig}" 2>/dev/null)
+        network=$(jq -r '.inbounds[0].streamSettings.network // empty' "${inboundConfig}" 2>/dev/null)
+        security=$(jq -r '.inbounds[0].streamSettings.security // empty' "${inboundConfig}" 2>/dev/null)
+        version=$(jq -r '.inbounds[0].settings.version // empty' "${inboundConfig}" 2>/dev/null)
+        inboundTag=$(jq -r '.inbounds[0].tag // "untagged"' "${inboundConfig}" 2>/dev/null)
+        port=$(jq -r '.inbounds[0].port // "unknown"' "${inboundConfig}" 2>/dev/null)
+        kind=
+        clientType=
+        label=
+
+        case "${protocol}:${network}:${security}" in
+        vless:tcp:tls)
+            kind=vless
+            clientType=0
+            label="VLESS + TCP + TLS Vision"
+            ;;
+        vless:ws:*)
+            kind=vless
+            clientType=1
+            label="VLESS + WebSocket + TLS"
+            ;;
+        vless:tcp:reality)
+            kind=vless
+            clientType=3
+            label="VLESS + Reality + Vision"
+            ;;
+        hysteria:hysteria:tls)
+            [[ "${version}" == "2" ]] || continue
+            kind=hysteria2
+            clientType=-
+            label="Hysteria2"
+            ;;
+        *) continue ;;
+        esac
+
+        accountProtocolFiles+=("${inboundConfig}")
+        accountProtocolKinds+=("${kind}")
+        accountProtocolClientTypes+=("${clientType}")
+        accountProtocolLabels+=("${label} [${inboundTag}, port ${port}]")
+    done < <(find "${configPath}" -maxdepth 1 -type f -name '*inbounds.json' -print 2>/dev/null | sort)
+}
+
+# 选择新 UUID 要加入的实际已安装协议，回车默认加入全部协议。
+selectUserProtocols() {
+    discoverAccountProtocols
+    if ((${#accountProtocolFiles[@]} == 0)); then
+        echoContent red " ---> 未检测到可添加账号的协议"
+        return 1
+    fi
+
+    echoContent skyBlue "\n请选择新 UUID 要加入的协议"
+    local index
+    for ((index = 0; index < ${#accountProtocolFiles[@]}; index++)); do
+        echoContent yellow "$((index + 1)).${accountProtocolLabels[index]}"
+    done
+    local selection
+    read -r -p "请选择[可多选，例:1,3；回车=全部]:" selection
+    selection=${selection//，/,}
+
+    userSelectedProtocolIndexes=()
+    if [[ -z "${selection}" ]]; then
+        userSelectedProtocolIndexes=("${!accountProtocolFiles[@]}")
+        return 0
+    fi
+
+    local -a choices=()
+    local choice selectedIndex existing
+    IFS=',' read -r -a choices <<<"${selection}"
+    for choice in "${choices[@]}"; do
+        choice=${choice//[[:space:]]/}
+        if [[ ! "${choice}" =~ ^[0-9]+$ ]] || ((choice < 1 || choice > ${#accountProtocolFiles[@]})); then
+            echoContent red " ---> 协议选项无效: ${choice}"
+            return 1
+        fi
+        selectedIndex=$((choice - 1))
+        existing=false
+        for index in "${userSelectedProtocolIndexes[@]}"; do
+            [[ "${index}" == "${selectedIndex}" ]] && existing=true
+        done
+        [[ "${existing}" == "false" ]] && userSelectedProtocolIndexes+=("${selectedIndex}")
+    done
+}
+
+appendVlessUser() {
+    local inboundConfig=$1 clientType=$2 userUUID=$3 userTag=$4
+    local client temporaryConfig
+    client=$(buildXrayClient "${clientType}" "${userUUID}" "${userTag}") || return 1
+    temporaryConfig=$(mktemp "${inboundConfig}.tmp.XXXXXX") || return 1
+    if jq --argjson client "${client}" '
+        .inbounds[0].settings.clients = ((.inbounds[0].settings.clients // []) + [$client])
+    ' "${inboundConfig}" >"${temporaryConfig}"; then
+        chmod --reference="${inboundConfig}" "${temporaryConfig}" 2>/dev/null || chmod 600 "${temporaryConfig}"
+        mv -f "${temporaryConfig}" "${inboundConfig}"
+    else
+        rm -f "${temporaryConfig}"
+        return 1
+    fi
+}
+
+appendHysteria2User() {
+    local inboundConfig=$1 userUUID=$2 userTag=$3
+    local temporaryConfig
+    temporaryConfig=$(mktemp "${inboundConfig}.tmp.XXXXXX") || return 1
+    if jq --arg auth "${userUUID}" --arg email "${userTag}-Hysteria2" '
+        if .inbounds[0].settings.clients != null then
+            .inbounds[0].settings.clients += [{auth: $auth, level: 0, email: $email}]
+        else
+            .inbounds[0].settings.users = ((.inbounds[0].settings.users // []) + [{auth: $auth, level: 0, email: $email}])
+        end
+    ' "${inboundConfig}" >"${temporaryConfig}"; then
+        chmod --reference="${inboundConfig}" "${temporaryConfig}" 2>/dev/null || chmod 600 "${temporaryConfig}"
+        mv -f "${temporaryConfig}" "${inboundConfig}"
+    else
+        rm -f "${temporaryConfig}"
+        return 1
+    fi
+}
+
+collectAccounts() {
+    discoverAccountProtocols
+    discoveredAccounts='[]'
+    local index protocol inboundConfig user userId userEmail userTag
+
+    for index in "${!accountProtocolFiles[@]}"; do
+        protocol=${accountProtocolLabels[index]}
+        inboundConfig=${accountProtocolFiles[index]}
+        while read -r user; do
+            userId=$(jq -r '.id // .uuid // .auth // .password // empty' <<<"${user}")
+            userEmail=$(jq -r '.email // .name // .username // empty' <<<"${user}")
+            [[ -z "${userId}" ]] && continue
+            userTag=$(normalizeXrayEmail "${userEmail}")
+            [[ -z "${userTag}" ]] && userTag="${userId}"
+            discoveredAccounts=$(jq -c --arg id "${userId}" --arg tag "${userTag}" --arg protocol "${protocol}" '
+                if any(.[]; .uuid == $id) then
+                    map(if .uuid == $id then
+                        .protocols = (if (.protocols | index($protocol)) == null then .protocols + [$protocol] else .protocols end)
+                    else . end)
+                else
+                    . + [{uuid:$id,tag:$tag,protocols:[$protocol]}]
+                end
+            ' <<<"${discoveredAccounts}")
+        done < <(jq -c '(.inbounds[0].settings.clients // .inbounds[0].settings.users // .inbounds[0].users // [])[]' "${inboundConfig}")
+    done
+}
+
+listAccounts() {
+    collectAccounts
+    if [[ $(jq 'length' <<<"${discoveredAccounts}") -eq 0 ]]; then
+        echoContent yellow " ---> 当前没有账号"
+        return
+    fi
+    echoContent skyBlue "\n当前账号"
+    jq -r 'to_entries[] |
+        "\(.key + 1). tag: \(.value.tag)\n   UUID/auth: \(.value.uuid)\n   协议: \(.value.protocols | join(", "))"
+    ' <<<"${discoveredAccounts}"
 }
 
 # 添加用户
 addUser() {
-    read -r -p "请输入要添加的用户数量:" userNum
+    read -r -p "请输入要添加的账号数量:" userNum
     echo
-    if [[ -z ${userNum} || ${userNum} -le 0 ]]; then
+    if [[ ! "${userNum}" =~ ^[0-9]+$ ]] || ((userNum <= 0)); then
         echoContent red " ---> 输入有误，请重新输入"
-        exit 0
+        return 1
     fi
-    local userConfig=".inbounds[0].settings.clients"
+    selectUserProtocols || return 1
 
     while [[ ${userNum} -gt 0 ]]; do
         readConfigHostPathUUID
-        local users=
         ((userNum--)) || true
 
-        customUUID
-        customUserEmail
+        customUUID || return 1
+        customUserEmail || return 1
 
         uuid=${currentCustomUUID}
         email=${currentCustomEmail}
 
-        # VLESS TCP
-        if echo "${currentInstallProtocolType}" | grep -q ",0,"; then
-            local clients=
-            clients=$(initXrayClients 0 "${uuid}" "${email}")
-            clients=$(jq -r "${userConfig} = ${clients}" ${configPath}02_VLESS_TCP_inbounds.json)
-            echo "${clients}" | jq . >${configPath}02_VLESS_TCP_inbounds.json
-        fi
+        local selectedIndex
+        for selectedIndex in "${userSelectedProtocolIndexes[@]}"; do
+            case "${accountProtocolKinds[selectedIndex]}" in
+            vless)
+                appendVlessUser "${accountProtocolFiles[selectedIndex]}" "${accountProtocolClientTypes[selectedIndex]}" "${uuid}" "${email}" || return 1
+                ;;
+            hysteria2)
+                appendHysteria2User "${accountProtocolFiles[selectedIndex]}" "${uuid}" "${email}" || return 1
+                ;;
+            esac
+        done
 
-        # VLESS WS
-        if echo "${currentInstallProtocolType}" | grep -q ",1,"; then
-            local clients=
-            clients=$(initXrayClients 1 "${uuid}" "${email}")
-            clients=$(jq -r "${userConfig} = ${clients}" ${configPath}03_VLESS_WS_inbounds.json)
-            echo "${clients}" | jq . >${configPath}03_VLESS_WS_inbounds.json
-        fi
-
-        # vless reality vision
-        if echo "${currentInstallProtocolType}" | grep -q ",3,"; then
-            local clients=
-            clients=$(initXrayClients 3 "${uuid}" "${email}") || return 1
-            clients=$(jq -r "${userConfig} = ${clients}" ${configPath}07_VLESS_vision_reality_inbounds.json)
-            echo "${clients}" | jq . >${configPath}07_VLESS_vision_reality_inbounds.json
-        fi
-
-        # Hysteria2 使用同一个 UUID 作为认证密码
-        if echo "${currentInstallProtocolType}" | grep -q ",6,"; then
-            local hysteria2Config=
-            hysteria2Config=$(jq --arg auth "${uuid}" --arg email "${email}-Hysteria2" '
-                if .inbounds[0].settings.clients != null then
-                    .inbounds[0].settings.clients += [{auth: $auth, level: 0, email: $email}]
-                else
-                    .inbounds[0].settings.users += [{auth: $auth, level: 0, email: $email}]
-                end
-            ' "${configPath}05_hysteria2_inbounds.json")
-            echo "${hysteria2Config}" | jq . >"${configPath}05_hysteria2_inbounds.json"
-        fi
-
+        echoContent green " ---> 已添加 ${email}: ${uuid}"
     done
     handleXray stop
     handleXray start
     echoContent green " ---> 添加完成"
-    subscribe false
-    manageAccount 1
+    echoContent yellow " ---> 如需更新客户端订阅，请前往独立的订阅管理"
 }
 # 移除用户
 removeUser() {
-    local sourceConfig= candidateConfig userCount delUserIndex userId temporaryConfig
-    local -a preferredConfigs=(
-        "02_VLESS_TCP_inbounds.json" "03_VLESS_WS_inbounds.json"
-        "07_VLESS_vision_reality_inbounds.json" "05_hysteria2_inbounds.json"
-    )
-
-    for candidateConfig in "${preferredConfigs[@]}"; do
-        candidateConfig="${configPath}${candidateConfig}"
-        [[ -f "${candidateConfig}" ]] || continue
-        userCount=$(jq -r '(.inbounds[0].settings.clients // .inbounds[0].settings.users // .inbounds[0].users // []) | length' "${candidateConfig}" 2>/dev/null)
-        if [[ "${userCount}" =~ ^[0-9]+$ && ${userCount} -gt 0 ]]; then
-            sourceConfig="${candidateConfig}"
-            break
-        fi
-    done
-
-    if [[ -z "${sourceConfig}" ]]; then
+    local candidateConfig userCount delUserIndex userId temporaryConfig index
+    collectAccounts
+    userCount=$(jq 'length' <<<"${discoveredAccounts}")
+    if ((userCount == 0)); then
         echoContent red " ---> 未找到可删除的用户"
         return 1
     fi
 
-    jq -r '(.inbounds[0].settings.clients // .inbounds[0].settings.users // .inbounds[0].users // [])[] | (.email // .name // .username // "unnamed")' "${sourceConfig}" | awk '{print NR":"$0}'
-    read -r -p "请选择要删除的用户编号[仅支持单个删除]:" delUserIndex
+    jq -r 'to_entries[] |
+        "\(.key + 1):\(.value.tag) [UUID/auth: \(.value.uuid)]\n   协议: \(.value.protocols | join(", "))"
+    ' <<<"${discoveredAccounts}"
+    read -r -p "请选择要删除的账号编号[将从所属全部协议删除]:" delUserIndex
     if [[ ! "${delUserIndex}" =~ ^[0-9]+$ || ${delUserIndex} -lt 1 || ${delUserIndex} -gt ${userCount} ]]; then
         echoContent red " ---> 选择错误"
         return 1
     fi
 
-    userId=$(jq -r --argjson index "$((delUserIndex - 1))" '(.inbounds[0].settings.clients // .inbounds[0].settings.users // .inbounds[0].users // [])[$index] | (.id // .uuid // .auth // .password // empty)' "${sourceConfig}")
+    userId=$(jq -r --argjson index "$((delUserIndex - 1))" '.[$index].uuid // empty' <<<"${discoveredAccounts}")
     if [[ -z "${userId}" ]]; then
         echoContent red " ---> 无法识别该用户的 UUID/auth，未修改配置"
         return 1
     fi
 
-    while IFS= read -r candidateConfig; do
+    for index in "${!accountProtocolFiles[@]}"; do
+        candidateConfig=${accountProtocolFiles[index]}
         if ! jq -e --arg userId "${userId}" '
             any((.inbounds[]?.settings.clients[]?, .inbounds[]?.settings.users[]?, .inbounds[]?.users[]?);
                 (.id // .uuid // .auth // .password // "") == $userId)
@@ -539,11 +675,12 @@ removeUser() {
             echoContent red " ---> 更新配置失败: ${candidateConfig}"
             return 1
         fi
-    done < <(find "${configPath}" -maxdepth 1 -type f -name '*inbounds.json' 2>/dev/null)
+    done
 
     handleXray stop
     handleXray start
-    manageAccount 1
+    echoContent green " ---> 删除完成"
+    echoContent yellow " ---> 如需更新客户端订阅，请前往独立的订阅管理"
 }
 # 更新脚本
 updateXrayAgent() {

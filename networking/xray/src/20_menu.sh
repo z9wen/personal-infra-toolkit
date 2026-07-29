@@ -19,7 +19,7 @@ menu() {
     echoContent yellow "3.REALITY管理"
 
     echoContent skyBlue "-------------------------工具管理-----------------------------"
-    echoContent yellow "4.用户管理"
+    echoContent yellow "4.账号管理"
     echoContent yellow "5.伪装站管理"
     echoContent yellow "6.证书管理"
     echoContent yellow "7.分流工具"
@@ -32,6 +32,8 @@ menu() {
     echoContent yellow "12.卸载脚本"
     echoContent skyBlue "-------------------------中转管理-----------------------------"
     echoContent yellow "13.中转管理（链式代理）"
+    echoContent skyBlue "-------------------------订阅管理-----------------------------"
+    echoContent yellow "14.订阅管理"
     echoContent red "=============================================================="
     mkdirTools
     aliasInstall
@@ -75,6 +77,9 @@ menu() {
         ;;
     13)
         manageRelay 1
+        ;;
+    14)
+        manageSubscriptions
         ;;
     esac
 }

@@ -89,7 +89,7 @@ defaultBase64Code() {
         ;;
     esac
     local user=
-    user=$(echo "${email}" | awk -F "[-]" '{print $1}')
+    user=$(normalizeXrayEmail "${email}")
     if [[ ! -f "/opt/xray-agent/subscribe_local/sing-box/${user}" ]]; then
         echo [] >"/opt/xray-agent/subscribe_local/sing-box/${user}"
     fi
@@ -223,4 +223,3 @@ EOF
 
 
 # 移除nginx302配置
-

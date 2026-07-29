@@ -10,6 +10,10 @@ normalizeXrayEmail() {
     printf '%s\n' "${value}"
 }
 
+validateXrayUserTag() {
+    [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]]
+}
+
 initXrayClients() {
     local clientType=$1
     local newUUID=$2
@@ -260,10 +264,13 @@ initXrayConfig() {
             uuid=$(/opt/xray-agent/xray/xray uuid)
         fi
 
-        echoContent yellow "\n请输入自定义用户名[需合法]，[回车]随机用户名"
-        read -r -p '用户名:' customEmail
+        echoContent yellow "\n请输入账号标签(tag)，例如 jp_vision，[回车]使用 UUID 前缀"
+        read -r -p '账号标签:' customEmail
         if [[ -z ${customEmail} ]]; then
-            customEmail="$(echo "${uuid}" | cut -d "-" -f 1)-VLESS_TCP/TLS_Vision"
+            customEmail="$(echo "${uuid}" | cut -d "-" -f 1)"
+        elif ! validateXrayUserTag "${customEmail}"; then
+            echoContent red " ---> 标签仅支持字母、数字、点、下划线和连字符，且最长 64 位"
+            return 1
         fi
     fi
 
@@ -536,4 +543,3 @@ EOF
         addXrayOutbound z_direct_outbound
     fi
 }
-

@@ -136,6 +136,32 @@ addSubscribeMenu() {
         subscribe
     fi
 }
+
+manageSubscriptions() {
+    if [[ -z "${configPath}" ]]; then
+        echoContent red " ---> 未安装"
+        return
+    fi
+
+    local subscriptionManageStatus
+    while true; do
+        echoContent skyBlue "\n订阅管理"
+        echoContent red "\n=============================================================="
+        echoContent yellow "1.查看或重新生成本机订阅"
+        echoContent yellow "2.管理其他机器订阅"
+        echoContent yellow "0.返回主菜单"
+        echoContent red "=============================================================="
+        read -r -p "请选择:" subscriptionManageStatus
+        case ${subscriptionManageStatus} in
+        1) subscribe ;;
+        2) addSubscribeMenu ;;
+        0) return ;;
+        *) echoContent red " ---> 请输入 0-2" ;;
+        esac
+        read -r -p "按回车键继续..."
+    done
+}
+
 # 添加其他机器clashMeta订阅
 addOtherSubscribe() {
     echoContent yellow "#注意事项:"
@@ -712,4 +738,3 @@ updateRemoteSubscribe() {
 
     done < <(grep -v '^$' <"/opt/xray-agent/subscribe_remote/remoteSubscribeUrl")
 }
-

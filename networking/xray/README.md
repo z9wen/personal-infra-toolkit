@@ -77,7 +77,20 @@ privileged system, firewall, Nginx and systemd changes. Review it before use.
 The relay manager supports multiple independent inbound-to-upstream profiles.
 Each local inbound tag can be assigned to one manual upstream or to a
 Shadowsocks node imported from a sing-box JSON subscription, with separate TCP
-and UDP routing choices. Subscription profiles share a daily refresh job;
+and UDP routing choices. When exactly one VLESS inbound is selected, a profile
+can be limited to specific client UUIDs; Xray matches their configured email
+values, while unselected UUIDs keep the existing route. Subscription profiles share a daily refresh job;
 changed credentials are validated before Xray is restarted, while failed
 refreshes keep the last working outbound. Existing single-profile relay state
 is migrated automatically.
+
+Account creation accepts a stable, human-readable tag such as `jp_vision` or
+`vision_jp_us`. Protocol-specific suffixes are added internally so Xray routing
+can identify the authenticated user. A new UUID can be added to selected
+installed protocols instead of being copied to every inbound. The account menu
+discovers these choices from the active inbound JSON files rather than from a
+fixed list of installation type numbers.
+
+Account management only lists, adds and removes server-side identities.
+Subscription generation and remote-subscription aggregation live under a
+separate top-level subscription menu.

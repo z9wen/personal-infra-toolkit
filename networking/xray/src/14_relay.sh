@@ -13,6 +13,7 @@ detectRelayInbounds() {
 # 选择需要走中转的本机入站，结果保存为 JSON 数组。
 selectRelayInbounds() {
     detectRelayInbounds
+    relaySelectedUsers='[]'
     if ((${#relayInboundTags[@]} == 0)); then
         echoContent red " ---> 未检测到可用的入站协议"
         return 1
@@ -52,6 +53,70 @@ selectRelayInbounds() {
     done
 
     relaySelectedInboundTags=$(printf '%s\n' "${selectedTags[@]}" | jq -R . | jq -sc .)
+}
+
+# 单独选择一个 VLESS 入站时，允许只把指定账号送往上游。
+# Xray 路由按 client email 识别来源账号；不同 UUID 必须使用不同 email。
+selectRelayUsers() {
+    relaySelectedUsers='[]'
+    local inboundCount inboundTag inboundConfig clients userCount scope selection
+    inboundCount=$(jq 'length' <<<"${relaySelectedInboundTags}")
+    ((inboundCount == 1)) || return 0
+
+    inboundTag=$(jq -r '.[0]' <<<"${relaySelectedInboundTags}")
+    case "${inboundTag}" in
+    VLESSTCP) inboundConfig="${configPath}02_VLESS_TCP_inbounds.json" ;;
+    VLESSWS) inboundConfig="${configPath}03_VLESS_WS_inbounds.json" ;;
+    VLESSReality) inboundConfig="${configPath}07_VLESS_vision_reality_inbounds.json" ;;
+    *) return 0 ;;
+    esac
+    [[ -f "${inboundConfig}" ]] || return 0
+
+    clients=$(jq -c '
+        (.inbounds[0].settings.clients // .inbounds[0].users // [])
+        | map(select((.email // "") != ""))
+    ' "${inboundConfig}") || return 1
+    userCount=$(jq 'length' <<<"${clients}")
+    ((userCount > 0)) || return 0
+
+    echoContent skyBlue "\n请选择此入站的中转范围"
+    echoContent yellow "1.整个入站（全部 UUID）"
+    echoContent yellow "2.指定账号（未选 UUID 保持原有路线）"
+    read -r -p "请选择[1]:" scope
+    scope=${scope:-1}
+    [[ "${scope}" == "1" ]] && return 0
+    if [[ "${scope}" != "2" ]]; then
+        echoContent red " ---> 请输入 1-2"
+        return 1
+    fi
+
+    echoContent skyBlue "\n可选择的账号"
+    jq -r 'to_entries[] |
+        (.value.email | sub("-(VLESS_TCP/TLS_Vision|VLESS_WS|vless_reality_vision|Hysteria2)$"; "")) as $tag |
+        "\(.key + 1).\($tag) [UUID: \(.value.id // .value.uuid)]"
+    ' <<<"${clients}"
+    read -r -p "请选择需要链式转发的账号[可多选，例:1,3]:" selection
+    selection=${selection//，/,}
+    if [[ -z "${selection}" ]]; then
+        echoContent red " ---> 至少选择一个账号"
+        return 1
+    fi
+
+    local -a choices=()
+    local choice email
+    IFS=',' read -r -a choices <<<"${selection}"
+    for choice in "${choices[@]}"; do
+        choice=${choice//[[:space:]]/}
+        if [[ ! "${choice}" =~ ^[0-9]+$ ]] || ((choice < 1 || choice > userCount)); then
+            echoContent red " ---> 账号选项无效: ${choice}"
+            return 1
+        fi
+        email=$(jq -r --argjson index "$((choice - 1))" '.[$index].email' <<<"${clients}")
+        relaySelectedUsers=$(jq -c --arg email "${email}" '
+            if index($email) == null then . + [$email] else . end
+        ' <<<"${relaySelectedUsers}")
+    done
+    echoContent green " ---> 仅所选账号通过此中转，其他 UUID 保持原有路线"
 }
 
 validateRelayPort() {
@@ -284,9 +349,10 @@ setupRelaySubscription() {
     nodePort=$(jq -r --arg tag "${selectedTag}" 'first(.outbounds[] | select(.type == "shadowsocks" and .tag == $tag)).server_port' "${subscriptionFile}")
     nodeMethod=$(jq -r --arg tag "${selectedTag}" 'first(.outbounds[] | select(.type == "shadowsocks" and .tag == $tag)).method' "${subscriptionFile}")
     profile=$(jq -n --arg id "${profileId}" --arg name "${profileName}" --argjson inboundTags "${relaySelectedInboundTags}" \
+        --argjson users "${relaySelectedUsers}" \
         --arg outboundTag "${outboundTag}" --arg outboundFile "${outboundFile}" --arg url "${subscriptionUrl}" --arg selectedTag "${selectedTag}" \
         --arg address "${nodeAddress}" --arg port "${nodePort}" --arg method "${nodeMethod}" --arg udpMode "${relaySelectedUdpMode}" '
-        {id:$id,name:$name,source:"subscription",inboundTags:$inboundTags,outboundTag:$outboundTag,outboundFile:$outboundFile,
+        {id:$id,name:$name,source:"subscription",inboundTags:$inboundTags,users:$users,outboundTag:$outboundTag,outboundFile:$outboundFile,
          subscription:{format:"sing-box-json",url:$url,selectedTag:$selectedTag},
          tcp:{mode:"relay",protocol:"shadowsocks",label:("Shadowsocks ("+$method+")"),address:$address,port:$port,bbrProfile:""},
          udp:(if $udpMode == "shared" then {mode:"shared",protocol:"shadowsocks",label:("Shadowsocks ("+$method+")"),address:$address,port:$port,bbrProfile:""} else {mode:"direct",protocol:"",label:"直连",address:"",port:"",bbrProfile:""} end)}')
@@ -426,8 +492,13 @@ rebuildRelayRouting() {
     ensureRelayStateV2 || return 1
     local relayRules managedTags newConfig
     relayRules=$(jq '[.profiles[]? | . as $profile |
-        [{type:"field",inboundTag:$profile.inboundTags,network:"tcp",outboundTag:$profile.outboundTag}] +
-        (if $profile.udp.mode == "shared" then [{type:"field",inboundTag:$profile.inboundTags,network:"udp",outboundTag:$profile.outboundTag}] else [] end)
+        ($profile.users // []) as $users |
+        [({type:"field",inboundTag:$profile.inboundTags,network:"tcp",outboundTag:$profile.outboundTag} +
+            if ($users | length) > 0 then {user:$users} else {} end)] +
+        (if $profile.udp.mode == "shared" then
+            [({type:"field",inboundTag:$profile.inboundTags,network:"udp",outboundTag:$profile.outboundTag} +
+                if ($users | length) > 0 then {user:$users} else {} end)]
+         else [] end)
     ] | add // []' "${relayStateFile}") || return 1
     managedTags=$(jq '[.profiles[]?.outboundTag]' "${relayStateFile}") || return 1
     newConfig=$(jq --argjson rules "${relayRules}" --argjson managedTags "${managedTags}" '
@@ -454,10 +525,11 @@ setupRelayManual() {
         return 1
     }
     profile=$(jq -n --arg id "${profileId}" --arg name "${profileName}" --argjson inboundTags "${relaySelectedInboundTags}" \
+        --argjson users "${relaySelectedUsers}" \
         --arg outboundTag "${outboundTag}" --arg outboundFile "${outboundFile}" --arg protocol "${relayBuiltProtocol}" \
         --arg label "${relayBuiltLabel}" --arg address "${relayBuiltAddress}" --arg port "${relayBuiltPort}" \
         --arg bbrProfile "${relayBuiltBbrProfile}" --arg udpMode "${relaySelectedUdpMode}" '
-        {id:$id,name:$name,source:"manual",inboundTags:$inboundTags,outboundTag:$outboundTag,outboundFile:$outboundFile,
+        {id:$id,name:$name,source:"manual",inboundTags:$inboundTags,users:$users,outboundTag:$outboundTag,outboundFile:$outboundFile,
          tcp:{mode:"relay",protocol:$protocol,label:$label,address:$address,port:$port,bbrProfile:$bbrProfile},
          udp:(if $udpMode == "shared" then {mode:"shared",protocol:$protocol,label:$label,address:$address,port:$port,bbrProfile:$bbrProfile} else {mode:"direct",protocol:"",label:"直连",address:"",port:"",bbrProfile:""} end)}')
     activateRelayProfile "${profile}" "${generatedOutbound}" || {
@@ -470,8 +542,9 @@ setupRelayManual() {
 
 setupRelay() {
     echoContent skyBlue "\n新增中转规则"
-    echoContent yellow "# 每个本机入站只能绑定一条规则，未绑定入站保持原有分流\n"
+    echoContent yellow "# 每个本机入站只能绑定一条规则；VLESS 单入站可只绑定指定 UUID\n"
     selectRelayInbounds || return
+    selectRelayUsers || return
     relayInboundTagsAvailable "${relaySelectedInboundTags}" || return
     echoContent skyBlue "\n请选择上游配置来源"
     echoContent yellow "1.sing-box JSON 订阅中的 Shadowsocks 节点"
@@ -498,7 +571,7 @@ showRelayConfig() {
     fi
     echoContent skyBlue "\n当前中转规则"
     jq -r '.profiles | to_entries[] |
-        "\(.key + 1). \(.value.name)\n   入站: \(.value.inboundTags | join(", "))\n   TCP : \(.value.tcp.label) -> \(.value.tcp.address):\(.value.tcp.port)\n   UDP : \(if .value.udp.mode == "shared" then (.value.udp.label + " -> " + .value.udp.address + ":" + .value.udp.port) else "直连" end)\n   来源: \(if .value.source == "subscription" then "订阅自动更新" else "手动" end)"' "${relayStateFile}"
+        "\(.key + 1). \(.value.name)\n   入站: \(.value.inboundTags | join(", "))\n   账号: \(if ((.value.users // []) | length) > 0 then ([.value.users[] | sub("-(VLESS_TCP/TLS_Vision|VLESS_WS|vless_reality_vision|Hysteria2)$"; "")] | join(", ")) else "全部 UUID" end)\n   TCP : \(.value.tcp.label) -> \(.value.tcp.address):\(.value.tcp.port)\n   UDP : \(if .value.udp.mode == "shared" then (.value.udp.label + " -> " + .value.udp.address + ":" + .value.udp.port) else "直连" end)\n   来源: \(if .value.source == "subscription" then "订阅自动更新" else "手动" end)"' "${relayStateFile}"
 }
 
 updateRelaySubscriptionProfile() {
