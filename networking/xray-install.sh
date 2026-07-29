@@ -5115,49 +5115,154 @@ writeRelayState() {
     mv "${temporaryFile}" "${relayStateFile}"
 }
 
-# 将旧版单中转状态转换成 profiles 数组，保留既有出站与订阅信息。
+# 将旧版状态转换为“一个上游 profile 对应多个入口 selectors”的格式。
 ensureRelayStateV2() {
     if [[ ! -f "${relayStateFile}" ]]; then
         writeRelayState '{"version":2,"profiles":[]}'
         return
     fi
     if jq -e '.version == 2 and (.profiles | type == "array")' "${relayStateFile}" >/dev/null 2>&1; then
-        chmod 600 "${relayStateFile}"
+        local normalized current
+        normalized=$(jq -c '
+            .profiles |= map(
+                if (.selectors? | type) == "array" then
+                    .
+                else
+                    . + {selectors:[{
+                        inboundTags:(.inboundTags // []),
+                        users:(.users // [])
+                    }]}
+                end |
+                del(.inboundTags, .users)
+            )
+        ' "${relayStateFile}") || return 1
+        current=$(jq -c . "${relayStateFile}") || return 1
+        if [[ "${normalized}" != "${current}" ]]; then
+            writeRelayState "${normalized}" || return 1
+            echoContent green " ---> 已将中转规则升级为多入口格式"
+        else
+            chmod 600 "${relayStateFile}"
+        fi
         return
     fi
     local migrated
     migrated=$(jq '
-        {version:2,profiles:[. + {
-            id:"legacy",
-            name:(.name // if .source == "subscription" then "原有订阅中转" else "原有手动中转" end),
-            outboundTag:"relay_tcp_outbound",
-            outboundFile:"relay_tcp_outbound.json"
-        }]}
+        . as $legacy |
+        {version:2,profiles:[(
+            $legacy + {
+                id:"legacy",
+                name:($legacy.name // if $legacy.source == "subscription" then "原有订阅中转" else "原有手动中转" end),
+                outboundTag:"relay_tcp_outbound",
+                outboundFile:"relay_tcp_outbound.json",
+                selectors:[{
+                    inboundTags:($legacy.inboundTags // []),
+                    users:($legacy.users // [])
+                }]
+            } |
+            del(.inboundTags, .users)
+        )]}
     ' "${relayStateFile}") || return 1
     writeRelayState "${migrated}"
-    echoContent green " ---> 已将原有中转配置迁移为多规则格式"
+    echoContent green " ---> 已将原有中转配置迁移为多入口格式"
 }
 
 relayProfileFileIsSafe() {
     [[ $1 =~ ^relay_([A-Za-z0-9_]+_)?outbound\.json$ ]]
 }
 
-relayInboundTagsAvailable() {
-    local inboundTags=$1
+# 检查目标选择器是否已绑定到其他上游。
+relayTargetsAvailable() {
+    local selector=$1 destinationId=${2:-}
     ensureRelayStateV2 || return 1
-    relayReassignInbounds=false
-    if jq -e --argjson tags "${inboundTags}" '
-        any(.profiles[]?.inboundTags[]?; . as $used | $tags | index($used) != null)
+    if jq -e --argjson selector "${selector}" --arg destinationId "${destinationId}" '
+        def tagOverlap($left; $right):
+            any($left[]?; . as $used | $right | index($used) != null);
+        def userOverlap($left; $right):
+            any($left[]?; . as $used | $right | index($used) != null);
+        def conflicts($current; $selected):
+            tagOverlap($current.inboundTags; $selected.inboundTags) and
+            (
+                (($selected.users // []) | length) == 0 or
+                (
+                    ((($current.users // []) | length) > 0) and
+                    userOverlap(($current.users // []); ($selected.users // []))
+                )
+            );
+        any(.profiles[]? | select(.id != $destinationId) | .selectors[]?; conflicts(.; $selector))
     ' "${relayStateFile}" >/dev/null; then
-        echoContent yellow " ---> 所选入站已属于以下规则:"
-        jq -r --argjson tags "${inboundTags}" '.profiles[] |
-            select(any(.inboundTags[]?; . as $used | $tags | index($used) != null)) |
-            "     " + .name + " [" + (.inboundTags | join(", ")) + "]"' "${relayStateFile}"
+        echoContent yellow " ---> 所选目标已属于以下规则:"
+        jq -r --argjson selector "${selector}" --arg destinationId "${destinationId}" '
+            def tagOverlap($left; $right):
+                any($left[]?; . as $used | $right | index($used) != null);
+            def userOverlap($left; $right):
+                any($left[]?; . as $used | $right | index($used) != null);
+            def displayUser:
+                sub("-(VLESS_TCP/TLS_Vision|VLESS_WS|vless_reality_vision|Hysteria2)$"; "");
+            def conflicts($current; $selected):
+                tagOverlap($current.inboundTags; $selected.inboundTags) and
+                (
+                    (($selected.users // []) | length) == 0 or
+                    (
+                        ((($current.users // []) | length) > 0) and
+                        userOverlap(($current.users // []); ($selected.users // []))
+                    )
+                );
+            .profiles[] | select(.id != $destinationId) as $profile |
+            $profile.selectors[] |
+            select(conflicts(.; $selector)) |
+            "     " + $profile.name + " [" + (.inboundTags | join(", ")) + "] 账号: " +
+            (if ((.users // []) | length) > 0 then ([.users[] | displayUser] | join(", ")) else "全部 UUID" end)
+        ' "${relayStateFile}"
         local reassignStatus
-        read -r -p "是否从原规则移除这些入站并分配给新规则？[y/N]:" reassignStatus
+        if [[ $(jq '.users | length' <<<"${selector}") -eq 0 ]]; then
+            read -r -p "新规则将覆盖整个入站，是否移除上述旧绑定？[y/N]:" reassignStatus
+        else
+            read -r -p "是否将这些账号改派到新规则？[y/N]:" reassignStatus
+        fi
         [[ "${reassignStatus}" =~ ^[Yy]$ ]] || return 1
-        relayReassignInbounds=true
     fi
+}
+
+# 把一个入口选择器绑定到目标上游，同时从其他冲突选择器中移除它。
+buildRelayStateWithSelector() {
+    local destinationId=$1 selector=$2 newProfile=${3:-null}
+    jq --arg destinationId "${destinationId}" --argjson selector "${selector}" --argjson newProfile "${newProfile}" '
+        def tagOverlap($left; $right):
+            any($left[]?; . as $used | $right | index($used) != null);
+        def subtractSelector($current; $selected):
+            if (($selected.users // []) | length) == 0 then
+                $current |
+                .inboundTags -= $selected.inboundTags |
+                select((.inboundTags | length) > 0)
+            elif (
+                (($current.users // []) | length) > 0 and
+                tagOverlap($current.inboundTags; $selected.inboundTags)
+            ) then
+                $current |
+                .users -= $selected.users |
+                select((.users | length) > 0)
+            else
+                $current
+            end;
+        (if $newProfile == null then . else .profiles += [$newProfile] end) |
+        .profiles |= map(
+            .selectors = (
+                [.selectors[]? | subtractSelector(.; $selector)] +
+                (if .id == $destinationId then [$selector] else [] end)
+            )
+        ) |
+        .profiles |= map(select((.selectors | length) > 0))
+    ' "${relayStateFile}"
+}
+
+removeOrphanedRelayFiles() {
+    local previousStateFile=$1 orphanedFile
+    while read -r orphanedFile; do
+        if relayProfileFileIsSafe "${orphanedFile}" &&
+            ! jq -e --arg file "${orphanedFile}" 'any(.profiles[]?; .outboundFile == $file)' "${relayStateFile}" >/dev/null; then
+            rm -f "${configPath}${orphanedFile}"
+        fi
+    done < <(jq -r '.profiles[]?.outboundFile' "${previousStateFile}")
 }
 
 refreshRelaySubscriptionCron() {
@@ -5171,8 +5276,11 @@ refreshRelaySubscriptionCron() {
 
 activateRelayProfile() {
     local profile=$1 generatedOutbound=$2
-    local outboundFile backupDir validationOutput newState
+    local outboundFile profileId selector emptyProfile backupDir validationOutput newState
     outboundFile=$(jq -r '.outboundFile' <<<"${profile}")
+    profileId=$(jq -r '.id' <<<"${profile}")
+    selector=$(jq -c '.selectors[0]' <<<"${profile}")
+    emptyProfile=$(jq -c '.selectors = []' <<<"${profile}")
     relayProfileFileIsSafe "${outboundFile}" || return 1
     ensureRelayStateV2 || return 1
     backupDir=$(mktemp -d /tmp/xray-relay-profile.XXXXXX) || return 1
@@ -5185,14 +5293,24 @@ activateRelayProfile() {
         return 1
     }
     chmod 600 "${configPath}${outboundFile}"
-    newState=$(jq --argjson profile "${profile}" '
-        $profile.inboundTags as $selected |
-        .profiles = ([.profiles[] |
-            .inboundTags -= $selected |
-            select((.inboundTags | length) > 0)
-        ] + [$profile])
-    ' "${relayStateFile}") || return 1
-    writeRelayState "${newState}" || return 1
+    newState=$(buildRelayStateWithSelector "${profileId}" "${selector}" "${emptyProfile}") || {
+        if [[ -f "${backupDir}/${outboundFile}" ]]; then
+            cp "${backupDir}/${outboundFile}" "${configPath}${outboundFile}"
+        else
+            rm -f "${configPath}${outboundFile}"
+        fi
+        rm -rf "${backupDir}"
+        return 1
+    }
+    writeRelayState "${newState}" || {
+        if [[ -f "${backupDir}/${outboundFile}" ]]; then
+            cp "${backupDir}/${outboundFile}" "${configPath}${outboundFile}"
+        else
+            rm -f "${configPath}${outboundFile}"
+        fi
+        rm -rf "${backupDir}"
+        return 1
+    }
     if ! rebuildRelayRouting || ! validationOutput=$(/opt/xray-agent/xray/xray run -test -confdir "${configPath}" 2>&1); then
         cp "${backupDir}/relay_config.json" "${relayStateFile}"
         [[ -f "${backupDir}/09_routing.json" ]] && cp "${backupDir}/09_routing.json" "${configPath}09_routing.json"
@@ -5206,16 +5324,46 @@ activateRelayProfile() {
         rm -rf "${backupDir}"
         return 1
     fi
-    local orphanedFile
-    while read -r orphanedFile; do
-        if relayProfileFileIsSafe "${orphanedFile}" && ! jq -e --arg file "${orphanedFile}" 'any(.profiles[]?; .outboundFile == $file)' "${relayStateFile}" >/dev/null; then
-            rm -f "${configPath}${orphanedFile}"
-        fi
-    done < <(jq -r '.profiles[]?.outboundFile' "${backupDir}/relay_config.json")
+    removeOrphanedRelayFiles "${backupDir}/relay_config.json"
     rm -rf "${backupDir}"
     refreshRelaySubscriptionCron
     handleXray stop
     handleXray start
+}
+
+attachRelaySelector() {
+    local destinationId=$1 selector=$2
+    local backupDir newState validationOutput profileName
+    ensureRelayStateV2 || return 1
+    profileName=$(jq -r --arg id "${destinationId}" 'first(.profiles[] | select(.id == $id)).name // empty' "${relayStateFile}")
+    [[ -n "${profileName}" ]] || return 1
+    [[ -f "${configPath}09_routing.json" ]] || return 1
+    backupDir=$(mktemp -d /tmp/xray-relay-attach.XXXXXX) || return 1
+    cp "${relayStateFile}" "${backupDir}/relay_config.json"
+    cp "${configPath}09_routing.json" "${backupDir}/09_routing.json"
+
+    newState=$(buildRelayStateWithSelector "${destinationId}" "${selector}") || {
+        rm -rf "${backupDir}"
+        return 1
+    }
+    writeRelayState "${newState}" || {
+        rm -rf "${backupDir}"
+        return 1
+    }
+    if ! rebuildRelayRouting || ! validationOutput=$(/opt/xray-agent/xray/xray run -test -confdir "${configPath}" 2>&1); then
+        cp "${backupDir}/relay_config.json" "${relayStateFile}"
+        cp "${backupDir}/09_routing.json" "${configPath}09_routing.json"
+        echoContent red " ---> Xray 拒绝了入口规则，已恢复上一版"
+        [[ -n "${validationOutput}" ]] && echoContent yellow "${validationOutput}"
+        rm -rf "${backupDir}"
+        return 1
+    fi
+    removeOrphanedRelayFiles "${backupDir}/relay_config.json"
+    rm -rf "${backupDir}"
+    refreshRelaySubscriptionCron
+    handleXray stop
+    handleXray start
+    echoContent green " ---> 入口规则已绑定到现有上游: ${profileName}"
 }
 
 selectRelayUdpMode() {
@@ -5263,11 +5411,10 @@ setupRelaySubscription() {
     nodeAddress=$(jq -r --arg tag "${selectedTag}" 'first(.outbounds[] | select(.type == "shadowsocks" and .tag == $tag)).server' "${subscriptionFile}")
     nodePort=$(jq -r --arg tag "${selectedTag}" 'first(.outbounds[] | select(.type == "shadowsocks" and .tag == $tag)).server_port' "${subscriptionFile}")
     nodeMethod=$(jq -r --arg tag "${selectedTag}" 'first(.outbounds[] | select(.type == "shadowsocks" and .tag == $tag)).method' "${subscriptionFile}")
-    profile=$(jq -n --arg id "${profileId}" --arg name "${profileName}" --argjson inboundTags "${relaySelectedInboundTags}" \
-        --argjson users "${relaySelectedUsers}" \
+    profile=$(jq -n --arg id "${profileId}" --arg name "${profileName}" --argjson selector "${relaySelectedSelector}" \
         --arg outboundTag "${outboundTag}" --arg outboundFile "${outboundFile}" --arg url "${subscriptionUrl}" --arg selectedTag "${selectedTag}" \
         --arg address "${nodeAddress}" --arg port "${nodePort}" --arg method "${nodeMethod}" --arg udpMode "${relaySelectedUdpMode}" '
-        {id:$id,name:$name,source:"subscription",inboundTags:$inboundTags,users:$users,outboundTag:$outboundTag,outboundFile:$outboundFile,
+        {id:$id,name:$name,source:"subscription",selectors:[$selector],outboundTag:$outboundTag,outboundFile:$outboundFile,
          subscription:{format:"sing-box-json",url:$url,selectedTag:$selectedTag},
          tcp:{mode:"relay",protocol:"shadowsocks",label:("Shadowsocks ("+$method+")"),address:$address,port:$port,bbrProfile:""},
          udp:(if $udpMode == "shared" then {mode:"shared",protocol:"shadowsocks",label:("Shadowsocks ("+$method+")"),address:$address,port:$port,bbrProfile:""} else {mode:"direct",protocol:"",label:"直连",address:"",port:"",bbrProfile:""} end)}')
@@ -5406,12 +5553,23 @@ rebuildRelayRouting() {
     [[ -f "${routingFile}" ]] || return 1
     ensureRelayStateV2 || return 1
     local relayRules managedTags newConfig
-    relayRules=$(jq '[.profiles[]? | . as $profile |
-        ($profile.users // []) as $users |
-        [({type:"field",inboundTag:$profile.inboundTags,network:"tcp",outboundTag:$profile.outboundTag} +
+    relayRules=$(jq '
+        [.profiles[]? as $profile |
+            $profile.selectors[]? |
+            {profile:$profile,selector:.}
+        ] as $bindings |
+        (
+            [$bindings[] | select(((.selector.users // []) | length) > 0)] +
+            [$bindings[] | select(((.selector.users // []) | length) == 0)]
+        ) as $orderedBindings |
+      [$orderedBindings[] |
+        .profile as $profile |
+        .selector as $selector |
+        ($selector.users // []) as $users |
+        [({type:"field",inboundTag:$selector.inboundTags,network:"tcp",outboundTag:$profile.outboundTag} +
             if ($users | length) > 0 then {user:$users} else {} end)] +
         (if $profile.udp.mode == "shared" then
-            [({type:"field",inboundTag:$profile.inboundTags,network:"udp",outboundTag:$profile.outboundTag} +
+            [({type:"field",inboundTag:$selector.inboundTags,network:"udp",outboundTag:$profile.outboundTag} +
                 if ($users | length) > 0 then {user:$users} else {} end)]
          else [] end)
     ] | add // []' "${relayStateFile}") || return 1
@@ -5439,12 +5597,11 @@ setupRelayManual() {
         rm -rf "${tempDir}"
         return 1
     }
-    profile=$(jq -n --arg id "${profileId}" --arg name "${profileName}" --argjson inboundTags "${relaySelectedInboundTags}" \
-        --argjson users "${relaySelectedUsers}" \
+    profile=$(jq -n --arg id "${profileId}" --arg name "${profileName}" --argjson selector "${relaySelectedSelector}" \
         --arg outboundTag "${outboundTag}" --arg outboundFile "${outboundFile}" --arg protocol "${relayBuiltProtocol}" \
         --arg label "${relayBuiltLabel}" --arg address "${relayBuiltAddress}" --arg port "${relayBuiltPort}" \
         --arg bbrProfile "${relayBuiltBbrProfile}" --arg udpMode "${relaySelectedUdpMode}" '
-        {id:$id,name:$name,source:"manual",inboundTags:$inboundTags,users:$users,outboundTag:$outboundTag,outboundFile:$outboundFile,
+        {id:$id,name:$name,source:"manual",selectors:[$selector],outboundTag:$outboundTag,outboundFile:$outboundFile,
          tcp:{mode:"relay",protocol:$protocol,label:$label,address:$address,port:$port,bbrProfile:$bbrProfile},
          udp:(if $udpMode == "shared" then {mode:"shared",protocol:$protocol,label:$label,address:$address,port:$port,bbrProfile:$bbrProfile} else {mode:"direct",protocol:"",label:"直连",address:"",port:"",bbrProfile:""} end)}')
     activateRelayProfile "${profile}" "${generatedOutbound}" || {
@@ -5455,12 +5612,46 @@ setupRelayManual() {
     echoContent green " ---> 中转规则 ${profileName} 已启用"
 }
 
+selectRelayDestination() {
+    ensureRelayStateV2 || return 1
+    local count selection newOption
+    count=$(jq '.profiles | length' "${relayStateFile}")
+    relayUseExistingProfile=false
+    relaySelectedDestinationId=
+    ((count == 0)) && return 0
+
+    echoContent skyBlue "\n请选择目标上游"
+    jq -r '.profiles | to_entries[] |
+        "\(.key + 1).\(.value.name) -> \(.value.tcp.label) \(.value.tcp.address):\(.value.tcp.port)"
+    ' "${relayStateFile}"
+    newOption=$((count + 1))
+    echoContent yellow "${newOption}.新建上游"
+    read -r -p "请选择:" selection
+    if [[ ! "${selection}" =~ ^[0-9]+$ ]] || ((selection < 1 || selection > newOption)); then
+        echoContent red " ---> 上游选项无效"
+        return 1
+    fi
+    if ((selection <= count)); then
+        relayUseExistingProfile=true
+        relaySelectedDestinationId=$(jq -r --argjson index "$((selection - 1))" '.profiles[$index].id' "${relayStateFile}")
+    fi
+}
+
 setupRelay() {
-    echoContent skyBlue "\n新增中转规则"
-    echoContent yellow "# 每个本机入站只能绑定一条规则；VLESS 单入站可只绑定指定 UUID\n"
+    echoContent skyBlue "\n新增入口规则"
+    echoContent yellow "# 一个上游可绑定多个入口；指定账号优先于“全部 UUID”兜底规则\n"
     selectRelayInbounds || return
     selectRelayUsers || return
-    relayInboundTagsAvailable "${relaySelectedInboundTags}" || return
+    relaySelectedSelector=$(jq -nc --argjson inboundTags "${relaySelectedInboundTags}" --argjson users "${relaySelectedUsers}" \
+        '{inboundTags:$inboundTags,users:$users}')
+    selectRelayDestination || return
+    if [[ "${relayUseExistingProfile}" == "true" ]]; then
+        relayTargetsAvailable "${relaySelectedSelector}" "${relaySelectedDestinationId}" || return
+        attachRelaySelector "${relaySelectedDestinationId}" "${relaySelectedSelector}"
+        return
+    fi
+    relayTargetsAvailable "${relaySelectedSelector}" || return
+
     echoContent skyBlue "\n请选择上游配置来源"
     echoContent yellow "1.sing-box JSON 订阅中的 Shadowsocks 节点"
     echoContent yellow "2.手动输入上游节点"
@@ -5484,9 +5675,19 @@ showRelayConfig() {
         echoContent yellow " ---> 当前未配置中转规则"
         return
     fi
-    echoContent skyBlue "\n当前中转规则"
+    echoContent skyBlue "\n当前中转上游"
     jq -r '.profiles | to_entries[] |
-        "\(.key + 1). \(.value.name)\n   入站: \(.value.inboundTags | join(", "))\n   账号: \(if ((.value.users // []) | length) > 0 then ([.value.users[] | sub("-(VLESS_TCP/TLS_Vision|VLESS_WS|vless_reality_vision|Hysteria2)$"; "")] | join(", ")) else "全部 UUID" end)\n   TCP : \(.value.tcp.label) -> \(.value.tcp.address):\(.value.tcp.port)\n   UDP : \(if .value.udp.mode == "shared" then (.value.udp.label + " -> " + .value.udp.address + ":" + .value.udp.port) else "直连" end)\n   来源: \(if .value.source == "subscription" then "订阅自动更新" else "手动" end)"' "${relayStateFile}"
+        "\(.key + 1). \(.value.name)\n" +
+        (.value.selectors | to_entries | map(
+            "   入口 \(.key + 1): \(.value.inboundTags | join(", ")) / 账号: " +
+            (if ((.value.users // []) | length) > 0 then
+                ([.value.users[] | sub("-(VLESS_TCP/TLS_Vision|VLESS_WS|vless_reality_vision|Hysteria2)$"; "")] | join(", "))
+             else "全部 UUID" end)
+        ) | join("\n")) +
+        "\n   TCP : \(.value.tcp.label) -> \(.value.tcp.address):\(.value.tcp.port)\n" +
+        "   UDP : \(if .value.udp.mode == "shared" then (.value.udp.label + " -> " + .value.udp.address + ":" + .value.udp.port) else "直连" end)\n" +
+        "   来源: \(if .value.source == "subscription" then "订阅自动更新" else "手动" end)"
+    ' "${relayStateFile}"
 }
 
 updateRelaySubscriptionProfile() {
@@ -5572,15 +5773,77 @@ updateRelaySubscription() {
     [[ "${updateFailed}" == "false" ]]
 }
 
+removeRelaySelector() {
+    ensureRelayStateV2 || return
+    local bindings count selection profileId selectorIndex backupDir newState validationOutput
+    bindings=$(jq -c '[
+        .profiles[] as $profile |
+        $profile.selectors | to_entries[] |
+        {
+            profileId:$profile.id,
+            profileName:$profile.name,
+            selectorIndex:.key,
+            inboundTags:.value.inboundTags,
+            users:(.value.users // [])
+        }
+    ]' "${relayStateFile}") || return 1
+    count=$(jq 'length' <<<"${bindings}")
+    ((count == 0)) && echoContent yellow " ---> 当前没有入口规则" && return
+    jq -r 'to_entries[] |
+        "\(.key + 1).\(.value.profileName) <- \(.value.inboundTags | join(", ")) / 账号: " +
+        (if (.value.users | length) > 0 then
+            ([.value.users[] | sub("-(VLESS_TCP/TLS_Vision|VLESS_WS|vless_reality_vision|Hysteria2)$"; "")] | join(", "))
+         else "全部 UUID" end)
+    ' <<<"${bindings}"
+    read -r -p "请选择要删除的入口规则:" selection
+    if [[ ! "${selection}" =~ ^[0-9]+$ ]] || ((selection < 1 || selection > count)); then
+        echoContent red " ---> 入口规则选项无效"
+        return
+    fi
+    profileId=$(jq -r --argjson index "$((selection - 1))" '.[$index].profileId' <<<"${bindings}")
+    selectorIndex=$(jq -r --argjson index "$((selection - 1))" '.[$index].selectorIndex' <<<"${bindings}")
+    [[ -f "${configPath}09_routing.json" ]] || return 1
+    backupDir=$(mktemp -d /tmp/xray-relay-selector-remove.XXXXXX) || return
+    cp "${relayStateFile}" "${backupDir}/relay_config.json"
+    cp "${configPath}09_routing.json" "${backupDir}/09_routing.json"
+    newState=$(jq --arg id "${profileId}" --argjson selectorIndex "${selectorIndex}" '
+        .profiles |= map(
+            if .id == $id then del(.selectors[$selectorIndex]) else . end
+        ) |
+        .profiles |= map(select((.selectors | length) > 0))
+    ' "${relayStateFile}") || {
+        rm -rf "${backupDir}"
+        return 1
+    }
+    writeRelayState "${newState}" || {
+        rm -rf "${backupDir}"
+        return 1
+    }
+    if ! rebuildRelayRouting || ! validationOutput=$(/opt/xray-agent/xray/xray run -test -confdir "${configPath}" 2>&1); then
+        cp "${backupDir}/relay_config.json" "${relayStateFile}"
+        cp "${backupDir}/09_routing.json" "${configPath}09_routing.json"
+        echoContent red " ---> 删除入口规则后验证失败，已恢复"
+        [[ -n "${validationOutput}" ]] && echoContent yellow "${validationOutput}"
+        rm -rf "${backupDir}"
+        return 1
+    fi
+    removeOrphanedRelayFiles "${backupDir}/relay_config.json"
+    rm -rf "${backupDir}"
+    refreshRelaySubscriptionCron
+    handleXray stop
+    handleXray start
+    echoContent green " ---> 入口规则已删除"
+}
+
 removeRelayProfile() {
     ensureRelayStateV2 || return
     local count selection profile outboundFile backupDir newState validationOutput
     count=$(jq '.profiles | length' "${relayStateFile}")
-    ((count == 0)) && echoContent yellow " ---> 当前没有中转规则" && return
-    jq -r '.profiles | to_entries[] | "\(.key + 1).\(.value.name) [\(.value.inboundTags | join(", "))]"' "${relayStateFile}"
-    read -r -p "请选择要删除的规则:" selection
+    ((count == 0)) && echoContent yellow " ---> 当前没有中转上游" && return
+    jq -r '.profiles | to_entries[] | "\(.key + 1).\(.value.name) [入口规则: \(.value.selectors | length) 条]"' "${relayStateFile}"
+    read -r -p "请选择要删除的上游[其全部入口规则也会删除]:" selection
     if [[ ! "${selection}" =~ ^[0-9]+$ ]] || ((selection < 1 || selection > count)); then
-        echoContent red " ---> 规则选项无效"
+        echoContent red " ---> 上游选项无效"
         return
     fi
     profile=$(jq -c --argjson index "$((selection - 1))" '.profiles[$index]' "${relayStateFile}")
@@ -5605,7 +5868,7 @@ removeRelayProfile() {
     refreshRelaySubscriptionCron
     handleXray stop
     handleXray start
-    echoContent green " ---> 中转规则已删除"
+    echoContent green " ---> 中转上游已删除"
 }
 
 removeRelay() {
@@ -5629,18 +5892,20 @@ manageRelay() {
         return
     fi
     ensureRelayStateV2 || return
-    local relayType profileCount
+    local relayType profileCount selectorCount
     while true; do
         ensureRelayStateV2 || return
         profileCount=$(jq '.profiles | length' "${relayStateFile}")
+        selectorCount=$(jq '[.profiles[]?.selectors[]?] | length' "${relayStateFile}")
         echoContent skyBlue "\n功能 1/${totalProgress} : 多规则中转管理"
         echoContent red "\n=============================================================="
-        echoContent yellow "# 当前中转规则: ${profileCount} 条"
-        echoContent yellow "1.新增中转规则"
-        echoContent yellow "2.查看全部规则"
+        echoContent yellow "# 当前上游: ${profileCount} 个 / 入口规则: ${selectorCount} 条"
+        echoContent yellow "1.新增入口规则"
+        echoContent yellow "2.查看全部上游与入口"
         echoContent yellow "3.立即更新所有订阅规则"
-        echoContent yellow "4.删除一条规则"
-        echoContent yellow "5.停用全部中转"
+        echoContent yellow "4.删除一条入口规则"
+        echoContent yellow "5.删除一个上游"
+        echoContent yellow "6.停用全部中转"
         echoContent yellow "0.返回主菜单"
         echoContent red "=============================================================="
         read -r -p "请选择:" relayType
@@ -5648,10 +5913,11 @@ manageRelay() {
         1) setupRelay ;;
         2) showRelayConfig ;;
         3) updateRelaySubscription ;;
-        4) removeRelayProfile ;;
-        5) removeRelay ;;
+        4) removeRelaySelector ;;
+        5) removeRelayProfile ;;
+        6) removeRelay ;;
         0) return ;;
-        *) echoContent red " ---> 请输入 0-5" ;;
+        *) echoContent red " ---> 请输入 0-6" ;;
         esac
         read -r -p "按回车键继续..."
     done
@@ -7197,7 +7463,7 @@ manageHysteria2() {
 menu() {
     cd "$HOME" || exit
     echoContent red "\n=============================================================="
-    echoContent green "当前版本：v2026.07.29.1785314311"
+    echoContent green "当前版本：v2026.07.29.1785316030"
     echoContent green "描述：Xray 一键安装管理脚本\c"
     showInstallStatus
     checkWgetShowProgress
