@@ -74,15 +74,18 @@ chmod +x xray-install.sh
 The script is intended for Debian/Ubuntu VPS environments and performs
 privileged system, firewall, Nginx and systemd changes. Review it before use.
 
-The relay manager supports multiple independent inbound-to-upstream profiles.
-Each local inbound tag can be assigned to one manual upstream or to a
-Shadowsocks node imported from a sing-box JSON subscription, with separate TCP
-and UDP routing choices. When exactly one VLESS inbound is selected, a profile
-can be limited to specific client UUIDs; Xray matches their configured email
-values, while unselected UUIDs keep the existing route. Subscription profiles share a daily refresh job;
+The relay manager separates reusable upstream profiles from their inbound
+selectors. One manual upstream or Shadowsocks node imported from a sing-box
+JSON subscription can serve multiple independent inbound/account selectors,
+without entering its credentials again. When exactly one VLESS inbound is
+selected, a selector can be limited to specific client UUIDs; Xray matches
+their configured email values, while unselected UUIDs keep the fallback route.
+Subscription profiles share a daily refresh job;
 changed credentials are validated before Xray is restarted, while failed
-refreshes keep the last working outbound. Existing single-profile relay state
-is migrated automatically.
+refreshes keep the last working outbound. Existing relay state is migrated
+automatically. Account-scoped relay rules take priority over a whole-inbound
+rule, so a Vision UUID can use another existing upstream while the whole Vision
+inbound rule remains as a fallback for every other UUID.
 
 Account creation accepts a stable, human-readable tag such as `jp_vision` or
 `vision_jp_us`. Protocol-specific suffixes are added internally so Xray routing
