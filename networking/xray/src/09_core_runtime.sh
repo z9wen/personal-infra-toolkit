@@ -662,7 +662,7 @@ handleXray() {
         else
             echoContent red "Xray启动失败"
             echoContent red "请手动执行以下的命令后【/opt/xray-agent/xray/xray -confdir /opt/xray-agent/xray/conf】将错误日志进行反馈"
-            exit 0
+            return 1
         fi
     elif [[ "$1" == "stop" ]]; then
         if [[ -z $(pgrep -f "xray/xray") ]]; then
@@ -670,9 +670,41 @@ handleXray() {
         else
             echoContent red "xray关闭失败"
             echoContent red "请手动执行【ps -ef|grep -v grep|grep xray|awk '{print \$2}'|xargs kill -9】"
-            exit 0
+            return 1
         fi
     fi
+}
+
+xraySystemdServiceAvailable() {
+    command -v systemctl >/dev/null 2>&1 && [[ -f /etc/systemd/system/xray.service ]]
+}
+
+# 使用 systemd 原子重启 Xray，避免 stop 成功后脚本在 start 前退出。
+restartXray() {
+    local attempt
+    if xraySystemdServiceAvailable; then
+        if ! systemctl restart xray.service; then
+            echoContent yellow " ---> Xray 重启失败，正在尝试重新启动"
+            systemctl start xray.service || {
+                echoContent red " ---> Xray 服务无法启动"
+                return 1
+            }
+        fi
+
+        for attempt in {1..5}; do
+            sleep 0.4
+            if systemctl is-active --quiet xray.service && pgrep -f "xray/xray" >/dev/null; then
+                echoContent green " ---> Xray重启成功"
+                return 0
+            fi
+        done
+        echoContent red " ---> Xray重启后未保持运行"
+        echoContent yellow " ---> 请执行【journalctl -u xray.service -n 50 --no-pager】查看错误"
+        return 1
+    fi
+
+    handleXray stop || return 1
+    handleXray start
 }
 
 # 读取Xray用户数据并初始化

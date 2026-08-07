@@ -409,8 +409,7 @@ activateRelayProfile() {
     removeOrphanedRelayFiles "${backupDir}/relay_config.json"
     rm -rf "${backupDir}"
     refreshRelaySubscriptionCron
-    handleXray stop
-    handleXray start
+    restartXray || return 1
 }
 
 attachRelaySelector() {
@@ -448,8 +447,7 @@ attachRelaySelectors() {
     removeOrphanedRelayFiles "${backupDir}/relay_config.json"
     rm -rf "${backupDir}"
     refreshRelaySubscriptionCron
-    handleXray stop
-    handleXray start
+    restartXray || return 1
     echoContent green " ---> $(jq 'length' <<<"${selectors}") 个入口规则已绑定到现有上游: ${profileName}"
 }
 
@@ -857,8 +855,7 @@ updateRelaySubscription() {
         updateRelaySubscriptionProfile "${profileId}" || updateFailed=true
     done < <(jq -r '.profiles[]? | select(.source == "subscription").id' "${relayStateFile}")
     if [[ "${relaySubscriptionChanged}" == "true" ]]; then
-        handleXray stop
-        handleXray start
+        restartXray || updateFailed=true
     fi
     [[ "${updateFailed}" == "false" ]]
 }
@@ -920,8 +917,7 @@ removeRelaySelector() {
     removeOrphanedRelayFiles "${backupDir}/relay_config.json"
     rm -rf "${backupDir}"
     refreshRelaySubscriptionCron
-    handleXray stop
-    handleXray start
+    restartXray || return 1
     echoContent green " ---> 入口规则已删除"
 }
 
@@ -956,8 +952,7 @@ removeRelayProfile() {
     fi
     rm -rf "${backupDir}"
     refreshRelaySubscriptionCron
-    handleXray stop
-    handleXray start
+    restartXray || return 1
     echoContent green " ---> 中转上游已删除"
 }
 
@@ -971,8 +966,7 @@ removeRelay() {
     rebuildRelayRouting
     rm -f /opt/xray-agent/relay_config
     removeCronRelaySubscription
-    handleXray stop
-    handleXray start
+    restartXray || return 1
     echoContent green " ---> 所有中转规则已停用，相关入站恢复原有分流"
 }
 
