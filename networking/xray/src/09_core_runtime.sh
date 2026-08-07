@@ -431,18 +431,19 @@ xrayVersionAtLeast() {
 # 安装xray
 installXray() {
     readInstallType
-    local prereleaseStatus=false
-    if [[ "$2" == "true" ]]; then
-        prereleaseStatus=true
-    fi
 
     echoContent skyBlue "\n进度  $1/${totalProgress} : 安装Xray"
 
     if [[ ! -f "/opt/xray-agent/xray/xray" ]]; then
 
-        version=$(curl -fsSL --retry 3 "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=5" | jq -r ".[]|select (.prerelease==${prereleaseStatus})|.tag_name" | head -1)
+        # 首次安装始终使用 GitHub 标记的最新正式版；预览版由安装后的版本管理功能手动切换。
+        version=$(curl -fsSL --retry 3 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | jq -r '.tag_name // empty')
+        if [[ -z "${version}" ]]; then
+            echoContent red " ---> 无法获取 Xray-core 最新正式版版本号"
+            return 1
+        fi
         echoContent green " ---> Xray-core版本:${version}"
-        if [[ -z "${version}" ]] || ! downloadXrayArchive "${version}"; then
+        if ! downloadXrayArchive "${version}"; then
             echoContent red " ---> Xray-core 下载或校验失败"
             return 1
         fi
@@ -675,4 +676,3 @@ handleXray() {
 }
 
 # 读取Xray用户数据并初始化
-
