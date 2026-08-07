@@ -77,9 +77,11 @@ privileged system, firewall, Nginx and systemd changes. Review it before use.
 The relay manager separates reusable upstream profiles from their inbound
 selectors. One manual upstream or Shadowsocks node imported from a sing-box
 JSON subscription can serve multiple independent inbound/account selectors,
-without entering its credentials again. When exactly one VLESS inbound is
-selected, a selector can be limited to specific client UUIDs; Xray matches
-their configured email values, while unselected UUIDs keep the fallback route.
+without entering its credentials again. Every installed inbound is presented
+as both a whole-inbound target and individual UUID/auth targets. Multiple exact
+targets can be selected together, for example one Vision UUID plus one
+Hysteria2 auth, while unselected accounts keep the fallback route. Xray matches
+their configured email values.
 Subscription profiles share a daily refresh job;
 changed credentials are validated before Xray is restarted, while failed
 refreshes keep the last working outbound. Existing relay state is migrated

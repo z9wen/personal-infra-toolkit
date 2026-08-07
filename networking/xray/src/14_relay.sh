@@ -10,113 +10,81 @@ detectRelayInbounds() {
     [[ -f "${configPath}05_hysteria2_inbounds.json" ]] && relayInboundTags+=("Hysteria2") && relayInboundLabels+=("Hysteria2 + TLS + QUIC")
 }
 
-# 选择需要走中转的本机入站，结果保存为 JSON 数组。
-selectRelayInbounds() {
+# 生成可选的“入站 + 账号”目标。每个入站都可选整体，也可精确到有 email 的 UUID/auth。
+buildRelayTargetChoices() {
     detectRelayInbounds
-    relaySelectedUsers='[]'
+    relayTargetChoices='[]'
     if ((${#relayInboundTags[@]} == 0)); then
         echoContent red " ---> 未检测到可用的入站协议"
         return 1
     fi
 
-    echoContent skyBlue "\n本机已安装的入站协议"
-    local index
+    local index inboundTag inboundLabel inboundConfig clients
     for ((index = 0; index < ${#relayInboundTags[@]}; index++)); do
-        echoContent yellow "$((index + 1)).${relayInboundLabels[index]}"
+        inboundTag=${relayInboundTags[index]}
+        inboundLabel=${relayInboundLabels[index]}
+        case "${inboundTag}" in
+        VLESSTCP) inboundConfig="${configPath}02_VLESS_TCP_inbounds.json" ;;
+        VLESSWS) inboundConfig="${configPath}03_VLESS_WS_inbounds.json" ;;
+        VLESSReality) inboundConfig="${configPath}07_VLESS_vision_reality_inbounds.json" ;;
+        Hysteria2) inboundConfig="${configPath}05_hysteria2_inbounds.json" ;;
+        *) continue ;;
+        esac
+        relayTargetChoices=$(jq -c --arg tag "${inboundTag}" --arg label "${inboundLabel}" '
+            . + [{selector:{inboundTags:[$tag],users:[]},label:($label + " / 整个入站（全部 UUID/auth）")}]
+        ' <<<"${relayTargetChoices}")
+        clients=$(jq -c '
+            (.inbounds[0].settings.clients // .inbounds[0].settings.users // .inbounds[0].users // [])
+            | map(select((.email // "") != ""))
+        ' "${inboundConfig}") || return 1
+        relayTargetChoices=$(jq -c --arg tag "${inboundTag}" --arg label "${inboundLabel}" --argjson clients "${clients}" '
+            reduce $clients[] as $client (.;
+                ($client.email | sub("-(VLESS_TCP/TLS_Vision|VLESS_WS|vless_reality_vision|Hysteria2)$"; "")) as $accountTag |
+                ($client.id // $client.uuid // $client.auth // $client.password // "unknown") as $credential |
+                . + [{selector:{inboundTags:[$tag],users:[$client.email]},
+                    label:($label + " / tag: " + $accountTag + " / UUID/auth: " + $credential)}]
+            )
+        ' <<<"${relayTargetChoices}")
     done
-
-    local selection
-    read -r -p "请选择需要链式转发的入站[可多选，例:1,4]:" selection
-    selection=${selection//，/,}
-    if [[ -z "${selection}" ]]; then
-        echoContent red " ---> 至少选择一个入站"
-        return 1
-    fi
-
-    local -a selectedTags=()
-    local -a choices=()
-    local choice tag existing
-    IFS=',' read -r -a choices <<<"${selection}"
-    for choice in "${choices[@]}"; do
-        choice=${choice//[[:space:]]/}
-        if [[ ! "${choice}" =~ ^[0-9]+$ ]] || ((choice < 1 || choice > ${#relayInboundTags[@]})); then
-            echoContent red " ---> 入站选项无效: ${choice}"
-            return 1
-        fi
-        tag=${relayInboundTags[choice - 1]}
-        existing=false
-        local selected
-        for selected in "${selectedTags[@]}"; do
-            [[ "${selected}" == "${tag}" ]] && existing=true
-        done
-        [[ "${existing}" == "false" ]] && selectedTags+=("${tag}")
-    done
-
-    relaySelectedInboundTags=$(printf '%s\n' "${selectedTags[@]}" | jq -R . | jq -sc .)
 }
 
-# 单独选择一个 VLESS 入站时，允许只把指定账号送往上游。
-# Xray 路由按 client email 识别来源账号；不同 UUID 必须使用不同 email。
-selectRelayUsers() {
-    relaySelectedUsers='[]'
-    local inboundCount inboundTag inboundConfig clients userCount scope selection
-    inboundCount=$(jq 'length' <<<"${relaySelectedInboundTags}")
-    ((inboundCount == 1)) || return 0
+# 一次可选多个精确目标，例如某个 Vision UUID 加上 Hysteria2 auth。
+selectRelayTargets() {
+    buildRelayTargetChoices || return 1
+    local targetCount selection
+    targetCount=$(jq 'length' <<<"${relayTargetChoices}")
+    ((targetCount > 0)) || return 1
+    echoContent skyBlue "\n请选择需要链式转发的精确目标"
+    jq -r 'to_entries[] | "\(.key + 1).\(.value.label)"' <<<"${relayTargetChoices}"
 
-    inboundTag=$(jq -r '.[0]' <<<"${relaySelectedInboundTags}")
-    case "${inboundTag}" in
-    VLESSTCP) inboundConfig="${configPath}02_VLESS_TCP_inbounds.json" ;;
-    VLESSWS) inboundConfig="${configPath}03_VLESS_WS_inbounds.json" ;;
-    VLESSReality) inboundConfig="${configPath}07_VLESS_vision_reality_inbounds.json" ;;
-    *) return 0 ;;
-    esac
-    [[ -f "${inboundConfig}" ]] || return 0
-
-    clients=$(jq -c '
-        (.inbounds[0].settings.clients // .inbounds[0].users // [])
-        | map(select((.email // "") != ""))
-    ' "${inboundConfig}") || return 1
-    userCount=$(jq 'length' <<<"${clients}")
-    ((userCount > 0)) || return 0
-
-    echoContent skyBlue "\n请选择此入站的中转范围"
-    echoContent yellow "1.整个入站（全部 UUID）"
-    echoContent yellow "2.指定账号（未选 UUID 保持原有路线）"
-    read -r -p "请选择[1]:" scope
-    scope=${scope:-1}
-    [[ "${scope}" == "1" ]] && return 0
-    if [[ "${scope}" != "2" ]]; then
-        echoContent red " ---> 请输入 1-2"
-        return 1
-    fi
-
-    echoContent skyBlue "\n可选择的账号"
-    jq -r 'to_entries[] |
-        (.value.email | sub("-(VLESS_TCP/TLS_Vision|VLESS_WS|vless_reality_vision|Hysteria2)$"; "")) as $tag |
-        "\(.key + 1).\($tag) [UUID: \(.value.id // .value.uuid)]"
-    ' <<<"${clients}"
-    read -r -p "请选择需要链式转发的账号[可多选，例:1,3]:" selection
+    read -r -p "请选择[可多选，例:3,6]:" selection
     selection=${selection//，/,}
     if [[ -z "${selection}" ]]; then
-        echoContent red " ---> 至少选择一个账号"
+        echoContent red " ---> 至少选择一个目标"
         return 1
     fi
 
+    relaySelectedSelectors='[]'
     local -a choices=()
-    local choice email
+    local choice selector
     IFS=',' read -r -a choices <<<"${selection}"
     for choice in "${choices[@]}"; do
         choice=${choice//[[:space:]]/}
-        if [[ ! "${choice}" =~ ^[0-9]+$ ]] || ((choice < 1 || choice > userCount)); then
-            echoContent red " ---> 账号选项无效: ${choice}"
+        if [[ ! "${choice}" =~ ^[0-9]+$ ]] || ((choice < 1 || choice > targetCount)); then
+            echoContent red " ---> 目标选项无效: ${choice}"
             return 1
         fi
-        email=$(jq -r --argjson index "$((choice - 1))" '.[$index].email' <<<"${clients}")
-        relaySelectedUsers=$(jq -c --arg email "${email}" '
-            if index($email) == null then . + [$email] else . end
-        ' <<<"${relaySelectedUsers}")
+        selector=$(jq -c --argjson index "$((choice - 1))" '.[$index].selector' <<<"${relayTargetChoices}")
+        relaySelectedSelectors=$(jq -c --argjson selector "${selector}" '
+            ($selector.inboundTags[0]) as $tag |
+            if (($selector.users | length) == 0) then
+                [ .[] | select(.inboundTags[0] != $tag) ] + [$selector]
+            elif any(.[]; .inboundTags[0] == $tag and ((.users // []) | length) == 0) then .
+            elif index($selector) == null then . + [$selector]
+            else . end
+        ' <<<"${relaySelectedSelectors}")
     done
-    echoContent green " ---> 仅所选账号通过此中转，其他 UUID 保持原有路线"
+    echoContent green " ---> 已选择 $(jq 'length' <<<"${relaySelectedSelectors}") 个独立入口规则"
 }
 
 validateRelayPort() {
@@ -340,6 +308,35 @@ buildRelayStateWithSelector() {
     ' "${relayStateFile}"
 }
 
+# 将多个独立 selector 在一次状态更新中绑定到同一上游。
+buildRelayStateWithSelectors() {
+    local destinationId=$1 selectors=$2 newProfile=${3:-null}
+    jq --arg destinationId "${destinationId}" --argjson selectors "${selectors}" --argjson newProfile "${newProfile}" '
+        def tagOverlap($left; $right):
+            any($left[]?; . as $used | $right | index($used) != null);
+        def subtractSelector($current; $selected):
+            if (($selected.users // []) | length) == 0 then
+                $current |
+                .inboundTags -= $selected.inboundTags |
+                select((.inboundTags | length) > 0)
+            elif ((($current.users // []) | length) > 0 and tagOverlap($current.inboundTags; $selected.inboundTags)) then
+                $current |
+                .users -= $selected.users |
+                select((.users | length) > 0)
+            else $current end;
+        (if $newProfile == null then . else .profiles += [$newProfile] end) |
+        reduce $selectors[] as $selector (.;
+            .profiles |= map(
+                .selectors = (
+                    [.selectors[]? | subtractSelector(.; $selector)] +
+                    (if .id == $destinationId then [$selector] else [] end)
+                )
+            )
+        ) |
+        .profiles |= map(select((.selectors | length) > 0))
+    ' "${relayStateFile}"
+}
+
 removeOrphanedRelayFiles() {
     local previousStateFile=$1 orphanedFile
     while read -r orphanedFile; do
@@ -361,10 +358,10 @@ refreshRelaySubscriptionCron() {
 
 activateRelayProfile() {
     local profile=$1 generatedOutbound=$2
-    local outboundFile profileId selector emptyProfile backupDir validationOutput newState
+    local outboundFile profileId selectors emptyProfile backupDir validationOutput newState
     outboundFile=$(jq -r '.outboundFile' <<<"${profile}")
     profileId=$(jq -r '.id' <<<"${profile}")
-    selector=$(jq -c '.selectors[0]' <<<"${profile}")
+    selectors=$(jq -c '.selectors' <<<"${profile}")
     emptyProfile=$(jq -c '.selectors = []' <<<"${profile}")
     relayProfileFileIsSafe "${outboundFile}" || return 1
     ensureRelayStateV2 || return 1
@@ -378,7 +375,7 @@ activateRelayProfile() {
         return 1
     }
     chmod 600 "${configPath}${outboundFile}"
-    newState=$(buildRelayStateWithSelector "${profileId}" "${selector}" "${emptyProfile}") || {
+    newState=$(buildRelayStateWithSelectors "${profileId}" "${selectors}" "${emptyProfile}") || {
         if [[ -f "${backupDir}/${outboundFile}" ]]; then
             cp "${backupDir}/${outboundFile}" "${configPath}${outboundFile}"
         else
@@ -418,16 +415,21 @@ activateRelayProfile() {
 
 attachRelaySelector() {
     local destinationId=$1 selector=$2
+    attachRelaySelectors "${destinationId}" "[$selector]"
+}
+
+# 一次附加多个入口规则，只校验和重启 Xray 一次。
+attachRelaySelectors() {
+    local destinationId=$1 selectors=$2
     local backupDir newState validationOutput profileName
     ensureRelayStateV2 || return 1
     profileName=$(jq -r --arg id "${destinationId}" 'first(.profiles[] | select(.id == $id)).name // empty' "${relayStateFile}")
-    [[ -n "${profileName}" ]] || return 1
-    [[ -f "${configPath}09_routing.json" ]] || return 1
+    [[ -n "${profileName}" && -f "${configPath}09_routing.json" ]] || return 1
     backupDir=$(mktemp -d /tmp/xray-relay-attach.XXXXXX) || return 1
     cp "${relayStateFile}" "${backupDir}/relay_config.json"
     cp "${configPath}09_routing.json" "${backupDir}/09_routing.json"
 
-    newState=$(buildRelayStateWithSelector "${destinationId}" "${selector}") || {
+    newState=$(buildRelayStateWithSelectors "${destinationId}" "${selectors}") || {
         rm -rf "${backupDir}"
         return 1
     }
@@ -448,7 +450,7 @@ attachRelaySelector() {
     refreshRelaySubscriptionCron
     handleXray stop
     handleXray start
-    echoContent green " ---> 入口规则已绑定到现有上游: ${profileName}"
+    echoContent green " ---> $(jq 'length' <<<"${selectors}") 个入口规则已绑定到现有上游: ${profileName}"
 }
 
 selectRelayUdpMode() {
@@ -496,10 +498,10 @@ setupRelaySubscription() {
     nodeAddress=$(jq -r --arg tag "${selectedTag}" 'first(.outbounds[] | select(.type == "shadowsocks" and .tag == $tag)).server' "${subscriptionFile}")
     nodePort=$(jq -r --arg tag "${selectedTag}" 'first(.outbounds[] | select(.type == "shadowsocks" and .tag == $tag)).server_port' "${subscriptionFile}")
     nodeMethod=$(jq -r --arg tag "${selectedTag}" 'first(.outbounds[] | select(.type == "shadowsocks" and .tag == $tag)).method' "${subscriptionFile}")
-    profile=$(jq -n --arg id "${profileId}" --arg name "${profileName}" --argjson selector "${relaySelectedSelector}" \
+    profile=$(jq -n --arg id "${profileId}" --arg name "${profileName}" --argjson selectors "${relaySelectedSelectors}" \
         --arg outboundTag "${outboundTag}" --arg outboundFile "${outboundFile}" --arg url "${subscriptionUrl}" --arg selectedTag "${selectedTag}" \
         --arg address "${nodeAddress}" --arg port "${nodePort}" --arg method "${nodeMethod}" --arg udpMode "${relaySelectedUdpMode}" '
-        {id:$id,name:$name,source:"subscription",selectors:[$selector],outboundTag:$outboundTag,outboundFile:$outboundFile,
+        {id:$id,name:$name,source:"subscription",selectors:$selectors,outboundTag:$outboundTag,outboundFile:$outboundFile,
          subscription:{format:"sing-box-json",url:$url,selectedTag:$selectedTag},
          tcp:{mode:"relay",protocol:"shadowsocks",label:("Shadowsocks ("+$method+")"),address:$address,port:$port,bbrProfile:""},
          udp:(if $udpMode == "shared" then {mode:"shared",protocol:"shadowsocks",label:("Shadowsocks ("+$method+")"),address:$address,port:$port,bbrProfile:""} else {mode:"direct",protocol:"",label:"直连",address:"",port:"",bbrProfile:""} end)}')
@@ -682,11 +684,11 @@ setupRelayManual() {
         rm -rf "${tempDir}"
         return 1
     }
-    profile=$(jq -n --arg id "${profileId}" --arg name "${profileName}" --argjson selector "${relaySelectedSelector}" \
+    profile=$(jq -n --arg id "${profileId}" --arg name "${profileName}" --argjson selectors "${relaySelectedSelectors}" \
         --arg outboundTag "${outboundTag}" --arg outboundFile "${outboundFile}" --arg protocol "${relayBuiltProtocol}" \
         --arg label "${relayBuiltLabel}" --arg address "${relayBuiltAddress}" --arg port "${relayBuiltPort}" \
         --arg bbrProfile "${relayBuiltBbrProfile}" --arg udpMode "${relaySelectedUdpMode}" '
-        {id:$id,name:$name,source:"manual",selectors:[$selector],outboundTag:$outboundTag,outboundFile:$outboundFile,
+        {id:$id,name:$name,source:"manual",selectors:$selectors,outboundTag:$outboundTag,outboundFile:$outboundFile,
          tcp:{mode:"relay",protocol:$protocol,label:$label,address:$address,port:$port,bbrProfile:$bbrProfile},
          udp:(if $udpMode == "shared" then {mode:"shared",protocol:$protocol,label:$label,address:$address,port:$port,bbrProfile:$bbrProfile} else {mode:"direct",protocol:"",label:"直连",address:"",port:"",bbrProfile:""} end)}')
     activateRelayProfile "${profile}" "${generatedOutbound}" || {
@@ -725,17 +727,20 @@ selectRelayDestination() {
 setupRelay() {
     echoContent skyBlue "\n新增入口规则"
     echoContent yellow "# 一个上游可绑定多个入口；指定账号优先于“全部 UUID”兜底规则\n"
-    selectRelayInbounds || return
-    selectRelayUsers || return
-    relaySelectedSelector=$(jq -nc --argjson inboundTags "${relaySelectedInboundTags}" --argjson users "${relaySelectedUsers}" \
-        '{inboundTags:$inboundTags,users:$users}')
+    selectRelayTargets || return
     selectRelayDestination || return
     if [[ "${relayUseExistingProfile}" == "true" ]]; then
-        relayTargetsAvailable "${relaySelectedSelector}" "${relaySelectedDestinationId}" || return
-        attachRelaySelector "${relaySelectedDestinationId}" "${relaySelectedSelector}"
+        local selector
+        while read -r selector; do
+            relayTargetsAvailable "${selector}" "${relaySelectedDestinationId}" || return
+        done < <(jq -c '.[]' <<<"${relaySelectedSelectors}")
+        attachRelaySelectors "${relaySelectedDestinationId}" "${relaySelectedSelectors}"
         return
     fi
-    relayTargetsAvailable "${relaySelectedSelector}" || return
+    local selector
+    while read -r selector; do
+        relayTargetsAvailable "${selector}" || return
+    done < <(jq -c '.[]' <<<"${relaySelectedSelectors}")
 
     echoContent skyBlue "\n请选择上游配置来源"
     echoContent yellow "1.sing-box JSON 订阅中的 Shadowsocks 节点"
