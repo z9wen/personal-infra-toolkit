@@ -92,36 +92,118 @@ validateRelayPort() {
     [[ "${value}" =~ ^[0-9]+$ ]] && ((value >= 1 && value <= 65535))
 }
 
-# 从 sing-box JSON 订阅中读取 Shadowsocks 出站并转换为 Xray 配置。
+# 返回 sing-box JSON 订阅中可转换为 Xray 出站的节点。
+# Reality 暂只接受未配置额外 transport 的 VLESS + Reality（RAW/TCP）。
+getRelayNodesFromSingBoxSubscription() {
+    local subscriptionFile=$1
+    jq -c '[
+        .outbounds[]? |
+        select((.tag | type) == "string" and (.tag | length) > 0) |
+        if .type == "shadowsocks" then
+            . + {_relayType:"shadowsocks"}
+        elif (
+            .type == "vless" and
+            .tls.enabled == true and
+            .tls.reality.enabled == true and
+            (((.transport // {}) | type) == "object") and
+            (((.transport // {}) | length) == 0)
+        ) then
+            . + {_relayType:"vless-reality"}
+        else empty end
+    ]' "${subscriptionFile}"
+}
+
+# 从 sing-box JSON 订阅中读取 Shadowsocks 或 VLESS Reality 出站并转换为 Xray 配置。
 buildRelayOutboundFromSingBoxSubscription() {
     local subscriptionFile=$1 selectedTag=$2 outboundTag=$3 outputFile=$4
-    local node
-    node=$(jq -c --arg tag "${selectedTag}" '
-        first(.outbounds[]? | select(.type == "shadowsocks" and .tag == $tag))
-    ' "${subscriptionFile}") || return 1
+    local supportedNodes node nodeType
+    supportedNodes=$(getRelayNodesFromSingBoxSubscription "${subscriptionFile}") || return 1
+    node=$(jq -c --arg tag "${selectedTag}" 'first(.[] | select(.tag == $tag))' <<<"${supportedNodes}") || return 1
     [[ -n "${node}" && "${node}" != "null" ]] || return 1
+    nodeType=$(jq -r '._relayType' <<<"${node}")
 
     if ! jq -e '
         (.server | type == "string" and length > 0) and
-        (.server_port | type == "number" and . >= 1 and . <= 65535) and
-        (.method | type == "string" and length > 0) and
-        (.password | type == "string" and length > 0)
+        (.server_port | type == "number" and . >= 1 and . <= 65535)
     ' <<<"${node}" >/dev/null; then
         return 1
     fi
 
-    jq -n --arg tag "${outboundTag}" --argjson node "${node}" '
-        {outbounds:[{
-            tag:$tag,
-            protocol:"shadowsocks",
-            settings:{
-                address:$node.server,
-                port:$node.server_port,
-                method:$node.method,
-                password:$node.password
-            }
-        }]}
-    ' >"${outputFile}"
+    case ${nodeType} in
+    shadowsocks)
+        if ! jq -e '
+            (.method | type == "string" and length > 0) and
+            (.password | type == "string" and length > 0)
+        ' <<<"${node}" >/dev/null; then
+            return 1
+        fi
+        jq -n --arg tag "${outboundTag}" --argjson node "${node}" '
+            {outbounds:[{
+                tag:$tag,
+                protocol:"shadowsocks",
+                settings:{
+                    address:$node.server,
+                    port:$node.server_port,
+                    method:$node.method,
+                    password:$node.password
+                }
+            }]}
+        ' >"${outputFile}" || return 1
+        relayBuiltProtocol="shadowsocks"
+        relayBuiltLabel="Shadowsocks ($(jq -r '.method' <<<"${node}"))"
+        ;;
+    vless-reality)
+        if ! jq -e '
+            (.uuid | type == "string" and length > 0) and
+            ((.flow // "") | type == "string" and
+                (. == "" or . == "xtls-rprx-vision" or . == "xtls-rprx-vision-udp443")) and
+            (.tls.server_name | type == "string" and length > 0) and
+            (.tls.reality.public_key | type == "string" and length > 0) and
+            ((.tls.reality.short_id // "") | type == "string" and test("^([0-9A-Fa-f]{2}){0,8}$")) and
+            ((.tls.utls.fingerprint // "chrome") | type == "string" and length > 0)
+        ' <<<"${node}" >/dev/null; then
+            return 1
+        fi
+        jq -n --arg tag "${outboundTag}" --argjson node "${node}" '
+            {outbounds:[{
+                tag:$tag,
+                protocol:"vless",
+                settings:{vnext:[{
+                    address:$node.server,
+                    port:$node.server_port,
+                    users:[({id:$node.uuid,encryption:"none"} +
+                        if (($node.flow // "") | length) > 0 then {flow:$node.flow} else {} end)]
+                }]},
+                streamSettings:{
+                    network:"tcp",
+                    security:"reality",
+                    realitySettings:({
+                        show:false,
+                        serverName:$node.tls.server_name,
+                        fingerprint:($node.tls.utls.fingerprint // "chrome"),
+                        password:$node.tls.reality.public_key,
+                        shortId:($node.tls.reality.short_id // ""),
+                        spiderX:"/"
+                    } + if (($node.tls.reality.mldsa65_verify // "") | length) > 0 then
+                        {mldsa65Verify:$node.tls.reality.mldsa65_verify}
+                    else {} end)
+                }
+            }]}
+        ' >"${outputFile}" || return 1
+        relayBuiltProtocol="reality"
+        if [[ -n $(jq -r '.flow // empty' <<<"${node}") ]]; then
+            relayBuiltLabel="VLESS + Reality + Vision"
+        else
+            relayBuiltLabel="VLESS + Reality"
+        fi
+        ;;
+    *) return 1 ;;
+    esac
+
+    relayBuiltSubscriptionType=${nodeType}
+    relayBuiltAddress=$(jq -r '.server' <<<"${node}")
+    relayBuiltPort=$(jq -r '.server_port' <<<"${node}")
+    relayBuiltBbrProfile=
 }
 
 fetchRelaySubscription() {
@@ -458,11 +540,11 @@ selectRelayUdpMode() {
     [[ "${udpRelayStatus}" =~ ^[Yy]$ ]] && relaySelectedUdpMode=shared
 }
 
-# 使用 sing-box JSON 订阅新增 Shadowsocks 中转规则。
+# 使用 sing-box JSON 订阅新增 Shadowsocks 或 VLESS Reality 中转规则。
 setupRelaySubscription() {
     local profileName=$1 profileId=$2 outboundTag="relay_profile_${profileId}" outboundFile="relay_${profileId}_outbound.json"
     selectRelayUdpMode
-    local subscriptionUrl tempDir subscriptionFile nodeCount nodeIndex selectedTag generatedOutbound
+    local subscriptionUrl tempDir subscriptionFile supportedNodes nodeCount nodeIndex selectedTag generatedOutbound
     read -r -p "请输入 sing-box JSON 订阅地址:" subscriptionUrl
     [[ -z "${subscriptionUrl}" ]] && echoContent red " ---> 订阅地址不能为空" && return 1
     tempDir=$(mktemp -d /tmp/xray-relay-subscription.XXXXXX) || return 1
@@ -472,43 +554,50 @@ setupRelaySubscription() {
         rm -rf "${tempDir}"
         return 1
     }
-    nodeCount=$(jq '[.outbounds[]? | select(.type == "shadowsocks")] | length' "${subscriptionFile}")
+    supportedNodes=$(getRelayNodesFromSingBoxSubscription "${subscriptionFile}") || {
+        rm -rf "${tempDir}"
+        return 1
+    }
+    nodeCount=$(jq 'length' <<<"${supportedNodes}")
     if ((nodeCount == 0)); then
-        echoContent red " ---> 订阅中没有 Shadowsocks 节点"
+        echoContent red " ---> 订阅中没有可用的 Shadowsocks 或 VLESS Reality 节点"
         rm -rf "${tempDir}"
         return 1
     elif ((nodeCount == 1)); then
-        selectedTag=$(jq -r 'first(.outbounds[] | select(.type == "shadowsocks")).tag' "${subscriptionFile}")
+        selectedTag=$(jq -r '.[0].tag' <<<"${supportedNodes}")
     else
-        jq -r '[.outbounds[] | select(.type == "shadowsocks")] | to_entries[] | "\(.key + 1).\(.value.tag) -> \(.value.server):\(.value.server_port)"' "${subscriptionFile}"
+        jq -r 'to_entries[] |
+            "\(.key + 1).\(.value.tag) [" +
+            (if .value._relayType == "vless-reality" then "VLESS Reality" else "Shadowsocks" end) +
+            "] -> \(.value.server):\(.value.server_port)"
+        ' <<<"${supportedNodes}"
         read -r -p "请选择上游节点:" nodeIndex
         if [[ ! "${nodeIndex}" =~ ^[0-9]+$ ]] || ((nodeIndex < 1 || nodeIndex > nodeCount)); then
             rm -rf "${tempDir}"
             return 1
         fi
-        selectedTag=$(jq -r --argjson index "$((nodeIndex - 1))" '[.outbounds[] | select(.type == "shadowsocks")][$index].tag' "${subscriptionFile}")
+        selectedTag=$(jq -r --argjson index "$((nodeIndex - 1))" '.[$index].tag' <<<"${supportedNodes}")
     fi
     buildRelayOutboundFromSingBoxSubscription "${subscriptionFile}" "${selectedTag}" "${outboundTag}" "${generatedOutbound}" || {
+        echoContent red " ---> 节点参数不完整或无法转换为 Xray 出站"
         rm -rf "${tempDir}"
         return 1
     }
-    local nodeAddress nodePort nodeMethod profile
-    nodeAddress=$(jq -r --arg tag "${selectedTag}" 'first(.outbounds[] | select(.type == "shadowsocks" and .tag == $tag)).server' "${subscriptionFile}")
-    nodePort=$(jq -r --arg tag "${selectedTag}" 'first(.outbounds[] | select(.type == "shadowsocks" and .tag == $tag)).server_port' "${subscriptionFile}")
-    nodeMethod=$(jq -r --arg tag "${selectedTag}" 'first(.outbounds[] | select(.type == "shadowsocks" and .tag == $tag)).method' "${subscriptionFile}")
+    local profile
     profile=$(jq -n --arg id "${profileId}" --arg name "${profileName}" --argjson selectors "${relaySelectedSelectors}" \
         --arg outboundTag "${outboundTag}" --arg outboundFile "${outboundFile}" --arg url "${subscriptionUrl}" --arg selectedTag "${selectedTag}" \
-        --arg address "${nodeAddress}" --arg port "${nodePort}" --arg method "${nodeMethod}" --arg udpMode "${relaySelectedUdpMode}" '
+        --arg nodeType "${relayBuiltSubscriptionType}" --arg protocol "${relayBuiltProtocol}" --arg label "${relayBuiltLabel}" \
+        --arg address "${relayBuiltAddress}" --arg port "${relayBuiltPort}" --arg udpMode "${relaySelectedUdpMode}" '
         {id:$id,name:$name,source:"subscription",selectors:$selectors,outboundTag:$outboundTag,outboundFile:$outboundFile,
-         subscription:{format:"sing-box-json",url:$url,selectedTag:$selectedTag},
-         tcp:{mode:"relay",protocol:"shadowsocks",label:("Shadowsocks ("+$method+")"),address:$address,port:$port,bbrProfile:""},
-         udp:(if $udpMode == "shared" then {mode:"shared",protocol:"shadowsocks",label:("Shadowsocks ("+$method+")"),address:$address,port:$port,bbrProfile:""} else {mode:"direct",protocol:"",label:"直连",address:"",port:"",bbrProfile:""} end)}')
+         subscription:{format:"sing-box-json",url:$url,selectedTag:$selectedTag,nodeType:$nodeType},
+         tcp:{mode:"relay",protocol:$protocol,label:$label,address:$address,port:$port,bbrProfile:""},
+         udp:(if $udpMode == "shared" then {mode:"shared",protocol:$protocol,label:$label,address:$address,port:$port,bbrProfile:""} else {mode:"direct",protocol:"",label:"直连",address:"",port:"",bbrProfile:""} end)}')
     activateRelayProfile "${profile}" "${generatedOutbound}" || {
         rm -rf "${tempDir}"
         return 1
     }
     rm -rf "${tempDir}"
-    echoContent green " ---> 中转规则 ${profileName} 已启用: ${selectedTag} -> ${nodeAddress}:${nodePort}"
+    echoContent green " ---> 中转规则 ${profileName} 已启用: ${selectedTag} -> ${relayBuiltAddress}:${relayBuiltPort}"
 }
 
 # 生成一个上游出站。第三个参数表示该出站是否承载 UDP。
@@ -741,7 +830,7 @@ setupRelay() {
     done < <(jq -c '.[]' <<<"${relaySelectedSelectors}")
 
     echoContent skyBlue "\n请选择上游配置来源"
-    echoContent yellow "1.sing-box JSON 订阅中的 Shadowsocks 节点"
+    echoContent yellow "1.sing-box JSON 订阅中的 Shadowsocks / VLESS Reality 节点"
     echoContent yellow "2.手动输入上游节点"
     local relaySource profileName profileId
     read -r -p "请选择:" relaySource
@@ -780,9 +869,11 @@ showRelayConfig() {
 
 updateRelaySubscriptionProfile() {
     local profileId=$1 profile subscriptionUrl selectedTag outboundTag outboundFile tempDir subscriptionFile generatedOutbound
+    local supportedNodes preferredNodeType newState
     profile=$(jq -c --arg id "${profileId}" 'first(.profiles[] | select(.id == $id))' "${relayStateFile}") || return 1
     subscriptionUrl=$(jq -r '.subscription.url' <<<"${profile}")
     selectedTag=$(jq -r '.subscription.selectedTag' <<<"${profile}")
+    preferredNodeType=$(jq -r '.subscription.nodeType // if .tcp.protocol == "reality" then "vless-reality" else "shadowsocks" end' <<<"${profile}")
     outboundTag=$(jq -r '.outboundTag' <<<"${profile}")
     outboundFile=$(jq -r '.outboundFile' <<<"${profile}")
     relayProfileFileIsSafe "${outboundFile}" || return 1
@@ -793,52 +884,73 @@ updateRelaySubscriptionProfile() {
         rm -rf "${tempDir}"
         return 1
     }
-    if ! jq -e --arg tag "${selectedTag}" 'any(.outbounds[]?; .type == "shadowsocks" and .tag == $tag)' "${subscriptionFile}" >/dev/null; then
-        selectedTag=$(jq -r 'first(.outbounds[]? | select(.type == "shadowsocks")).tag // empty' "${subscriptionFile}")
+    supportedNodes=$(getRelayNodesFromSingBoxSubscription "${subscriptionFile}") || {
+        rm -rf "${tempDir}"
+        return 1
+    }
+    if ! jq -e --arg tag "${selectedTag}" 'any(.[]; .tag == $tag)' <<<"${supportedNodes}" >/dev/null; then
+        selectedTag=$(jq -r --arg nodeType "${preferredNodeType}" 'first(.[] | select(._relayType == $nodeType)).tag // empty' <<<"${supportedNodes}")
     fi
     if [[ -z "${selectedTag}" ]]; then
-        echoContent red " ---> 更新后的订阅中没有 Shadowsocks 节点，保留旧配置"
+        echoContent red " ---> 更新后的订阅中没有同类型可用节点，保留旧配置"
         rm -rf "${tempDir}"
         return 1
     fi
     buildRelayOutboundFromSingBoxSubscription "${subscriptionFile}" "${selectedTag}" "${outboundTag}" "${generatedOutbound}" || {
+        echoContent red " ---> 更新后的节点参数不完整，保留旧配置"
+        rm -rf "${tempDir}"
+        return 1
+    }
+    newState=$(jq --arg id "${profileId}" --arg tag "${selectedTag}" --arg nodeType "${relayBuiltSubscriptionType}" \
+        --arg protocol "${relayBuiltProtocol}" --arg label "${relayBuiltLabel}" \
+        --arg address "${relayBuiltAddress}" --arg port "${relayBuiltPort}" '
+        .profiles |= map(if .id == $id then
+            .subscription.selectedTag = $tag |
+            .subscription.nodeType = $nodeType |
+            .tcp.protocol = $protocol | .tcp.label = $label | .tcp.address = $address | .tcp.port = $port |
+            if .udp.mode == "shared" then
+                .udp.protocol = $protocol | .udp.label = $label | .udp.address = $address | .udp.port = $port
+            else . end
+        else . end)
+    ' "${relayStateFile}") || {
         rm -rf "${tempDir}"
         return 1
     }
     if [[ -f "${configPath}${outboundFile}" ]] && cmp -s "${generatedOutbound}" "${configPath}${outboundFile}"; then
-        if [[ $(jq -r '.subscription.selectedTag' <<<"${profile}") != "${selectedTag}" ]]; then
-            local renamedState
-            renamedState=$(jq --arg id "${profileId}" --arg tag "${selectedTag}" '.profiles |= map(if .id == $id then .subscription.selectedTag = $tag else . end)' "${relayStateFile}") || return 1
-            writeRelayState "${renamedState}" || return 1
-        fi
+        writeRelayState "${newState}" || {
+            rm -rf "${tempDir}"
+            return 1
+        }
         echoContent green " ---> $(jq -r '.name' <<<"${profile}"): 订阅没有变化"
         rm -rf "${tempDir}"
         return 0
     fi
-    local backupFile="${tempDir}/backup.json" validationOutput nodeAddress nodePort nodeMethod newState
+    local backupFile="${tempDir}/backup.json" validationOutput
     [[ -f "${configPath}${outboundFile}" ]] && cp "${configPath}${outboundFile}" "${backupFile}"
     mv "${generatedOutbound}" "${configPath}${outboundFile}"
     chmod 600 "${configPath}${outboundFile}"
     if ! validationOutput=$(/opt/xray-agent/xray/xray run -test -confdir "${configPath}" 2>&1); then
-        [[ -f "${backupFile}" ]] && cp "${backupFile}" "${configPath}${outboundFile}"
+        if [[ -f "${backupFile}" ]]; then
+            cp "${backupFile}" "${configPath}${outboundFile}"
+        else
+            rm -f "${configPath}${outboundFile}"
+        fi
         echoContent red " ---> 新订阅配置验证失败，已保留旧配置"
         echoContent yellow "${validationOutput}"
         rm -rf "${tempDir}"
         return 1
     fi
-    nodeAddress=$(jq -r --arg tag "${selectedTag}" 'first(.outbounds[] | select(.type == "shadowsocks" and .tag == $tag)).server' "${subscriptionFile}")
-    nodePort=$(jq -r --arg tag "${selectedTag}" 'first(.outbounds[] | select(.type == "shadowsocks" and .tag == $tag)).server_port' "${subscriptionFile}")
-    nodeMethod=$(jq -r --arg tag "${selectedTag}" 'first(.outbounds[] | select(.type == "shadowsocks" and .tag == $tag)).method' "${subscriptionFile}")
-    newState=$(jq --arg id "${profileId}" --arg tag "${selectedTag}" --arg address "${nodeAddress}" --arg port "${nodePort}" --arg method "${nodeMethod}" '
-        .profiles |= map(if .id == $id then
-            .subscription.selectedTag = $tag |
-            .tcp.label = ("Shadowsocks ("+$method+")") | .tcp.address = $address | .tcp.port = $port |
-            if .udp.mode == "shared" then .udp.label = ("Shadowsocks ("+$method+")") | .udp.address = $address | .udp.port = $port else . end
-        else . end)
-    ' "${relayStateFile}") || return 1
-    writeRelayState "${newState}" || return 1
+    writeRelayState "${newState}" || {
+        if [[ -f "${backupFile}" ]]; then
+            cp "${backupFile}" "${configPath}${outboundFile}"
+        else
+            rm -f "${configPath}${outboundFile}"
+        fi
+        rm -rf "${tempDir}"
+        return 1
+    }
     relaySubscriptionChanged=true
-    echoContent green " ---> $(jq -r '.name' <<<"${profile}"): 已更新到 ${selectedTag} -> ${nodeAddress}:${nodePort}"
+    echoContent green " ---> $(jq -r '.name' <<<"${profile}"): 已更新到 ${selectedTag} -> ${relayBuiltAddress}:${relayBuiltPort}"
     rm -rf "${tempDir}"
 }
 
