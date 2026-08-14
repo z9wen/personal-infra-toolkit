@@ -11,6 +11,7 @@ readonly NC='\033[0m'
 
 readonly CONFIG_FILE='/etc/sysctl.d/90-bbr-optimizer.conf'
 readonly ICMP_CONFIG_FILE='/etc/sysctl.d/91-vps-icmp-policy.conf'
+readonly IPV6_CONFIG_FILE='/etc/sysctl.d/92-vps-ipv6-policy.conf'
 readonly MODULE_FILE='/etc/modules-load.d/bbr-optimizer.conf'
 readonly BACKUP_ROOT='/var/backups/bbr-optimizer'
 readonly OLD_CONFIG_FILE='/etc/sysctl.d/90-xray-vision-bbr.conf'
@@ -145,8 +146,9 @@ show_menu() {
    - Better for high-bandwidth, high-RTT streaming/downloads
 
 4) Manage ICMP Echo Response
-5) View Current Status
-6) Restore BBR Backup
+5) Manage IPv6
+6) View Current Status
+7) Restore BBR Backup
 0) Exit
 ============================================================
 EOF
@@ -404,6 +406,92 @@ manage_icmp() {
     esac
 }
 
+set_ipv6_policy() {
+    local value=$1 description old_all old_default temporary_ipv6 old_config apply_output
+    if [[ "${value}" == '1' ]]; then
+        description='disabled'
+    else
+        description='enabled'
+    fi
+
+    old_all=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 0)
+    old_default=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || echo 0)
+    temporary_ipv6=$(mktemp /tmp/vps-ipv6-policy.XXXXXX.conf)
+    old_config=$(mktemp /tmp/vps-ipv6-policy-backup.XXXXXX.conf)
+
+    if [[ -f "${IPV6_CONFIG_FILE}" ]]; then
+        cp -a "${IPV6_CONFIG_FILE}" "${old_config}"
+    else
+        : >"${old_config}"
+    fi
+
+    {
+        printf '# Managed separately by bbr_optimizer.sh\n'
+        printf 'net.ipv6.conf.all.disable_ipv6 = %s\n' "${value}"
+        printf 'net.ipv6.conf.default.disable_ipv6 = %s\n' "${value}"
+    } >"${temporary_ipv6}"
+
+    if ! install -m 0644 "${temporary_ipv6}" "${IPV6_CONFIG_FILE}" ||
+        ! apply_output=$(sysctl -p "${IPV6_CONFIG_FILE}" 2>&1); then
+        print_error "Failed to set IPv6 policy: ${apply_output:-file installation failed}"
+        if [[ -s "${old_config}" ]]; then
+            install -m 0644 "${old_config}" "${IPV6_CONFIG_FILE}"
+        else
+            rm -f "${IPV6_CONFIG_FILE}"
+        fi
+        sysctl -w "net.ipv6.conf.all.disable_ipv6=${old_all}" >/dev/null 2>&1 || true
+        sysctl -w "net.ipv6.conf.default.disable_ipv6=${old_default}" >/dev/null 2>&1 || true
+        rm -f "${temporary_ipv6}" "${old_config}"
+        return 1
+    fi
+
+    rm -f "${temporary_ipv6}" "${old_config}"
+    print_success "IPv6 is now ${description}"
+}
+
+manage_ipv6() {
+    local all_status default_status choice confirm
+
+    if [[ ! -e /proc/sys/net/ipv6/conf/all/disable_ipv6 ||
+        ! -e /proc/sys/net/ipv6/conf/default/disable_ipv6 ]]; then
+        print_warning 'This kernel does not expose the IPv6 disable controls'
+        return 0
+    fi
+
+    all_status=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo unknown)
+    default_status=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || echo unknown)
+
+    printf '\n============================================================\n'
+    printf 'IPv6 Policy\n'
+    if [[ "${all_status}" == '1' && "${default_status}" == '1' ]]; then
+        printf 'Status: disabled\n'
+    else
+        printf 'Status: enabled\n'
+    fi
+    printf '\n1) Disable IPv6 system-wide\n'
+    printf '2) Enable IPv6 system-wide\n'
+    printf '0) Back\n'
+    printf '============================================================\n'
+    read -r -p 'Please select [0-2]: ' choice
+
+    case "${choice}" in
+    1)
+        print_warning 'Disabling IPv6 immediately interrupts IPv6 connections and may affect IPv6-only services'
+        read -r -p 'Disable IPv6 system-wide? [y/N]: ' confirm
+        [[ "${confirm}" =~ ^[Yy]$ ]] && set_ipv6_policy 1
+        ;;
+    2)
+        read -r -p 'Enable IPv6 system-wide? [y/N]: ' confirm
+        [[ "${confirm}" =~ ^[Yy]$ ]] && set_ipv6_policy 0
+        ;;
+    0) return 0 ;;
+    *)
+        print_error 'Invalid selection'
+        return 1
+        ;;
+    esac
+}
+
 restore_snapshot() {
     local backup_dir=$1
 
@@ -499,7 +587,7 @@ get_default_interface() {
 }
 
 verify_status() {
-    local interface_name qdisc_status bbr_module
+    local interface_name qdisc_status bbr_module ipv6_all ipv6_default
     interface_name=$(get_default_interface)
     bbr_module=
     if command -v lsmod >/dev/null 2>&1; then
@@ -525,6 +613,15 @@ verify_status() {
         printf 'ICMP echo response:  disabled\n'
     else
         printf 'ICMP echo response:  enabled\n'
+    fi
+    ipv6_all=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo unavailable)
+    ipv6_default=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || echo unavailable)
+    if [[ "${ipv6_all}" == 'unavailable' || "${ipv6_default}" == 'unavailable' ]]; then
+        printf 'IPv6:               unavailable\n'
+    elif [[ "${ipv6_all}" == '1' && "${ipv6_default}" == '1' ]]; then
+        printf 'IPv6:               disabled\n'
+    else
+        printf 'IPv6:               enabled\n'
     fi
 
     if [[ -n "${interface_name}" ]] && command -v tc >/dev/null 2>&1; then
@@ -588,14 +685,15 @@ main() {
 
     while true; do
         show_menu
-        read -r -p 'Please select [0-6]: ' choice
+        read -r -p 'Please select [0-7]: ' choice
         case "${choice}" in
         1) apply_profile balanced || true ;;
         2) apply_profile latency || true ;;
         3) apply_profile bandwidth || true ;;
         4) manage_icmp || true ;;
-        5) verify_status ;;
-        6) restore_backup || true ;;
+        5) manage_ipv6 || true ;;
+        6) verify_status ;;
+        7) restore_backup || true ;;
         0)
             print_info 'Exiting script'
             return 0
