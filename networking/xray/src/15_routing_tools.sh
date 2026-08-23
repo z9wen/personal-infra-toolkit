@@ -88,8 +88,7 @@ setUnlockSNI() {
 }
 EOF
             echoContent red " ---> SNI反向代理分流成功"
-            handleXray stop
-            handleXray start
+            restartXray || return 1
         else
             echoContent red " ---> 域名不可为空"
         fi
@@ -148,8 +147,7 @@ setUnlockDNS() {
         fi
 
 
-        handleXray stop
-        handleXray start
+        restartXray || return 1
 
         echoContent yellow "\n ---> 如还无法观看可以尝试以下两种方案"
         echoContent yellow " 1.重启vps"
@@ -175,8 +173,7 @@ EOF
     fi
 
 
-    handleXray stop
-    handleXray start
+    restartXray || return 1
 
     echoContent green " ---> 卸载成功"
 
@@ -194,11 +191,9 @@ removeUnlockSNI() {
 	}
 }
 EOF
-    handleXray stop
-    handleXray start
+    restartXray || return 1
 
     echoContent green " ---> 卸载成功"
 
     exit 0
 }
-

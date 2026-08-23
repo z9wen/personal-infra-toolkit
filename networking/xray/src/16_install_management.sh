@@ -56,7 +56,6 @@ customXrayInstall() {
         installTools 1
         if [[ -n "${btDomain}" ]]; then
             echoContent skyBlue "\n进度  3/${totalProgress} : 检测到宝塔面板/1Panel/HestiaCP，跳过申请TLS步骤"
-            handleXray stop
             if [[ "${selectCustomInstallType}" != ",3," ]]; then
                 customPortFunction
             fi
@@ -64,7 +63,6 @@ customXrayInstall() {
             # 申请tls
             if [[ "${selectCustomInstallType}" != ",3," ]]; then
                 initTLSNginxConfig 2
-                handleXray stop
                 installTLS 3
             else
                 echoContent skyBlue "\n进度  2/${totalProgress} : 检测到仅安装Reality，跳过TLS证书步骤"
@@ -98,8 +96,7 @@ customXrayInstall() {
             installCronTLS 10
         fi
 
-        handleXray stop
-        handleXray start
+        restartXray || return 1
         # 生成账号
         checkGFWStatue 11
         showAccounts 12
@@ -131,12 +128,10 @@ xrayCoreInstall() {
     installTools 2
     if [[ -n "${btDomain}" ]]; then
         echoContent skyBlue "\n进度  3/${totalProgress} : 检测到宝塔面板/1Panel/HestiaCP，跳过申请TLS步骤"
-        handleXray stop
         customPortFunction
     else
         # 申请tls
         initTLSNginxConfig 3
-        handleXray stop
         installTLS 4
     fi
 
@@ -158,9 +153,7 @@ xrayCoreInstall() {
         handleNginx start
         return 1
     fi
-    handleXray stop
-    sleep 2
-    handleXray start
+    restartXray || return 1
 
     handleNginx start
     # 生成账号

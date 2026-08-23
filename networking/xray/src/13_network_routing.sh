@@ -83,9 +83,9 @@ ipv6Routing() {
         exit 0
     fi
 
-    handleXray stop
-    handleXray start
+    restartXray || return 1
 }
+
 
 # ipv6分流规则展示
 showIPv6Routing() {
@@ -397,7 +397,5 @@ warpRoutingReg() {
         echoContent red " ---> 选择错误"
         exit 0
     fi
-    handleXray stop
-    handleXray start
+    restartXray || return 1
 }
-

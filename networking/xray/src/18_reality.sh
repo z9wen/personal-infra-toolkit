@@ -192,9 +192,7 @@ initXrayRealityPort() {
             realityPort=$((RANDOM % 20001 + 10000))
         fi
         #        fi
-        if [[ -n "${realityPort}" && "${xrayVLESSRealityPort}" == "${realityPort}" ]]; then
-            handleXray stop
-        else
+        if [[ -n "${realityPort}" && "${xrayVLESSRealityPort}" != "${realityPort}" ]]; then
             checkPort "${realityPort}"
         fi
     fi
@@ -220,8 +218,7 @@ manageReality() {
     selectCustomInstallType=",3,"
     initXrayConfig custom 1 true
 
-    handleXray stop
-    handleXray start
+    restartXray || return 1
     subscribe false
 }
 

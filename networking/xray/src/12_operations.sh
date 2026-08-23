@@ -291,8 +291,7 @@ EOF
             done < <(echo "${newPort}" | tr ',' '\n')
 
             echoContent green " ---> 添加完毕"
-            handleXray stop
-            handleXray start
+            restartXray || return 1
             addCorePort
         fi
     elif [[ "${selectNewPortType}" == "3" ]]; then
@@ -309,8 +308,7 @@ EOF
                 rm "${hysteriaDokodemodoorFilePath}"
             fi
 
-            handleXray stop
-            handleXray start
+            restartXray || return 1
             addCorePort
         else
             echoContent yellow "\n ---> 编号输入错误，请重新选择"
@@ -623,8 +621,7 @@ addUser() {
 
         echoContent green " ---> 已添加 ${email}: ${uuid}"
     done
-    handleXray stop
-    handleXray start
+    restartXray || return 1
     echoContent green " ---> 添加完成"
     echoContent yellow " ---> 如需更新客户端订阅，请前往独立的订阅管理"
 }
@@ -677,8 +674,7 @@ removeUser() {
         fi
     done
 
-    handleXray stop
-    handleXray start
+    restartXray || return 1
     echoContent green " ---> 删除完成"
     echoContent yellow " ---> 如需更新客户端订阅，请前往独立的订阅管理"
 }
@@ -803,8 +799,7 @@ EOF
             vlessVisionRealityInbounds=$(jq -r ".inbounds[0].streamSettings.realitySettings.show=${realityLogShow}" ${configPath}07_VLESS_vision_reality_inbounds.json)
             echo "${vlessVisionRealityInbounds}" | jq . >${configPath}07_VLESS_vision_reality_inbounds.json
         fi
-        handleXray stop
-        handleXray start
+        restartXray || return 1
         checkLog 1
         ;;
     2)

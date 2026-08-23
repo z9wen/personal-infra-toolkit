@@ -48,8 +48,7 @@ setHysteria2BbrProfile() {
     fi
 
     rm -f "${backupConfig}"
-    handleXray stop
-    handleXray start
+    restartXray || return 1
     hysteria2BbrProfile=${profile}
     echoContent green " ---> Hysteria2 QUIC拥塞控制已切换为: BBR/${profile}"
 }
@@ -87,4 +86,3 @@ manageHysteria2() {
         esac
     done
 }
-

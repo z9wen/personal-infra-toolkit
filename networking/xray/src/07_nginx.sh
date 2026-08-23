@@ -33,11 +33,14 @@ checkDNSIP() {
 }
 # 检查端口实际开放状态
 checkPortOpen() {
-    handleXray stop >/dev/null 2>&1
-
     local port=$1
     local domain=$2
     local checkPortOpenResult=
+    local xrayWasRunning=false
+    if pgrep -f "xray/xray" >/dev/null; then
+        xrayWasRunning=true
+        handleXray stop >/dev/null 2>&1 || return 1
+    fi
     allowPort "${port}"
 
     if [[ -z "${btDomain}" ]]; then
@@ -89,7 +92,13 @@ EOF
                     echoContent red " ---> 错误日志：${checkPortOpenResult}，请将此错误日志通过issues提交反馈"
                 fi
             fi
+            if [[ "${xrayWasRunning}" == "true" ]]; then
+                restartXray || exit 1
+            fi
             exit 0
+        fi
+        if [[ "${xrayWasRunning}" == "true" ]]; then
+            restartXray || return 1
         fi
         checkIP "${localIP}"
     fi

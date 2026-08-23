@@ -401,8 +401,7 @@ renewalTLS() {
                 renewalDomain="*.${dnsTLSDomain}"
             fi
             sudo "$HOME/.acme.sh/acme.sh" --install-cert -d "${renewalDomain}" --fullchain-file "/opt/xray-agent/tls/${domain}.crt" --key-file "/opt/xray-agent/tls/${domain}.key" --ecc
-            handleXray stop
-            handleXray start
+            restartXray || return 1
             handleNginx start
         else
             echoContent green " ---> 证书有效"
@@ -520,8 +519,7 @@ xrayVersionManageMenu() {
     elif [[ "${selectXrayType}" == "5" ]]; then
         handleXray start
     elif [[ "${selectXrayType}" == "6" ]]; then
-        handleXray stop
-        handleXray start
+        restartXray || return 1
     elif [[ "${selectXrayType}" == "7" ]]; then
         updateGeoSite
     elif [[ "${selectXrayType}" == "8" ]]; then
@@ -540,8 +538,7 @@ updateGeoSite() {
     echo "version:${version}"
     downloadGeoData "${version}" "${configPath}../" || return 1
 
-    handleXray stop
-    handleXray start
+    restartXray || return 1
     echoContent green " ---> 更新完毕"
 
 }
@@ -567,8 +564,7 @@ updateXray() {
         unzip -o "/opt/xray-agent/xray/${xrayCoreCPUVendor}.zip" -d /opt/xray-agent/xray >/dev/null
         rm -rf "/opt/xray-agent/xray/${xrayCoreCPUVendor}.zip"
         chmod 755 /opt/xray-agent/xray/xray
-        handleXray stop
-        handleXray start
+        restartXray || return 1
     else
         echoContent green " ---> 当前Xray-core版本:$(/opt/xray-agent/xray/xray --version | awk '{print $2}' | head -1)"
 

@@ -151,7 +151,7 @@ deployLocalAcmeCertificate() {
         -d "${acmeManagedSourceDomain}"
         --fullchain-file "${certFile}"
         --key-file "${keyFile}"
-        --reloadcmd "systemctl try-restart xray.service >/dev/null 2>&1 || true"
+        --reloadcmd "if systemctl is-active --quiet xray.service; then systemctl restart xray.service >/dev/null 2>&1 || systemctl start xray.service >/dev/null 2>&1; fi"
     )
     [[ "${acmeManagedEcc}" == "true" ]] && installArgs+=(--ecc)
 
@@ -323,9 +323,6 @@ customPortFunction() {
             read -r -p "端口:" port
             if [[ -z "${port}" ]]; then
                 port=443
-            fi
-            if [[ "${port}" == "${xrayVLESSRealityPort}" ]]; then
-                handleXray stop
             fi
         fi
 
@@ -627,4 +624,3 @@ installTLS() {
 }
 
 # 初始化随机字符串
-
