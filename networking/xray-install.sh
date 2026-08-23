@@ -1322,11 +1322,14 @@ checkDNSIP() {
 }
 # 检查端口实际开放状态
 checkPortOpen() {
-    handleXray stop >/dev/null 2>&1
-
     local port=$1
     local domain=$2
     local checkPortOpenResult=
+    local xrayWasRunning=false
+    if pgrep -f "xray/xray" >/dev/null; then
+        xrayWasRunning=true
+        handleXray stop >/dev/null 2>&1 || return 1
+    fi
     allowPort "${port}"
 
     if [[ -z "${btDomain}" ]]; then
@@ -1378,7 +1381,13 @@ EOF
                     echoContent red " ---> 错误日志：${checkPortOpenResult}，请将此错误日志通过issues提交反馈"
                 fi
             fi
+            if [[ "${xrayWasRunning}" == "true" ]]; then
+                restartXray || exit 1
+            fi
             exit 0
+        fi
+        if [[ "${xrayWasRunning}" == "true" ]]; then
+            restartXray || return 1
         fi
         checkIP "${localIP}"
     fi
@@ -1692,7 +1701,7 @@ deployLocalAcmeCertificate() {
         -d "${acmeManagedSourceDomain}"
         --fullchain-file "${certFile}"
         --key-file "${keyFile}"
-        --reloadcmd "systemctl try-restart xray.service >/dev/null 2>&1 || true"
+        --reloadcmd "if systemctl is-active --quiet xray.service; then systemctl restart xray.service >/dev/null 2>&1 || systemctl start xray.service >/dev/null 2>&1; fi"
     )
     [[ "${acmeManagedEcc}" == "true" ]] && installArgs+=(--ecc)
 
@@ -1864,9 +1873,6 @@ customPortFunction() {
             read -r -p "端口:" port
             if [[ -z "${port}" ]]; then
                 port=443
-            fi
-            if [[ "${port}" == "${xrayVLESSRealityPort}" ]]; then
-                handleXray stop
             fi
         fi
 
@@ -2168,7 +2174,6 @@ installTLS() {
 }
 
 # 初始化随机字符串
-
 
 initRandomPath() {
     local chars="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -2572,8 +2577,7 @@ renewalTLS() {
                 renewalDomain="*.${dnsTLSDomain}"
             fi
             sudo "$HOME/.acme.sh/acme.sh" --install-cert -d "${renewalDomain}" --fullchain-file "/opt/xray-agent/tls/${domain}.crt" --key-file "/opt/xray-agent/tls/${domain}.key" --ecc
-            handleXray stop
-            handleXray start
+            restartXray || return 1
             handleNginx start
         else
             echoContent green " ---> 证书有效"
@@ -2691,8 +2695,7 @@ xrayVersionManageMenu() {
     elif [[ "${selectXrayType}" == "5" ]]; then
         handleXray start
     elif [[ "${selectXrayType}" == "6" ]]; then
-        handleXray stop
-        handleXray start
+        restartXray || return 1
     elif [[ "${selectXrayType}" == "7" ]]; then
         updateGeoSite
     elif [[ "${selectXrayType}" == "8" ]]; then
@@ -2711,8 +2714,7 @@ updateGeoSite() {
     echo "version:${version}"
     downloadGeoData "${version}" "${configPath}../" || return 1
 
-    handleXray stop
-    handleXray start
+    restartXray || return 1
     echoContent green " ---> 更新完毕"
 
 }
@@ -2738,8 +2740,7 @@ updateXray() {
         unzip -o "/opt/xray-agent/xray/${xrayCoreCPUVendor}.zip" -d /opt/xray-agent/xray >/dev/null
         rm -rf "/opt/xray-agent/xray/${xrayCoreCPUVendor}.zip"
         chmod 755 /opt/xray-agent/xray/xray
-        handleXray stop
-        handleXray start
+        restartXray || return 1
     else
         echoContent green " ---> 当前Xray-core版本:$(/opt/xray-agent/xray/xray --version | awk '{print $2}' | head -1)"
 
@@ -3942,8 +3943,7 @@ EOF
             done < <(echo "${newPort}" | tr ',' '\n')
 
             echoContent green " ---> 添加完毕"
-            handleXray stop
-            handleXray start
+            restartXray || return 1
             addCorePort
         fi
     elif [[ "${selectNewPortType}" == "3" ]]; then
@@ -3960,8 +3960,7 @@ EOF
                 rm "${hysteriaDokodemodoorFilePath}"
             fi
 
-            handleXray stop
-            handleXray start
+            restartXray || return 1
             addCorePort
         else
             echoContent yellow "\n ---> 编号输入错误，请重新选择"
@@ -4274,8 +4273,7 @@ addUser() {
 
         echoContent green " ---> 已添加 ${email}: ${uuid}"
     done
-    handleXray stop
-    handleXray start
+    restartXray || return 1
     echoContent green " ---> 添加完成"
     echoContent yellow " ---> 如需更新客户端订阅，请前往独立的订阅管理"
 }
@@ -4328,8 +4326,7 @@ removeUser() {
         fi
     done
 
-    handleXray stop
-    handleXray start
+    restartXray || return 1
     echoContent green " ---> 删除完成"
     echoContent yellow " ---> 如需更新客户端订阅，请前往独立的订阅管理"
 }
@@ -4454,8 +4451,7 @@ EOF
             vlessVisionRealityInbounds=$(jq -r ".inbounds[0].streamSettings.realitySettings.show=${realityLogShow}" ${configPath}07_VLESS_vision_reality_inbounds.json)
             echo "${vlessVisionRealityInbounds}" | jq . >${configPath}07_VLESS_vision_reality_inbounds.json
         fi
-        handleXray stop
-        handleXray start
+        restartXray || return 1
         checkLog 1
         ;;
     2)
@@ -4627,9 +4623,9 @@ ipv6Routing() {
         exit 0
     fi
 
-    handleXray stop
-    handleXray start
+    restartXray || return 1
 }
+
 
 # ipv6分流规则展示
 showIPv6Routing() {
@@ -4941,10 +4937,8 @@ warpRoutingReg() {
         echoContent red " ---> 选择错误"
         exit 0
     fi
-    handleXray stop
-    handleXray start
+    restartXray || return 1
 }
-
 # ==================== 中转管理 ====================
 
 # 返回本机已安装、可作为中转入口的协议。
@@ -6155,8 +6149,7 @@ setUnlockSNI() {
 }
 EOF
             echoContent red " ---> SNI反向代理分流成功"
-            handleXray stop
-            handleXray start
+            restartXray || return 1
         else
             echoContent red " ---> 域名不可为空"
         fi
@@ -6215,8 +6208,7 @@ setUnlockDNS() {
         fi
 
 
-        handleXray stop
-        handleXray start
+        restartXray || return 1
 
         echoContent yellow "\n ---> 如还无法观看可以尝试以下两种方案"
         echoContent yellow " 1.重启vps"
@@ -6242,8 +6234,7 @@ EOF
     fi
 
 
-    handleXray stop
-    handleXray start
+    restartXray || return 1
 
     echoContent green " ---> 卸载成功"
 
@@ -6261,14 +6252,12 @@ removeUnlockSNI() {
 	}
 }
 EOF
-    handleXray stop
-    handleXray start
+    restartXray || return 1
 
     echoContent green " ---> 卸载成功"
 
     exit 0
 }
-
 # Xray-core个性化安装
 mapInstallMenuSelection() {
     local menuSelection=${1//[[:space:]]/}
@@ -6327,7 +6316,6 @@ customXrayInstall() {
         installTools 1
         if [[ -n "${btDomain}" ]]; then
             echoContent skyBlue "\n进度  3/${totalProgress} : 检测到宝塔面板/1Panel/HestiaCP，跳过申请TLS步骤"
-            handleXray stop
             if [[ "${selectCustomInstallType}" != ",3," ]]; then
                 customPortFunction
             fi
@@ -6335,7 +6323,6 @@ customXrayInstall() {
             # 申请tls
             if [[ "${selectCustomInstallType}" != ",3," ]]; then
                 initTLSNginxConfig 2
-                handleXray stop
                 installTLS 3
             else
                 echoContent skyBlue "\n进度  2/${totalProgress} : 检测到仅安装Reality，跳过TLS证书步骤"
@@ -6369,8 +6356,7 @@ customXrayInstall() {
             installCronTLS 10
         fi
 
-        handleXray stop
-        handleXray start
+        restartXray || return 1
         # 生成账号
         checkGFWStatue 11
         showAccounts 12
@@ -6402,12 +6388,10 @@ xrayCoreInstall() {
     installTools 2
     if [[ -n "${btDomain}" ]]; then
         echoContent skyBlue "\n进度  3/${totalProgress} : 检测到宝塔面板/1Panel/HestiaCP，跳过申请TLS步骤"
-        handleXray stop
         customPortFunction
     else
         # 申请tls
         initTLSNginxConfig 3
-        handleXray stop
         installTLS 4
     fi
 
@@ -6429,9 +6413,7 @@ xrayCoreInstall() {
         handleNginx start
         return 1
     fi
-    handleXray stop
-    sleep 2
-    handleXray start
+    restartXray || return 1
 
     handleNginx start
     # 生成账号
@@ -7428,9 +7410,7 @@ initXrayRealityPort() {
             realityPort=$((RANDOM % 20001 + 10000))
         fi
         #        fi
-        if [[ -n "${realityPort}" && "${xrayVLESSRealityPort}" == "${realityPort}" ]]; then
-            handleXray stop
-        else
+        if [[ -n "${realityPort}" && "${xrayVLESSRealityPort}" != "${realityPort}" ]]; then
             checkPort "${realityPort}"
         fi
     fi
@@ -7456,8 +7436,7 @@ manageReality() {
     selectCustomInstallType=",3,"
     initXrayConfig custom 1 true
 
-    handleXray stop
-    handleXray start
+    restartXray || return 1
     subscribe false
 }
 
@@ -7561,8 +7540,7 @@ setHysteria2BbrProfile() {
     fi
 
     rm -f "${backupConfig}"
-    handleXray stop
-    handleXray start
+    restartXray || return 1
     hysteria2BbrProfile=${profile}
     echoContent green " ---> Hysteria2 QUIC拥塞控制已切换为: BBR/${profile}"
 }
@@ -7601,12 +7579,11 @@ manageHysteria2() {
     done
 }
 
-
 # 主菜单
 menu() {
     cd "$HOME" || exit
     echoContent red "\n=============================================================="
-    echoContent green "当前版本：v2026.08.14.1786702675"
+    echoContent green "当前版本：v2026.08.23.1787482799"
     echoContent green "描述：Xray 一键安装管理脚本\c"
     showInstallStatus
     checkWgetShowProgress
