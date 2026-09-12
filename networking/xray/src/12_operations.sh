@@ -221,13 +221,13 @@ addCorePort() {
         read -r -p "请输入默认的端口号，同时会更改订阅端口以及节点端口，[回车]默认443:" defaultPort
 
         if [[ -n "${defaultPort}" ]]; then
-            rm -rf "$(find ${configPath}* | grep "default")"
+            while IFS= read -r -d "" target; do rm -rf -- "${target}"; done < <(find "${configPath}" -maxdepth 1 -type f -name "*default*" -print0)
         fi
 
         if [[ -n "${newPort}" ]]; then
 
             while read -r port; do
-                rm -rf "$(find ${configPath}* | grep "${port}")"
+                while IFS= read -r -d "" target; do rm -rf -- "${target}"; done < <(find "${configPath}" -maxdepth 1 -type f -name "*${port}*" -print0)
 
                 local fileName=
                 local hysteriaFileName=
