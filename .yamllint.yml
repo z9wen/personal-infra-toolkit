@@ -5,3 +5,7 @@ rules:
   line-length: disable
   truthy:
     check-keys: false
+  comments:
+    # cloud-init requires the exact "#cloud-config" header without a space.
+    ignore: |
+      azure/terraform/cloud-init.yaml
