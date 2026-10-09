@@ -1,156 +1,196 @@
 #!/bin/bash
-
+#
 # auto-sync-renewed-certs.sh
-# Automatically detect renewed certificates from acme.sh and sync to HestiaCP
+# Automatically detect renewed certificates from acme.sh and sync them to HestiaCP.
+#
+# Web domains are updated with HestiaCP's own v-update-web-domain-ssl, which
+# stores the certificate in HestiaCP's data directory ($HESTIA/data/users/<user>/ssl,
+# the source of truth used when web configs are rebuilt) and rewrites
+# /home/<user>/conf/web/<domain>/ssl. Domains without SSL enabled in HestiaCP are
+# skipped. A certificate is considered renewed when the acme.sh certificate file
+# is newer than the copy HestiaCP stores.
+#
+# Exit status: 0 when every sync succeeded, 1 when at least one failed.
+#
+# Configuration (edit below or override through the environment):
 
-LOG_FILE="/var/log/acme-auto-sync.log"
-ACME_DIR="/root/.acme.sh"
-USER="admin" # HestiaCP panel user
-PANEL_DOMAIN="panel.example.com"  # HestiaCP panel domain
+LOG_FILE="${LOG_FILE:-/var/log/acme-auto-sync.log}"
+ACME_DIR="${ACME_DIR:-/root/.acme.sh}"
+HESTIA="${HESTIA:-/usr/local/hestia}"
+HESTIA_HOME_DIR="${HESTIA_HOME_DIR:-/home}"
+HESTIA_USER="${HESTIA_USER:-admin}"               # HestiaCP panel user
+PANEL_DOMAIN="${PANEL_DOMAIN:-panel.example.com}" # HestiaCP panel domain
+PANEL_SSL_DIR="${PANEL_SSL_DIR:-$HESTIA/ssl}"     # HestiaCP panel certificate directory
+
+set -euo pipefail
 
 # Logging function
 log() {
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-log "🔄 Starting auto-sync for renewed certificates"
-log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+# Copies the acme.sh files into a new private directory using the names
+# HestiaCP expects and prints its path.
+stage_certificate() {
+    local domain="$1" acme_cert_dir="$2"
+    local stage_dir
 
-# Sync certificate for a single domain
+    stage_dir="$(mktemp -d "${TMPDIR:-/tmp}/acme-auto-sync.XXXXXX")" || return 1
+    if cp -- "$acme_cert_dir/${domain}.cer" "$stage_dir/${domain}.crt" \
+        && cp -- "$acme_cert_dir/${domain}.key" "$stage_dir/${domain}.key" \
+        && { [[ ! -f "$acme_cert_dir/ca.cer" ]] || cp -- "$acme_cert_dir/ca.cer" "$stage_dir/${domain}.ca"; } \
+        && chmod 600 "$stage_dir/${domain}".*; then
+        echo "$stage_dir"
+        return 0
+    fi
+    rm -rf -- "$stage_dir"
+    return 1
+}
+
+# Sync certificate for a single web domain.
+# Returns 0 when synced, 2 when up to date or skipped, 1 on failure.
 sync_domain() {
-  local domain=$1
-  local acme_cert_dir="${ACME_DIR}/${domain}_ecc"
-  local ssl_dir="/home/${USER}/conf/web/${domain}/ssl"
+    local domain="$1"
+    local acme_cert_dir="${ACME_DIR}/${domain}_ecc"
+    local hestia_cert="$HESTIA/data/users/${HESTIA_USER}/ssl/${domain}.crt"
+    local stage_dir status=0
 
-  # Check if certificate directory exists
-  if [ ! -d "$acme_cert_dir" ]; then
-    log "⚠️  Certificate directory not found: $acme_cert_dir"
-    return 1
-  fi
+    # Check if certificate files exist
+    if [[ ! -f "$acme_cert_dir/${domain}.cer" || ! -f "$acme_cert_dir/${domain}.key" ]]; then
+        log "⚠️  ACME certificate not found for $domain"
+        return 1
+    fi
 
-  # Check if SSL directory exists
-  if [ ! -d "$ssl_dir" ]; then
-    log "⚠️  SSL directory not found: $ssl_dir"
-    return 1
-  fi
+    # Only domains that already have SSL enabled in HestiaCP are updated
+    if [[ ! -f "$hestia_cert" ]]; then
+        log "ℹ️  SSL is not enabled in HestiaCP for $domain; skipping"
+        return 2
+    fi
 
-  # Get certificate modification time
-  local acme_cert_time=$(stat -c %Y "$acme_cert_dir/${domain}.cer" 2>/dev/null)
-  local hestia_cert_time=$(stat -c %Y "$ssl_dir/${domain}.crt" 2>/dev/null)
+    if [[ ! "$acme_cert_dir/${domain}.cer" -nt "$hestia_cert" ]]; then
+        log "ℹ️  Certificate for $domain is up to date"
+        return 2
+    fi
 
-  if [ -z "$acme_cert_time" ]; then
-    log "⚠️  ACME certificate not found for $domain"
-    return 1
-  fi
-
-  # Sync if certificate is updated
-  if [ -z "$hestia_cert_time" ] || [ "$acme_cert_time" -gt "$hestia_cert_time" ]; then
     log "📋 Syncing certificate for $domain..."
+    if ! stage_dir="$(stage_certificate "$domain" "$acme_cert_dir")"; then
+        log "❌ Could not stage certificate files for $domain"
+        return 1
+    fi
 
-    # Copy certificate files
-    cp "$acme_cert_dir/${domain}.cer" "$ssl_dir/${domain}.crt"
-    cp "$acme_cert_dir/${domain}.key" "$ssl_dir/${domain}.key"
-    cp "$acme_cert_dir/ca.cer" "$ssl_dir/${domain}.ca" 2>/dev/null
-    cp "$acme_cert_dir/fullchain.cer" "$ssl_dir/${domain}.pem"
+    "$HESTIA/bin/v-update-web-domain-ssl" "$HESTIA_USER" "$domain" "$stage_dir" 2>&1 \
+        | tee -a "$LOG_FILE" || status=$?
+    rm -rf -- "$stage_dir"
 
-    # Set permissions
-    chmod 644 "$ssl_dir/${domain}.crt"
-    chmod 600 "$ssl_dir/${domain}.key"
-    chmod 644 "$ssl_dir/${domain}.ca" 2>/dev/null
-    chmod 644 "$ssl_dir/${domain}.pem"
-
+    if ((status != 0)); then
+        log "❌ HestiaCP failed to update the certificate for $domain"
+        return 1
+    fi
     log "✅ Certificate synced for $domain"
     return 0
-  else
-    log "ℹ️  Certificate for $domain is up to date"
-    return 2
-  fi
 }
 
-# Sync HestiaCP panel certificate (special handling)
+# Sync HestiaCP panel certificate (special handling).
+# Returns 0 when synced, 2 when up to date, 1 on failure.
 sync_panel_cert() {
-  local domain="$PANEL_DOMAIN"
-  local acme_cert_dir="${ACME_DIR}/${domain}_ecc"
-  local panel_ssl_dir="/usr/local/hestia/ssl"
-  local user_ssl_dir="/usr/local/hestia/data/users/${USER}/ssl"
+    local domain="$PANEL_DOMAIN"
+    local acme_cert_dir="${ACME_DIR}/${domain}_ecc"
+    local user_ssl_dir="$HESTIA/data/users/${HESTIA_USER}/ssl"
 
-  if [ ! -d "$acme_cert_dir" ]; then
-    log "⚠️  Panel certificate directory not found"
-    return 1
-  fi
+    if [[ ! -f "$acme_cert_dir/${domain}.cer" || ! -f "$acme_cert_dir/fullchain.cer" || ! -f "$acme_cert_dir/${domain}.key" ]]; then
+        log "⚠️  Panel certificate files not found in $acme_cert_dir"
+        return 1
+    fi
 
-  # Get certificate modification time
-  local acme_cert_time=$(stat -c %Y "$acme_cert_dir/${domain}.cer" 2>/dev/null)
-  local panel_cert_time=$(stat -c %Y "$panel_ssl_dir/certificate.crt" 2>/dev/null)
+    # -nt is also true when the panel certificate does not exist yet
+    if [[ ! "$acme_cert_dir/${domain}.cer" -nt "$PANEL_SSL_DIR/certificate.crt" ]]; then
+        log "ℹ️  Panel certificate is up to date"
+        return 2
+    fi
 
-  if [ -z "$acme_cert_time" ]; then
-    return 1
-  fi
-
-  # Sync if certificate is updated
-  if [ -z "$panel_cert_time" ] || [ "$acme_cert_time" -gt "$panel_cert_time" ]; then
     log "📋 Syncing panel certificate for $domain..."
 
-    # Copy to panel directory
-    cp "$acme_cert_dir/fullchain.cer" "$panel_ssl_dir/certificate.crt"
-    cp "$acme_cert_dir/${domain}.key" "$panel_ssl_dir/certificate.key"
-
-    # Copy to user directory
-    mkdir -p "$user_ssl_dir"
-    cp "$acme_cert_dir/fullchain.cer" "$user_ssl_dir/${domain}.pem"
-    cp "$acme_cert_dir/fullchain.cer" "$user_ssl_dir/${domain}.crt"
-    cp "$acme_cert_dir/${domain}.key" "$user_ssl_dir/${domain}.key"
+    # Copy to panel directory, then to the user directory
+    if ! {
+        cp -- "$acme_cert_dir/fullchain.cer" "$PANEL_SSL_DIR/certificate.crt" \
+            && cp -- "$acme_cert_dir/${domain}.key" "$PANEL_SSL_DIR/certificate.key" \
+            && mkdir -p "$user_ssl_dir" \
+            && cp -- "$acme_cert_dir/fullchain.cer" "$user_ssl_dir/${domain}.pem" \
+            && cp -- "$acme_cert_dir/fullchain.cer" "$user_ssl_dir/${domain}.crt" \
+            && cp -- "$acme_cert_dir/${domain}.key" "$user_ssl_dir/${domain}.key"
+    }; then
+        log "❌ Could not copy the panel certificate files"
+        return 1
+    fi
 
     log "✅ Panel certificate synced"
     log "♻️  Restarting HestiaCP..."
-    systemctl restart hestia
+    if ! systemctl restart hestia; then
+        log "❌ Restarting HestiaCP failed"
+        return 1
+    fi
     return 0
-  else
-    log "ℹ️  Panel certificate is up to date"
-    return 2
-  fi
 }
 
-# Get all domains that need to be synced
-DOMAINS=()
-NEED_RELOAD=false
+main() {
+    local cert_dir domain status
+    local need_reload=false failures=0
 
-# Iterate through all ECC certificate directories
-for cert_dir in ${ACME_DIR}/*_ecc/; do
-  if [ -d "$cert_dir" ]; then
-    domain=$(basename "$cert_dir" | sed 's/_ecc$//')
+    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log "🔄 Starting auto-sync for renewed certificates"
+    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    # Skip wildcard certificates
-    if [[ "$domain" == \** ]]; then
-      continue
-    fi
+    # Iterate through all ECC certificate directories
+    for cert_dir in "$ACME_DIR"/*_ecc/; do
+        [[ -d "$cert_dir" ]] || continue
+        domain="${cert_dir%/}"
+        domain="${domain##*/}"
+        domain="${domain%_ecc}"
 
-    # Check if it's the panel domain
-    if [ "$domain" = "$PANEL_DOMAIN" ]; then
-      sync_panel_cert
-      if [ $? -eq 0 ]; then
-        NEED_RELOAD=false  # Panel restarted, no need to reload nginx
-      fi
-    else
-      # Check if domain exists in HestiaCP
-      if [ -d "/home/${USER}/conf/web/${domain}" ]; then
-        sync_domain "$domain"
-        if [ $? -eq 0 ]; then
-          NEED_RELOAD=true
+        # Skip wildcard certificates
+        if [[ "$domain" == \** ]]; then
+            continue
         fi
-      fi
+
+        status=0
+        if [[ "$domain" == "$PANEL_DOMAIN" ]]; then
+            # Restarting hestia does not reload the system nginx, so a reload
+            # requested by another domain must be kept.
+            sync_panel_cert || status=$?
+        elif [[ -d "${HESTIA_HOME_DIR}/${HESTIA_USER}/conf/web/${domain}" ]]; then
+            sync_domain "$domain" || status=$?
+            if ((status == 0)); then
+                need_reload=true
+            fi
+        else
+            continue
+        fi
+        if ((status == 1)); then
+            failures=$((failures + 1))
+        fi
+    done
+
+    # Reload nginx if there are updates
+    if [[ "$need_reload" == true ]]; then
+        log "♻️  Reloading nginx..."
+        if systemctl reload nginx; then
+            log "✅ Nginx reloaded"
+        else
+            log "❌ Nginx reload failed"
+            failures=$((failures + 1))
+        fi
     fi
-  fi
-done
 
-# Reload nginx if there are updates
-if [ "$NEED_RELOAD" = true ]; then
-  log "♻️  Reloading nginx..."
-  systemctl reload nginx
-  log "✅ Nginx reloaded"
+    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    if ((failures > 0)); then
+        log "❌ Auto-sync completed with $failures error(s)"
+        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        return 1
+    fi
+    log "✅ Auto-sync completed"
+    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi
-
-log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-log "✅ Auto-sync completed"
-log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

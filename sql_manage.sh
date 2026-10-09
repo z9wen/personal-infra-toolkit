@@ -78,6 +78,16 @@ Notes:
   Running without arguments opens the interactive management menu.
   backup-all for PostgreSQL uses pg_dumpall and may contain role definitions.
   Backup files are created with user-only permissions (umask 077).
+  cleanup keeps the <keep_count> newest files (by modification time) for each
+  database name prefix, e.g. app_db_*.sql.gz and all-databases_*.sql.gz are
+  retained independently.
+  PostgreSQL single-database restores run in one transaction (--single-transaction)
+  and roll back completely on the first error.
+  PostgreSQL restore-all is meant for a fresh cluster: roles that already exist
+  (such as the connecting superuser) are kept and updated by the following
+  ALTER ROLE, but an existing database or object still stops the restore.
+  MySQL restores stop at the first error, but DDL statements auto-commit, so a
+  failed MySQL restore can leave a partially restored database behind.
 EOF
 }
 
@@ -130,7 +140,7 @@ require_command() {
 }
 
 ensure_backup_directory() {
-    mkdir -p "$BACKUP_DIR"
+    mkdir -p "$BACKUP_DIR" || die "Cannot create backup directory: $BACKUP_DIR"
     chmod 700 "$BACKUP_DIR" 2>/dev/null || true
 }
 
@@ -205,7 +215,7 @@ run_pg_dump() {
 }
 
 run_pg_dumpall() {
-    "${PG_ENV[@]}" "$PG_DUMPALL" "${PG_BASE_ARGS[@]}" "$@"
+    "${PG_ENV[@]}" "$PG_DUMPALL" "${PG_BASE_ARGS[@]}"
 }
 
 run_createdb() {
@@ -313,8 +323,8 @@ finalize_backup() {
         rm -f "$temporary_file"
         die "Compressed backup validation failed"
     }
-    chmod 600 "$temporary_file"
-    mv "$temporary_file" "$output_file"
+    chmod 600 "$temporary_file" || die "Cannot set permissions on $temporary_file"
+    mv "$temporary_file" "$output_file" || die "Cannot move backup into place: $output_file"
     info "Backup written to $output_file"
 }
 
@@ -397,7 +407,10 @@ backup_all_databases() {
 ensure_mysql_database() {
     local database="$1"
     local escaped_database="${database//\`/\`\`}"
-    run_mysql -e "CREATE DATABASE IF NOT EXISTS \`$escaped_database\`;"
+    run_mysql -e "CREATE DATABASE IF NOT EXISTS \`$escaped_database\`;" || {
+        warn "Could not create MySQL database: $database"
+        return 1
+    }
 }
 
 ensure_postgresql_database() {
@@ -410,11 +423,17 @@ ensure_postgresql_database() {
         --dbname=postgres \
         --tuples-only \
         --no-align \
-        --command="SELECT 1 FROM pg_database WHERE datname = '$escaped_database';")"
+        --command="SELECT 1 FROM pg_database WHERE datname = '$escaped_database';")" || {
+        warn "Could not check whether PostgreSQL database exists: $database"
+        return 1
+    }
 
     if [[ "$exists" != "1" ]]; then
         info "Creating PostgreSQL database: $database"
-        run_createdb -- "$database"
+        run_createdb -- "$database" || {
+            warn "Could not create PostgreSQL database: $database"
+            return 1
+        }
     fi
 }
 
@@ -425,6 +444,7 @@ stream_backup_to_command() {
     case "$backup_file" in
         *.gz)
             gzip -t "$backup_file" || die "Invalid or corrupted gzip backup: $backup_file"
+            # pipefail (set at the top of the script) makes a gzip or client failure fail the pipeline.
             gzip -dc "$backup_file" | "$@"
             ;;
         *)
@@ -443,19 +463,48 @@ restore_database() {
     case "$DB_ENGINE" in
         mysql)
             require_mysql_client
-            ensure_mysql_database "$database"
-            stream_backup_to_command "$backup_file" run_mysql "$database"
+            ensure_mysql_database "$database" || return 1
+            # The mysql client stops at the first error (no --force). DDL auto-commits,
+            # so MySQL cannot roll a failed restore back the way PostgreSQL can.
+            stream_backup_to_command "$backup_file" run_mysql "$database" || {
+                warn "MySQL restore failed for $database; the database may be partially restored"
+                return 1
+            }
             ;;
         postgresql)
             require_postgresql_client
-            ensure_postgresql_database "$database"
+            ensure_postgresql_database "$database" || return 1
             stream_backup_to_command "$backup_file" run_psql \
                 --dbname="$database" \
-                --set=ON_ERROR_STOP=1
+                --single-transaction \
+                --set=ON_ERROR_STOP=1 || {
+                warn "PostgreSQL restore failed for $database; the transaction was rolled back"
+                return 1
+            }
             ;;
     esac
 
     info "Restore completed for $database"
+}
+
+# pg_dumpall emits "CREATE ROLE name;" followed by "ALTER ROLE name WITH ...;" for
+# every role, expecting the CREATE to fail harmlessly for roles that already exist
+# (always the case for the connecting superuser). With ON_ERROR_STOP=1 that error
+# would abort the restore, so each CREATE ROLE in the global section (before the
+# first \connect) is wrapped in a DO block that ignores duplicate_object only.
+tolerate_existing_pg_roles() {
+    awk '
+        !in_databases && /^\\connect / { in_databases = 1 }
+        !in_databases && /^CREATE ROLE [^;]+;$/ && index($0, "$sql_manage_role$") == 0 {
+            print "DO $sql_manage_role$ BEGIN " $0 " EXCEPTION WHEN duplicate_object THEN RAISE NOTICE '"'"'role already exists, keeping it'"'"'; END $sql_manage_role$;"
+            next
+        }
+        { print }
+    '
+}
+
+restore_postgresql_cluster() {
+    tolerate_existing_pg_roles | run_psql --dbname=postgres --set=ON_ERROR_STOP=1
 }
 
 restore_all_databases() {
@@ -468,17 +517,33 @@ restore_all_databases() {
     case "$DB_ENGINE" in
         mysql)
             require_mysql_client
-            stream_backup_to_command "$backup_file" run_mysql
+            stream_backup_to_command "$backup_file" run_mysql || {
+                warn "MySQL full restore failed; databases may be partially restored"
+                return 1
+            }
             ;;
         postgresql)
             require_postgresql_client
-            stream_backup_to_command "$backup_file" run_psql \
-                --dbname=postgres \
-                --set=ON_ERROR_STOP=1
+            stream_backup_to_command "$backup_file" restore_postgresql_cluster || {
+                warn "PostgreSQL full restore failed; databases may be partially restored"
+                return 1
+            }
             ;;
     esac
 
     info "Full restore completed"
+}
+
+# Retention group of a backup file: its name without the extension and the
+# trailing _<timestamp>, e.g. app_db_20260717-010203.sql.gz -> app_db.
+backup_group_name() {
+    local name="${1##*/}"
+    name="${name%.gz}"
+    name="${name%.sql}"
+    case "$name" in
+        *_*) name="${name%_*}" ;;
+    esac
+    printf '%s' "$name"
 }
 
 cleanup_backups() {
@@ -487,19 +552,41 @@ cleanup_backups() {
     ((keep_count > 0)) || die "keep_count must be greater than zero"
     ensure_backup_directory
 
-    local files=()
-    mapfile -t files < <(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name '*.sql' -o -name '*.sql.gz' \) | sort -r)
-
-    if ((${#files[@]} <= keep_count)); then
-        info "Nothing to clean. Found ${#files[@]} backup files."
-        return 0
+    local stat_mtime=(stat -c %Y)
+    if ! stat -c %Y / >/dev/null 2>&1; then
+        stat_mtime=(stat -f %m) # BSD/macOS stat
     fi
 
-    local file
-    for file in "${files[@]:keep_count}"; do
-        rm -f "$file"
-        info "Removed old backup: $file"
-    done
+    local tab=$'\t'
+    local file group mtime total=0 removed=0 failed=0 kept_in_group=0 current_group=""
+    while IFS="$tab" read -r group mtime file; do
+        total=$((total + 1))
+        if [[ "$group" != "$current_group" ]]; then
+            current_group="$group"
+            kept_in_group=0
+        fi
+        if ((kept_in_group < keep_count)); then
+            kept_in_group=$((kept_in_group + 1))
+            continue
+        fi
+        if rm -f -- "$file"; then
+            removed=$((removed + 1))
+            info "Removed old backup: $file"
+        else
+            failed=1
+            warn "Could not remove old backup: $file"
+        fi
+    done < <(
+        find "$BACKUP_DIR" -maxdepth 1 -type f \( -name '*.sql' -o -name '*.sql.gz' \) | while IFS= read -r file; do
+            mtime="$("${stat_mtime[@]}" "$file")" || continue
+            printf '%s\t%s\t%s\n' "$(backup_group_name "$file")" "$mtime" "$file"
+        done | sort -t "$tab" -k1,1 -k2,2nr -k3,3r
+    )
+
+    if ((removed == 0 && failed == 0)); then
+        info "Nothing to clean. Found $total backup files; keeping up to $keep_count per database."
+    fi
+    ((failed == 0))
 }
 
 pause_for_menu() {
@@ -614,8 +701,22 @@ configure_connection() {
     esac
 }
 
+# Run a menu action in a subshell so a failing action (or die) cannot end the
+# menu. Calling it inside "if !" or "||" would disable set -e for everything the
+# action runs, so errexit is switched off only around the subshell, which turns
+# it back on for the action itself.
 run_menu_action() {
-    if ! ("$@"); then
+    local status=0 restore_errexit=0
+    [[ $- == *e* ]] && restore_errexit=1
+    set +e
+    (
+        set -e
+        "$@"
+    )
+    status=$?
+    ((restore_errexit == 0)) || set -e
+
+    if ((status != 0)); then
         warn "Operation failed; check the error above"
     fi
     pause_for_menu
@@ -798,14 +899,7 @@ interactive_menu() {
     done
 }
 
-main() {
-    parse_global_options "$@"
-    if ((REMAINING_COUNT > 0)); then
-        set -- "${REMAINING_ARGS[@]}"
-    else
-        set --
-    fi
-
+init_settings() {
     BACKUP_DIR_CUSTOM=0
     if [[ -n "${BACKUP_DIR:-}" ]]; then
         BACKUP_DIR_CUSTOM=1
@@ -829,13 +923,19 @@ main() {
     PG_DUMPALL="${PG_DUMPALL:-pg_dumpall}"
     CREATEDB="${CREATEDB:-createdb}"
 
-    MYSQL_BASE_ARGS=()
-    PG_BASE_ARGS=()
-    PG_ENV=()
-    REMAINING_ARGS=()
     build_connection_settings
-
     SELECTED_BACKUP_FILE=""
+}
+
+main() {
+    parse_global_options "$@"
+    if ((REMAINING_COUNT > 0)); then
+        set -- "${REMAINING_ARGS[@]}"
+    else
+        set --
+    fi
+
+    init_settings
 
     local command="${1:-menu}"
     case "$command" in
@@ -875,4 +975,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
