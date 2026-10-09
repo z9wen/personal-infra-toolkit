@@ -37,7 +37,9 @@ esac
 NFT
 chmod +x "${temporaryDirectory}/bin/nft"
 export PATH="${temporaryDirectory}/bin:${PATH}" NFT_LOG="${temporaryDirectory}/nft.log" NFT_LOADED="${temporaryDirectory}/loaded"
-# Pretend systemd is absent so rules are loaded directly.
+# Pretend systemd is absent so rules are loaded directly. CI runners boot with
+# systemd, so the detection itself must be stubbed, not just systemctl.
+hasSystemd() { return 1; }
 systemctl() { return 1; }
 echoContent() { :; }
 allowedPorts=

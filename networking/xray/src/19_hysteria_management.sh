@@ -165,12 +165,17 @@ table inet ${hysteria2PortHopTable} {
 NFT
 }
 
+# True when systemd is the running init, not merely installed (e.g. containers).
+hasSystemd() {
+    command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]
+}
+
 # (Re)load the rules now, and make them survive reboots where systemd exists.
 loadPortHopRules() {
     local nftBin
     nftBin=$(command -v nft) || return 1
     "${nftBin}" delete table inet "${hysteria2PortHopTable}" >/dev/null 2>&1
-    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    if hasSystemd; then
         cat >"${hysteria2PortHopUnit}" <<UNIT
 [Unit]
 Description=xray-agent Hysteria2 port hopping (UDP redirect)
