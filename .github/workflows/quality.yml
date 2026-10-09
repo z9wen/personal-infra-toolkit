@@ -6,6 +6,8 @@ on:
       - "**/*.sh"
       - "**/*.yml"
       - "**/*.yaml"
+      - "**/*.py"
+      - "requirements-dev.txt"
       - "Makefile"
       - ".yamllint.yml"
   pull_request:
@@ -13,6 +15,8 @@ on:
       - "**/*.sh"
       - "**/*.yml"
       - "**/*.yaml"
+      - "**/*.py"
+      - "requirements-dev.txt"
       - "Makefile"
       - ".yamllint.yml"
   workflow_dispatch:
@@ -32,8 +36,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
       - name: Install quality tools
         run: |
+          pip install -r requirements-dev.txt
           sudo apt-get update
           sudo apt-get install --yes shellcheck shfmt yamllint
           go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
@@ -45,6 +55,9 @@ jobs:
       - name: Run ShellCheck
         run: make lint
 
+      - name: Run Ruff
+        run: make python-lint
+
       - name: Check shell formatting
         run: make format-check
 
@@ -53,3 +66,6 @@ jobs:
 
       - name: Validate GitHub Actions
         run: make actionlint
+
+      - name: Run unit tests
+        run: make test
