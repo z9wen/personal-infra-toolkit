@@ -1,24 +1,23 @@
-
 removeNginx302() {
-    # 检查配置文件是否存在
+    # Check that the config file exists
     if [[ ! -f "${nginxConfigPath}xray-agent.conf" ]]; then
         echoContent red " ---> 配置文件不存在: ${nginxConfigPath}xray-agent.conf"
         echoContent yellow " ---> 请先完成 Xray 安装后再使用此功能"
         return 1
     fi
-    
-    # 使用临时文件避免在循环中修改原文件
+
+    # Use a temp file to avoid modifying the original file inside the loop
     local tmpFile="${nginxConfigPath}xray-agent.conf.tmp"
     cp "${nginxConfigPath}xray-agent.conf" "${tmpFile}"
-    
-    # 删除所有 return 302/301 行（排除包含 request_uri 的）
+
+    # Delete all return 302/301 lines (excluding those containing request_uri)
     sed -i '/return 30[12]/!b; /request_uri/b; d' "${tmpFile}"
-    
-    # 替换原文件
+
+    # Replace the original file
     mv "${tmpFile}" "${nginxConfigPath}xray-agent.conf"
 }
 
-# 检查302是否成功
+# Check whether the 302 redirect succeeded
 checkNginx302() {
     local testHost="${currentHost}"
     local testPort="${currentPort}"
@@ -46,7 +45,7 @@ checkNginx302() {
     local targetUrl="${scheme}://${testHost}:${testPort}"
     local httpCode=
     httpCode=$(curl -I -k --connect-timeout 5 -s -o /dev/null -w "%{http_code}" "${targetUrl}")
-    
+
     if [[ "${httpCode}" == "302" ]]; then
         echoContent green " ---> 重定向设置完毕 (HTTP ${httpCode})"
         exit 0
@@ -60,7 +59,7 @@ checkNginx302() {
     handleNginx start >/dev/null 2>&1
 }
 
-# 备份恢复nginx文件
+# Back up/restore the nginx file
 backupNginxConfig() {
     if [[ "$1" == "backup" ]]; then
         if [[ ! -f "${nginxConfigPath}xray-agent.conf" ]]; then
@@ -79,52 +78,52 @@ backupNginxConfig() {
     fi
 
 }
-# 添加302配置
+# Add the 302 config
 addNginx302() {
     local redirectUrl="$1"
-    local redirectCode="302"  # 固定使用 302
+    local redirectCode="302" # Always use 302
 
-    # 检查配置文件是否存在
+    # Check that the config file exists
     if [[ ! -f "${nginxConfigPath}xray-agent.conf" ]]; then
         echoContent red " ---> 配置文件不存在: ${nginxConfigPath}xray-agent.conf"
         echoContent yellow " ---> 请先完成 Xray 安装后再使用此功能"
         backupNginxConfig restoreBackup
         return 1
     fi
-    
-    # 验证 URL 格式
+
+    # Validate the URL format
     if [[ ! "${redirectUrl}" =~ ^https?:// ]]; then
         echoContent red " ---> URL 格式错误，必须以 http:// 或 https:// 开头"
         backupNginxConfig restoreBackup
         return 1
     fi
-    
-    # 转义特殊字符（单引号）
+
+    # Escape special characters (single quotes)
     redirectUrl="${redirectUrl//\'/\'\\\'\'}"
-    
-    # 读取所有 location / { 的行号到数组
+
+    # Read the line numbers of all `location / {` into an array
     local lineNumbers=()
     while IFS= read -r line; do
         lineNumbers+=("$(echo "${line}" | awk -F ":" '{print $1}')")
     done < <(grep -n "location / {" "${nginxConfigPath}xray-agent.conf")
-    
-    # 从后往前插入，避免行号变化
+
+    # Insert from back to front so line numbers do not shift
     local count=${#lineNumbers[@]}
-    for ((i=count-1; i>=0; i--)); do
+    for ((i = count - 1; i >= 0; i--)); do
         local insertIndex=$((lineNumbers[i] + 1))
         sed -i "${insertIndex}i\\        return ${redirectCode} '${redirectUrl}';" "${nginxConfigPath}xray-agent.conf"
     done
-    
+
     if [[ ${count} -eq 0 ]]; then
         echoContent red " ---> 重定向添加失败：未找到 location / { 配置"
         backupNginxConfig restoreBackup
         return 1
     fi
-    
+
     echoContent green " ---> 已在 ${count} 处添加 ${redirectCode} 重定向"
 }
 
-# 更新伪装站
+# Update the masquerade site
 updateNginxBlog() {
     echoContent skyBlue "\n进度 $1/${totalProgress} : 更换伪装站点"
 
@@ -162,13 +161,13 @@ updateNginxBlog() {
             echoContent yellow "\n使用 302 临时重定向，便于随时调整目标 URL。"
 
             read -r -p "请输入要重定向的完整URL:" redirectDomain
-            
+
             if [[ -z "${redirectDomain}" ]]; then
                 echoContent red " ---> 重定向URL不能为空"
                 backupNginxConfig restoreBackup
                 exit 0
             fi
-            
+
             removeNginx302
             addNginx302 "${redirectDomain}"
             handleNginx stop
@@ -196,7 +195,90 @@ updateNginxBlog() {
     fi
 }
 
-# 添加新端口
+# Extra ports are dokodemo-door inbounds that forward to the main TLS port.
+# Files: 02_dokodemodoor_inbounds_<port>[_default].json, plus
+# 02_dokodemodoor_inbounds_hysteria_<port>.json when Hysteria2 is installed.
+# The _default marker selects the port used in shared links/subscriptions.
+
+# Print "<port> <file>" for every extra TCP port, sorted by port.
+listCorePorts() {
+    local file name port
+    for file in "${configPath}"02_dokodemodoor_inbounds_*.json; do
+        [[ -f "${file}" ]] || continue
+        name=${file##*/}
+        [[ "${name}" =~ ^02_dokodemodoor_inbounds_([0-9]+)(_default)?\.json$ ]] || continue
+        port=${BASH_REMATCH[1]}
+        echo "${port} ${file}"
+    done | sort -n
+}
+
+# Remove exactly the files that belong to one extra port.
+removeCorePortFiles() {
+    local port=$1
+    rm -f "${configPath}02_dokodemodoor_inbounds_${port}.json" \
+        "${configPath}02_dokodemodoor_inbounds_${port}_default.json" \
+        "${configPath}02_dokodemodoor_inbounds_hysteria_${port}.json"
+}
+
+writeCorePortFiles() {
+    local port=$1 isDefault=$2 settingsPort=${customPort:-443} fileName
+    fileName="${configPath}02_dokodemodoor_inbounds_${port}.json"
+    [[ "${isDefault}" == "true" ]] && fileName="${configPath}02_dokodemodoor_inbounds_${port}_default.json"
+
+    jq -n --argjson port "${port}" --argjson target "${settingsPort}" '{inbounds:[{
+        listen:"0.0.0.0", port:$port, protocol:"dokodemo-door",
+        settings:{address:"127.0.0.1", port:$target, network:"tcp", followRedirect:false},
+        tag:("dokodemo-door-newPort-" + ($port | tostring))
+    }]}' >"${fileName}" || return 1
+
+    if [[ -n "${hysteria2Port}" ]]; then
+        jq -n --argjson port "${port}" --argjson target "${hysteria2Port}" '{inbounds:[{
+            listen:"0.0.0.0", port:$port, protocol:"dokodemo-door",
+            settings:{address:"127.0.0.1", port:$target, network:"udp", followRedirect:false},
+            tag:("dokodemo-door-newPort-hysteria-" + ($port | tostring))
+        }]}' >"${configPath}02_dokodemodoor_inbounds_hysteria_${port}.json" || return 1
+    fi
+}
+
+# Add the given ports; with a default port, move the _default marker to it.
+applyCorePorts() {
+    local defaultPort=$1 port existing file
+    shift
+    if [[ -n "${defaultPort}" ]]; then
+        # Demote the previous default port instead of deleting it.
+        for file in "${configPath}"02_dokodemodoor_inbounds_*_default.json; do
+            [[ -f "${file}" ]] && mv "${file}" "${file%_default.json}.json"
+        done
+    fi
+    for port in "$@"; do
+        removeCorePortFiles "${port}"
+        writeCorePortFiles "${port}" "$([[ "${port}" == "${defaultPort}" ]] && echo true || echo false)" || return 1
+    done
+}
+
+# Parse "2053,2083 ,2087" into a validated, de-duplicated list in corePortList.
+# Empty items (e.g. a trailing comma) are ignored; any invalid item fails.
+parseCorePortList() {
+    local input=${1//，/,} item
+    local -a items=()
+    corePortList=()
+    IFS=',' read -r -a items <<<"${input}"
+    for item in "${items[@]}"; do
+        item=${item//[[:space:]]/}
+        [[ -z "${item}" ]] && continue
+        if ! isValidPort "${item}"; then
+            echoContent red " ---> 端口无效: ${item}（需为 1-65535 的数字）"
+            return 1
+        fi
+        [[ " ${corePortList[*]:-} " == *" ${item} "* ]] || corePortList+=("${item}")
+    done
+    ((${#corePortList[@]} > 0)) || {
+        echoContent red " ---> 未输入任何端口"
+        return 1
+    }
+}
+
+# Add a new port
 addCorePort() {
     echoContent skyBlue "\n功能 1/${totalProgress} : 添加新端口"
     echoContent red "\n=============================================================="
@@ -212,112 +294,51 @@ addCorePort() {
     echoContent yellow "2.添加端口"
     echoContent yellow "3.删除端口"
     echoContent red "=============================================================="
+    local selectNewPortType newPort defaultPort portIndex selected port
     read -r -p "请选择:" selectNewPortType
-    if [[ "${selectNewPortType}" == "1" ]]; then
-        find ${configPath} -name "*dokodemodoor*" | grep -v "hysteria" | awk -F "[c][o][n][f][/]" '{print $2}' | awk -F "[_]" '{print $4}' | awk -F "[.]" '{print ""NR""":"$1}'
-        exit 0
-    elif [[ "${selectNewPortType}" == "2" ]]; then
-        read -r -p "请输入端口号:" newPort
-        read -r -p "请输入默认的端口号，同时会更改订阅端口以及节点端口，[回车]默认443:" defaultPort
-
-        if [[ -n "${defaultPort}" ]]; then
-            while IFS= read -r -d "" target; do rm -rf -- "${target}"; done < <(find "${configPath}" -maxdepth 1 -type f -name "*default*" -print0)
-        fi
-
-        if [[ -n "${newPort}" ]]; then
-
-            while read -r port; do
-                while IFS= read -r -d "" target; do rm -rf -- "${target}"; done < <(find "${configPath}" -maxdepth 1 -type f -name "*${port}*" -print0)
-
-                local fileName=
-                local hysteriaFileName=
-                if [[ -n "${defaultPort}" && "${port}" == "${defaultPort}" ]]; then
-                    fileName="${configPath}02_dokodemodoor_inbounds_${port}_default.json"
-                else
-                    fileName="${configPath}02_dokodemodoor_inbounds_${port}.json"
-                fi
-
-                if [[ -n ${hysteria2Port} ]]; then
-                    hysteriaFileName="${configPath}02_dokodemodoor_inbounds_hysteria_${port}.json"
-                fi
-
-                # 开放端口
-                allowPort "${port}"
-                allowPort "${port}" "udp"
-
-                local settingsPort=443
-                if [[ -n "${customPort}" ]]; then
-                    settingsPort=${customPort}
-                fi
-
-                if [[ -n ${hysteriaFileName} ]]; then
-                    cat <<EOF >"${hysteriaFileName}"
-{
-  "inbounds": [
-	{
-	  "listen": "0.0.0.0",
-	  "port": ${port},
-	  "protocol": "dokodemo-door",
-	  "settings": {
-		"address": "127.0.0.1",
-		"port": ${hysteria2Port},
-		"network": "udp",
-		"followRedirect": false
-	  },
-	  "tag": "dokodemo-door-newPort-hysteria-${port}"
-	}
-  ]
-}
-EOF
-                fi
-                cat <<EOF >"${fileName}"
-{
-  "inbounds": [
-	{
-	  "listen": "0.0.0.0",
-	  "port": ${port},
-	  "protocol": "dokodemo-door",
-	  "settings": {
-		"address": "127.0.0.1",
-		"port": ${settingsPort},
-		"network": "tcp",
-		"followRedirect": false
-	  },
-	  "tag": "dokodemo-door-newPort-${port}"
-	}
-  ]
-}
-EOF
-            done < <(echo "${newPort}" | tr ',' '\n')
-
-            echoContent green " ---> 添加完毕"
-            restartXray || return 1
-            addCorePort
-        fi
-    elif [[ "${selectNewPortType}" == "3" ]]; then
-        find ${configPath} -name "*dokodemodoor*" | grep -v "hysteria" | awk -F "[c][o][n][f][/]" '{print $2}' | awk -F "[_]" '{print $4}' | awk -F "[.]" '{print ""NR""":"$1}'
-        read -r -p "请输入要删除的端口编号:" portIndex
-        local dokoConfig
-        dokoConfig=$(find ${configPath} -name "*dokodemodoor*" | grep -v "hysteria" | awk -F "[c][o][n][f][/]" '{print $2}' | awk -F "[_]" '{print $4}' | awk -F "[.]" '{print ""NR""":"$1}' | grep "${portIndex}:")
-        if [[ -n "${dokoConfig}" ]]; then
-            rm "${configPath}02_dokodemodoor_inbounds_$(echo "${dokoConfig}" | awk -F "[:]" '{print $2}').json"
-            local hysteriaDokodemodoorFilePath=
-
-            hysteriaDokodemodoorFilePath="${configPath}02_dokodemodoor_inbounds_hysteria_$(echo "${dokoConfig}" | awk -F "[:]" '{print $2}').json"
-            if [[ -f "${hysteriaDokodemodoorFilePath}" ]]; then
-                rm "${hysteriaDokodemodoorFilePath}"
+    case "${selectNewPortType}" in
+        1)
+            listCorePorts | awk '{print NR ":" $1}'
+            ;;
+        2)
+            read -r -p "请输入端口号:" newPort
+            parseCorePortList "${newPort}" || return 1
+            read -r -p "请输入默认的端口号，同时会更改订阅端口以及节点端口，[回车]默认443:" defaultPort
+            defaultPort=${defaultPort//[[:space:]]/}
+            if [[ -n "${defaultPort}" && " ${corePortList[*]} " != *" ${defaultPort} "* ]]; then
+                echoContent red " ---> 默认端口必须是本次输入的端口之一"
+                return 1
             fi
 
+            for port in "${corePortList[@]}"; do
+                allowPort "${port}"
+                allowPort "${port}" "udp"
+            done
+            applyXrayConfigChange "添加端口" applyCorePorts "${defaultPort}" "${corePortList[@]}" || return 1
+            echoContent green " ---> 添加完毕"
             restartXray || return 1
-            addCorePort
-        else
-            echoContent yellow "\n ---> 编号输入错误，请重新选择"
-            addCorePort
-        fi
-    fi
+            ;;
+        3)
+            listCorePorts | awk '{print NR ":" $1}'
+            read -r -p "请输入要删除的端口编号:" portIndex
+            if [[ "${portIndex}" =~ ^[1-9][0-9]*$ ]]; then
+                selected=$(listCorePorts | awk -v n="${portIndex}" 'NR == n {print $1}')
+            fi
+            if [[ -z "${selected}" ]]; then
+                echoContent yellow "\n ---> 编号输入错误，请重新选择"
+                return 1
+            fi
+            applyXrayConfigChange "删除端口" removeCorePortFiles "${selected}" || return 1
+            echoContent green " ---> 端口 ${selected} 已删除"
+            restartXray || return 1
+            ;;
+        *)
+            echoContent red " ---> 选择错误"
+            ;;
+    esac
 }
 
-# 卸载脚本
+# Uninstall the script
 unInstall() {
     read -r -p "是否确认卸载安装内容？[y/n]:" unInstallStatus
     if [[ "${unInstallStatus}" != "y" ]]; then
@@ -337,6 +358,8 @@ unInstall() {
         echoContent green " ---> 删除Xray开机自启完成"
     fi
 
+    removeAllPanelXhttpLocations
+    disablePortHopping
     rm -rf /opt/xray-agent
     rm -rf ${nginxConfigPath}xray-agent.conf
     rm -rf ${nginxConfigPath}checkPortOpen.conf >/dev/null 2>&1
@@ -356,7 +379,7 @@ unInstall() {
     echoContent green " ---> 卸载脚本完成"
 }
 
-# 自定义uuid
+# Custom UUID
 customUUID() {
     read -r -p "请输入合法的UUID，[回车]随机UUID:" currentCustomUUID
     echo
@@ -385,7 +408,7 @@ customUUID() {
     fi
 }
 
-# 自定义账号标签。Xray 内部会按协议追加 email 后缀，订阅中也用它标识节点。
+# Custom account tag. Xray appends an email suffix per protocol internally, and subscriptions also use it to identify nodes.
 customUserEmail() {
     read -r -p "请输入账号标签(tag)，例如 vision_jp_us，[回车]使用 UUID 前缀:" currentCustomEmail
     echo
@@ -419,8 +442,8 @@ customUserEmail() {
     fi
 }
 
-# 扫描实际入站配置，只返回当前已安装且支持账号写入的协议。
-# 协议识别来自 JSON 内容；clientType 仅作为各协议账号结构的适配器。
+# Scan the actual inbound config and return only the protocols that are installed and support account writes.
+# Protocols are identified from the JSON content; clientType is only an adapter for each protocol's account structure.
 discoverAccountProtocols() {
     accountProtocolFiles=()
     accountProtocolKinds=()
@@ -441,28 +464,38 @@ discoverAccountProtocols() {
         label=
 
         case "${protocol}:${network}:${security}" in
-        vless:tcp:tls)
-            kind=vless
-            clientType=0
-            label="VLESS + TCP + TLS Vision"
-            ;;
-        vless:ws:*)
-            kind=vless
-            clientType=1
-            label="VLESS + WebSocket + TLS"
-            ;;
-        vless:tcp:reality)
-            kind=vless
-            clientType=3
-            label="VLESS + Reality + Vision"
-            ;;
-        hysteria:hysteria:tls)
-            [[ "${version}" == "2" ]] || continue
-            kind=hysteria2
-            clientType=-
-            label="Hysteria2"
-            ;;
-        *) continue ;;
+            vless:tcp:tls)
+                kind=vless
+                clientType=0
+                label="VLESS + TCP + TLS Vision"
+                ;;
+            vless:ws:*)
+                kind=vless
+                clientType=1
+                label="VLESS + WebSocket + TLS"
+                ;;
+            vless:tcp:reality)
+                kind=vless
+                clientType=3
+                label="VLESS + Reality + Vision"
+                ;;
+            vless:xhttp:reality)
+                kind=vless
+                clientType=12
+                label="VLESS + XHTTP + Reality"
+                ;;
+            vless:xhttp:*)
+                kind=vless
+                clientType=14
+                label="VLESS + XHTTP + TLS"
+                ;;
+            hysteria:hysteria:tls)
+                [[ "${version}" == "2" ]] || continue
+                kind=hysteria2
+                clientType=-
+                label="Hysteria2"
+                ;;
+            *) continue ;;
         esac
 
         accountProtocolFiles+=("${inboundConfig}")
@@ -472,7 +505,7 @@ discoverAccountProtocols() {
     done < <(find "${configPath}" -maxdepth 1 -type f -name '*inbounds.json' -print 2>/dev/null | sort)
 }
 
-# 选择新 UUID 要加入的实际已安装协议，回车默认加入全部协议。
+# Choose which installed protocols the new UUID is added to; press Enter to add it to all of them.
 selectUserProtocols() {
     discoverAccountProtocols
     if ((${#accountProtocolFiles[@]} == 0)); then
@@ -533,12 +566,11 @@ appendHysteria2User() {
     local inboundConfig=$1 userUUID=$2 userTag=$3
     local temporaryConfig
     temporaryConfig=$(mktemp "${inboundConfig}.tmp.XXXXXX") || return 1
+    # Always write "clients" (see normalizeHysteria2UserField).
     if jq --arg auth "${userUUID}" --arg email "${userTag}-Hysteria2" '
-        if .inbounds[0].settings.clients != null then
-            .inbounds[0].settings.clients += [{auth: $auth, level: 0, email: $email}]
-        else
-            .inbounds[0].settings.users = ((.inbounds[0].settings.users // []) + [{auth: $auth, level: 0, email: $email}])
-        end
+        .inbounds[0].settings |= (
+            .clients = ((.clients // .users // []) + [{auth: $auth, level: 0, email: $email}]) | del(.users)
+        )
     ' "${inboundConfig}" >"${temporaryConfig}"; then
         chmod --reference="${inboundConfig}" "${temporaryConfig}" 2>/dev/null || chmod 600 "${temporaryConfig}"
         mv -f "${temporaryConfig}" "${inboundConfig}"
@@ -587,7 +619,7 @@ listAccounts() {
     ' <<<"${discoveredAccounts}"
 }
 
-# 添加用户
+# Add a user
 addUser() {
     read -r -p "请输入要添加的账号数量:" userNum
     echo
@@ -610,12 +642,12 @@ addUser() {
         local selectedIndex
         for selectedIndex in "${userSelectedProtocolIndexes[@]}"; do
             case "${accountProtocolKinds[selectedIndex]}" in
-            vless)
-                appendVlessUser "${accountProtocolFiles[selectedIndex]}" "${accountProtocolClientTypes[selectedIndex]}" "${uuid}" "${email}" || return 1
-                ;;
-            hysteria2)
-                appendHysteria2User "${accountProtocolFiles[selectedIndex]}" "${uuid}" "${email}" || return 1
-                ;;
+                vless)
+                    appendVlessUser "${accountProtocolFiles[selectedIndex]}" "${accountProtocolClientTypes[selectedIndex]}" "${uuid}" "${email}" || return 1
+                    ;;
+                hysteria2)
+                    appendHysteria2User "${accountProtocolFiles[selectedIndex]}" "${uuid}" "${email}" || return 1
+                    ;;
             esac
         done
 
@@ -625,9 +657,10 @@ addUser() {
     echoContent green " ---> 添加完成"
     echoContent yellow " ---> 如需更新客户端订阅，请前往独立的订阅管理"
 }
-# 移除用户
+# Remove a user
 removeUser() {
-    local candidateConfig userCount delUserIndex userId temporaryConfig index
+    local candidateConfig userCount delUserIndex userId temporaryConfig index email
+    local -a removedEmails=()
     collectAccounts
     userCount=$(jq 'length' <<<"${discoveredAccounts}")
     if ((userCount == 0)); then
@@ -659,6 +692,13 @@ removeUser() {
             continue
         fi
 
+        while IFS= read -r email; do
+            [[ -n "${email}" ]] && removedEmails+=("${email}")
+        done < <(jq -r --arg userId "${userId}" '
+            (.inbounds[]?.settings.clients[]?, .inbounds[]?.settings.users[]?, .inbounds[]?.users[]?) |
+            select((.id // .uuid // .auth // .password // "") == $userId) | .email // empty
+        ' "${candidateConfig}")
+
         temporaryConfig=$(mktemp "${candidateConfig}.tmp.XXXXXX") || return 1
         if jq --arg userId "${userId}" '
             (.inbounds[]? | select(.settings.clients? != null).settings.clients) |= map(select((.id // .uuid // .auth // .password // "") != $userId)) |
@@ -674,11 +714,16 @@ removeUser() {
         fi
     done
 
+    # Drop relay bindings for the deleted account, so a future account with
+    # the same tag does not silently inherit them.
+    if ((${#removedEmails[@]} > 0)); then
+        withRelayLock removeRelayUsers "${removedEmails[@]}" || return 1
+    fi
     restartXray || return 1
     echoContent green " ---> 删除完成"
     echoContent yellow " ---> 如需更新客户端订阅，请前往独立的订阅管理"
 }
-# 更新脚本
+# Update the script
 updateXrayAgent() {
     echoContent skyBlue "\n进度  $1/${totalProgress} : 更新脚本"
     local scriptUrl="https://raw.githubusercontent.com/z9wen/personal-infra-toolkit/main/networking/xray-install.sh"
@@ -692,7 +737,7 @@ updateXrayAgent() {
     }
 
     echoContent yellow " ---> 正在从 GitHub 获取最新脚本..."
-    if ! downloadFile "${scriptUrl}" "${temporaryScript}"; then
+    if ! downloadFile "${scriptUrl}" "${temporaryScript}" --https-only; then
         rm -f "${temporaryScript}"
         echoContent red " ---> 下载失败，当前脚本未变更"
         return 1
@@ -721,23 +766,7 @@ updateXrayAgent() {
     exec /bin/bash "${targetScript}"
 }
 
-# 防火墙
-handleFirewall() {
-    if systemctl status ufw 2>/dev/null | grep -q "active (exited)" && [[ "$1" == "stop" ]]; then
-        systemctl stop ufw >/dev/null 2>&1
-        systemctl disable ufw >/dev/null 2>&1
-        echoContent green " ---> ufw关闭成功"
-
-    fi
-
-    if systemctl status firewalld 2>/dev/null | grep -q "active (running)" && [[ "$1" == "stop" ]]; then
-        systemctl stop firewalld >/dev/null 2>&1
-        systemctl disable firewalld >/dev/null 2>&1
-        echoContent green " ---> firewalld关闭成功"
-    fi
-}
-
-# 查看、检查日志
+# View and check logs
 checkLog() {
     if [[ -z "${configPath}" && -z "${realityStatus}" ]]; then
         echoContent red " ---> 没有检测到安装目录，请执行脚本安装内容"
@@ -770,10 +799,10 @@ checkLog() {
     local configPathLog=${configPath//conf\//}
 
     case ${selectAccessLogType} in
-    1)
-        if [[ "${logStatus}" == "false" ]]; then
-            realityLogShow=true
-            cat <<EOF >${configPath}00_log.json
+        1)
+            if [[ "${logStatus}" == "false" ]]; then
+                realityLogShow=true
+                cat <<EOF >${configPath}00_log.json
 {
   "log": {
   	"access":"${configPathLog}access.log",
@@ -782,9 +811,9 @@ checkLog() {
   }
 }
 EOF
-        elif [[ "${logStatus}" == "true" ]]; then
-            realityLogShow=false
-            cat <<EOF >${configPath}00_log.json
+            elif [[ "${logStatus}" == "true" ]]; then
+                realityLogShow=false
+                cat <<EOF >${configPath}00_log.json
 {
   "log": {
     "error": "${configPathLog}error.log",
@@ -792,60 +821,60 @@ EOF
   }
 }
 EOF
-        fi
+            fi
 
-        if [[ -n ${realityStatus} ]]; then
-            local vlessVisionRealityInbounds
-            vlessVisionRealityInbounds=$(jq -r ".inbounds[0].streamSettings.realitySettings.show=${realityLogShow}" ${configPath}07_VLESS_vision_reality_inbounds.json)
-            echo "${vlessVisionRealityInbounds}" | jq . >${configPath}07_VLESS_vision_reality_inbounds.json
-        fi
-        restartXray || return 1
-        checkLog 1
-        ;;
-    2)
-        tail -f ${configPathLog}access.log
-        ;;
-    3)
-        tail -f ${configPathLog}error.log
-        ;;
-    4)
-        if [[ ! -f "/opt/xray-agent/crontab_tls.log" ]]; then
-            touch /opt/xray-agent/crontab_tls.log
-        fi
-        tail -n 100 /opt/xray-agent/crontab_tls.log
-        ;;
-    5)
-        tail -n 100 /opt/xray-agent/tls/acme.log
-        ;;
-    6)
-        echo >${configPathLog}access.log
-        echo >${configPathLog}error.log
-        ;;
+            if [[ -n ${realityStatus} ]]; then
+                local vlessVisionRealityInbounds
+                vlessVisionRealityInbounds=$(jq -r ".inbounds[0].streamSettings.realitySettings.show=${realityLogShow}" ${configPath}07_VLESS_vision_reality_inbounds.json)
+                echo "${vlessVisionRealityInbounds}" | jq . >${configPath}07_VLESS_vision_reality_inbounds.json
+            fi
+            restartXray || return 1
+            checkLog 1
+            ;;
+        2)
+            tail -f ${configPathLog}access.log
+            ;;
+        3)
+            tail -f ${configPathLog}error.log
+            ;;
+        4)
+            if [[ ! -f "/opt/xray-agent/crontab_tls.log" ]]; then
+                touch /opt/xray-agent/crontab_tls.log
+            fi
+            tail -n 100 /opt/xray-agent/crontab_tls.log
+            ;;
+        5)
+            tail -n 100 /opt/xray-agent/tls/acme.log
+            ;;
+        6)
+            echo >${configPathLog}access.log
+            echo >${configPathLog}error.log
+            ;;
     esac
 }
 
-# 脚本快捷方式
+# Script shortcut
 aliasInstall() {
-    # 获取当前脚本的实际路径
+    # Get the actual path of the current script
     local currentScript
     currentScript="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
-    
-    # 确保目标目录存在
+
+    # Make sure the target directory exists
     if [[ ! -d "/opt/xray-agent" ]]; then
         mkdir -p /opt/xray-agent
     fi
-    
-    # 只在首次安装或文件不存在时复制
+
+    # Copy only on first install or when the file does not exist
     local targetScript="/opt/xray-agent/install.sh"
     local needCopy=false
-    
+
     if [[ ! -f "$targetScript" ]]; then
         needCopy=true
     elif [[ "$currentScript" != "$targetScript" ]]; then
-        # 如果当前脚本不是目标位置，则需要复制（更新场景）
+        # If the current script is not at the target location, copy it (update scenario)
         needCopy=true
     fi
-    
+
     if [[ "$needCopy" == "true" && -f "$currentScript" ]]; then
         cp "$currentScript" "$targetScript"
         chmod +x "$targetScript"
@@ -855,33 +884,33 @@ aliasInstall() {
         return 1
     fi
 
-    # 检查并创建软连接
+    # Check for and create the symlink
     local xrayaType=false
     local symlinkPath=""
-    
+
     if [[ -d "/usr/bin/" ]]; then
         symlinkPath="/usr/bin/xraya"
     elif [[ -d "/usr/sbin" ]]; then
         symlinkPath="/usr/sbin/xraya"
     fi
-    
+
     if [[ -n "$symlinkPath" ]]; then
-        # 检查软连接是否已存在且正确
+        # Check whether the symlink already exists and is correct
         if [[ -L "$symlinkPath" ]] && [[ "$(readlink "$symlinkPath")" == "$targetScript" ]]; then
-            # 软连接已存在且正确，无需重新创建
+            # The symlink already exists and is correct; no need to recreate it
             xrayaType=true
         else
-            # 删除旧的软连接或文件
+            # Remove the old symlink or file
             rm -f "$symlinkPath"
-            
-            # 创建新的软连接
+
+            # Create a new symlink
             ln -s "$targetScript" "$symlinkPath"
             chmod 755 "$symlinkPath"
             xrayaType=true
             echoContent green " ---> 快捷方式创建成功，可执行[xraya]重新打开脚本"
         fi
     fi
-    
+
     if [[ "${xrayaType}" == "false" ]]; then
         echoContent red " ---> 快捷方式创建失败"
     fi

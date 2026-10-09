@@ -1,6 +1,6 @@
-# ==================== 分流工具 ====================
+# ==================== Routing tools ====================
 
-# 分流工具
+# Routing tools
 routingToolsMenu() {
     echoContent skyBlue "\n功能 1/${totalProgress} : 分流工具"
     echoContent red "\n=============================================================="
@@ -17,28 +17,28 @@ routingToolsMenu() {
     read -r -p "请选择:" selectType
 
     case ${selectType} in
-    1)
-        warpRoutingReg 1 IPv4
-        ;;
-    2)
-        warpRoutingReg 1 IPv6
-        ;;
-    3)
-        ipv6Routing 1
-        ;;
-    4)
-        socks5Routing
-        ;;
-    5)
-        dnsRouting 1
-        ;;
-    6)
-        sniRouting 1
-        ;;
+        1)
+            warpRoutingReg 1 IPv4
+            ;;
+        2)
+            warpRoutingReg 1 IPv6
+            ;;
+        3)
+            ipv6Routing 1
+            ;;
+        4)
+            socks5Routing
+            ;;
+        5)
+            dnsRouting 1
+            ;;
+        6)
+            sniRouting 1
+            ;;
     esac
 
 }
-# SNI反向代理分流
+# SNI reverse proxy split routing
 sniRouting() {
 
     if [[ -z "${configPath}" ]]; then
@@ -55,15 +55,15 @@ sniRouting() {
     read -r -p "请选择:" selectType
 
     case ${selectType} in
-    1)
-        setUnlockSNI
-        ;;
-    2)
-        removeUnlockSNI
-        ;;
+        1)
+            setUnlockSNI
+            ;;
+        2)
+            removeUnlockSNI
+            ;;
     esac
 }
-# 设置SNI分流
+# Set up SNI split routing
 setUnlockSNI() {
     read -r -p "请输入分流的SNI IP:" setSNIP
     if [[ -n ${setSNIP} ]]; then
@@ -100,87 +100,7 @@ EOF
     exit 0
 }
 
-# 添加xray dns 配置
-addXrayDNSConfig() {
-    local ip=$1
-    local domainList=$2
-    local domains=[]
-    while read -r line; do
-        local geositeStatus
-        geositeStatus=$(curl -s "https://api.github.com/repos/v2fly/domain-list-community/contents/data/${line}" | jq .message)
-
-        if [[ "${geositeStatus}" == "null" ]]; then
-            domains=$(echo "${domains}" | jq -r '. += ["geosite:'"${line}"'"]')
-        else
-            domains=$(echo "${domains}" | jq -r '. += ["domain:'"${line}"'"]')
-        fi
-    done < <(echo "${domainList}" | tr ',' '\n')
-
-    if [[ "${coreInstallType}" == "1" ]]; then
-
-        cat <<EOF >${configPath}11_dns.json
-{
-    "dns": {
-        "servers": [
-            {
-                "address": "${ip}",
-                "port": 53,
-                "domains": ${domains}
-            },
-        "localhost"
-        ]
-    }
-}
-EOF
-    fi
-}
-
-setUnlockDNS() {
-    read -r -p "请输入分流的DNS:" setDNS
-    if [[ -n ${setDNS} ]]; then
-        echoContent red "=============================================================="
-        echoContent yellow "录入示例:netflix,disney,hulu"
-        read -r -p "请按照上面示例录入域名:" domainList
-
-        if [[ "${coreInstallType}" == "1" ]]; then
-            addXrayDNSConfig "${setDNS}" "${domainList}"
-        fi
-
-
-        restartXray || return 1
-
-        echoContent yellow "\n ---> 如还无法观看可以尝试以下两种方案"
-        echoContent yellow " 1.重启vps"
-        echoContent yellow " 2.卸载dns解锁后，修改本地的[/etc/resolv.conf]DNS设置并重启vps\n"
-    else
-        echoContent red " ---> dns不可为空"
-    fi
-    exit 0
-}
-
-# 移除 DNS分流
-removeUnlockDNS() {
-    if [[ "${coreInstallType}" == "1" && -f "${configPath}11_dns.json" ]]; then
-        cat <<EOF >${configPath}11_dns.json
-{
-	"dns": {
-		"servers": [
-			"localhost"
-		]
-	}
-}
-EOF
-    fi
-
-
-    restartXray || return 1
-
-    echoContent green " ---> 卸载成功"
-
-    exit 0
-}
-
-# 移除SNI分流
+# Remove SNI split routing
 removeUnlockSNI() {
     cat <<EOF >${configPath}11_dns.json
 {

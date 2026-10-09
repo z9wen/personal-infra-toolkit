@@ -1,12 +1,38 @@
-# 初始化realityKey
+# Read a key from `xray x25519` output. The public key line changed from
+# "Password: <key>" to "Password (PublicKey): <key>" in Xray 26.x, so take
+# whatever follows ": " instead of the second whitespace field.
+# Usage: parseX25519Field <output> private|public
+parseX25519Field() {
+    local pattern='^(PrivateKey|Private key)'
+    [[ "$2" == "public" ]] && pattern='^(Password|Public key)'
+    awk -F': ' -v pattern="${pattern}" '$0 ~ pattern {print $2; exit}' <<<"$1"
+}
+
+isValidRealityKey() {
+    [[ "$1" =~ ^[A-Za-z0-9_-]{43}$ ]]
+}
+
+# Installs made with Xray 26.x before the parsing fix stored the literal
+# "(PublicKey):" as the public key. The server only needs the private key,
+# so recover the public key from it.
+repairRealityPublicKey() {
+    isValidRealityKey "${currentRealityPublicKey}" && return 0
+    isValidRealityKey "${currentRealityPrivateKey}" || return 0
+    [[ -x "${xrayBinary}" ]] || return 0
+    local derived
+    derived=$(parseX25519Field "$("${xrayBinary}" x25519 -i "${currentRealityPrivateKey}")" public)
+    isValidRealityKey "${derived}" && currentRealityPublicKey=${derived}
+}
+
+# Initialize the Reality key
 initRealityKey() {
     echoContent skyBlue "\n================ 生成 Reality 密钥对 ===============\n"
     echoContent yellow "📌 Reality 密钥说明："
     echoContent white "   • Private Key (私钥): 服务器端使用，必须保密"
     echoContent white "   • Public Key (公钥):  客户端使用，可以公开"
     echoContent white "   • 基于 X25519 椭圆曲线算法\n"
-    
-    # 总是询问是否使用上次密钥对，不管lastInstallationConfig的值
+
+    # Always ask whether to reuse the previous key pair, regardless of lastInstallationConfig
     if [[ -n "${currentRealityPublicKey}" ]]; then
         echoContent yellow "检测到上次安装的密钥对"
         echoContent green "Public Key:  ${currentRealityPublicKey}"
@@ -28,8 +54,8 @@ initRealityKey() {
             echoContent green "正在生成密钥对...\n"
             realityX25519Key=$(/opt/xray-agent/xray/xray x25519)
         fi
-        realityPrivateKey=$(echo "${realityX25519Key}" | grep "PrivateKey" | awk '{print $2}')
-        realityPublicKey=$(echo "${realityX25519Key}" | grep "Password" | awk '{print $2}')
+        realityPrivateKey=$(parseX25519Field "${realityX25519Key}" private)
+        realityPublicKey=$(parseX25519Field "${realityX25519Key}" public)
         if [[ -z "${realityPrivateKey}" ]]; then
             echoContent red "❌ 输入的 Private Key 不合法"
             initRealityKey
@@ -40,7 +66,7 @@ initRealityKey() {
         fi
     fi
 }
-# 初始化 mldsa65Seed
+# Initialize mldsa65Seed
 initRealityMldsa65() {
     echoContent skyBlue "\n生成Reality mldsa65\n"
     if /opt/xray-agent/xray/xray tls ping "${realityServerName}:${realityDomainPort}" 2>/dev/null | grep -q "X25519MLKEM768"; then
@@ -61,10 +87,7 @@ initRealityMldsa65() {
                 realityMldsa65=$(/opt/xray-agent/xray/xray mldsa65)
                 realityMldsa65Seed=$(echo "${realityMldsa65}" | head -1 | awk '{print $2}')
                 realityMldsa65Verify=$(echo "${realityMldsa65}" | tail -n 1 | awk '{print $2}')
-                #        fi
             fi
-            #    echoContent green "\n Seed:${realityMldsa65Seed}"
-            #    echoContent green "\n Verify:${realityMldsa65Verify}"
         else
             echoContent green " 目标域名支持X25519MLKEM768，但是证书的长度不足，忽略ML-DSA-65。"
         fi
@@ -72,24 +95,11 @@ initRealityMldsa65() {
         echoContent green " 目标域名不支持X25519MLKEM768，忽略ML-DSA-65。"
     fi
 }
-# 检查reality域名是否符合
-checkRealityDest() {
-    local traceResult=
-    traceResult=$(curl -s "https://$(echo "${realityDestDomain}" | cut -d ':' -f 1)/cdn-cgi/trace" | grep "visit_scheme=https")
-    if [[ -n "${traceResult}" ]]; then
-        echoContent red "\n ---> 检测到使用的域名，托管在cloudflare并开启了代理，使用此类型域名可能导致VPS流量被其他人使用[不建议使用]\n"
-        read -r -p "是否继续 ？[y/n]" setRealityDestStatus
-        if [[ "${setRealityDestStatus}" != 'y' ]]; then
-            exit 0
-        fi
-        echoContent yellow "\n ---> 忽略风险，继续使用"
-    fi
-}
 
-# 初始化客户端可用的ServersName
+# Initialize the client-usable serverNames
 initRealityClientServersName() {
     local realityDestDomainList="gateway.icloud.com,itunes.apple.com,swdist.apple.com,swcdn.apple.com,updates.cdn-apple.com,mensura.cdn-apple.com,osxapps.itunes.apple.com,aod.itunes.apple.com,download-installer.cdn.mozilla.net,addons.mozilla.org,s0.awsstatic.com,d1.awsstatic.com,images-na.ssl-images-amazon.com,m.media-amazon.com,player.live-video.net,one-piece.com,lol.secure.dyn.riotcdn.net,www.swift.com,academy.nvidia.com,www.cisco.com,www.asus.com,www.samsung.com,www.amd.com,cdn-dynmedia-1.microsoft.com,software.download.prss.microsoft.com,dl.google.com,www.google-analytics.com"
-    # 总是询问是否使用上次域名，不管lastInstallationConfig的值
+    # Always ask whether to reuse the previous domain, regardless of lastInstallationConfig
     if [[ -n "${realityServerName}" ]]; then
         if echo ${realityDestDomainList} | grep -q "${realityServerName}"; then
             read -r -p "读取到上次安装设置的Reality域名，是否使用？[y/n]:" realityServerNameStatus
@@ -125,25 +135,25 @@ initRealityClientServersName() {
             echoContent yellow "📌 Reality 工作原理："
             echoContent white "   客户端访问 → 假装访问目标网站 → 实际连接你的代理服务器"
             echoContent white "   如果被检测，流量看起来像在访问正常的 HTTPS 网站\n"
-            
+
             echoContent yellow "💡 推荐的伪装目标（可直接使用）："
             echoContent green "   • addons.mozilla.org        (Mozilla 插件商店)"
             echoContent green "   • gateway.icloud.com        (Apple iCloud)"
             echoContent green "   • download-installer.cdn.mozilla.net"
             echoContent green "   • www.cisco.com             (思科官网)"
             echoContent green "   • www.samsung.com           (三星官网)\n"
-            
+
             echoContent yellow "⚠️  选择要求："
             echoContent white "   1. 必须支持 TLSv1.3"
             echoContent white "   2. 证书链长度适中（<3500字节）"
             echoContent white "   3. 最好是知名网站（不易被墙）"
             echoContent white "   4. 默认端口 443，可自定义其他端口\n"
-            
+
             echoContent yellow "📝 输入格式："
             echoContent white "   • 仅域名:     addons.mozilla.org       (使用 443 端口)"
             echoContent white "   • 域名+端口:  www.cisco.com:443        (自定义端口)"
             echoContent white "   • 回车:       随机选择推荐域名\n"
-            
+
             read -r -p "请输入目标网站域名[回车随机选择]:" realityServerName
             if [[ -z "${realityServerName}" ]]; then
                 randomNum=$(randomNum 1 27)
@@ -158,9 +168,9 @@ initRealityClientServersName() {
 
     echoContent yellow "\n ---> 客户端可用域名: ${realityServerName}:${realityDomainPort}\n"
 }
-# 初始化reality端口
+# Initialize the Reality port
 initXrayRealityPort() {
-    # 总是询问是否使用上次端口，不管lastInstallationConfig的值
+    # Always ask whether to reuse the previous port, regardless of lastInstallationConfig
     if [[ -n "${xrayVLESSRealityPort}" ]]; then
         read -r -p "读取到上次安装记录，是否使用上次安装时的端口 ？[y/n]:" historyRealityPortStatus
         if [[ "${historyRealityPortStatus}" == "y" ]]; then
@@ -169,29 +179,21 @@ initXrayRealityPort() {
     fi
 
     if [[ -z "${realityPort}" ]]; then
-        #        if [[ -n "${port}" ]]; then
-        #            read -r -p "是否使用TLS+Vision端口 ？[y/n]:" realityPortTLSVisionStatus
-        #            if [[ "${realityPortTLSVisionStatus}" == "y" ]]; then
-        #                realityPort=${port}
-        #            fi
-        #        fi
-        #        if [[ -z "${realityPort}" ]]; then
         echoContent skyBlue "\n================ 配置 Reality 监听端口 ===============\n"
         echoContent yellow "📌 这是你的服务器对外开放的端口"
         echoContent white "   • 客户端连接时使用此端口"
         echoContent white "   • 建议使用非标准端口（避免端口扫描）"
         echoContent white "   • 端口范围：1-65535\n"
-        
+
         echoContent yellow "💡 推荐配置："
-		echoContent green "   • 常用端口：443、8443、2053"
+        echoContent green "   • 常用端口：443、8443、2053"
         echoContent green "   • 随机端口（回车自动生成 10000-30000)"
         echoContent green "   • 自定义端口：如 12345\n"
-        
+
         read -r -p "请输入端口[回车随机10000-30000]:" realityPort
         if [[ -z "${realityPort}" ]]; then
             realityPort=$((RANDOM % 20001 + 10000))
         fi
-        #        fi
         if [[ -n "${realityPort}" && "${xrayVLESSRealityPort}" != "${realityPort}" ]]; then
             checkPort "${realityPort}"
         fi
@@ -204,71 +206,51 @@ initXrayRealityPort() {
     fi
 
 }
-# reality管理
+# Port for VLESS + XHTTP + REALITY. Sets xhttpRealityPort; it must differ
+# from the Vision + REALITY port because both are separate inbounds.
+initXrayXhttpRealityPort() {
+    xhttpRealityPort=
+    if [[ -n "${xrayXhttpRealityPort}" ]]; then
+        local historyStatus
+        read -r -p "读取到上次 XHTTP+Reality 端口 ${xrayXhttpRealityPort}，是否继续使用？[y/n]:" historyStatus
+        [[ "${historyStatus}" == "y" ]] && xhttpRealityPort=${xrayXhttpRealityPort}
+    fi
+    while [[ -z "${xhttpRealityPort}" ]]; do
+        echoContent skyBlue "\n============= 配置 XHTTP+Reality 监听端口 =============\n"
+        read -r -p "请输入端口[回车随机10000-30000]:" xhttpRealityPort
+        xhttpRealityPort=${xhttpRealityPort:-$((RANDOM % 20001 + 10000))}
+        if ! isValidPort "${xhttpRealityPort}"; then
+            echoContent red " ---> 端口无效"
+            xhttpRealityPort=
+        elif [[ -n "${realityPort}" && "${xhttpRealityPort}" == "${realityPort}" ]]; then
+            echoContent red " ---> 不能与 Vision+Reality 使用同一端口"
+            xhttpRealityPort=
+        elif [[ "${xhttpRealityPort}" != "${xrayXhttpRealityPort}" ]]; then
+            checkPort "${xhttpRealityPort}"
+        fi
+    done
+    allowPort "${xhttpRealityPort}"
+    echoContent yellow "\n ---> XHTTP+Reality 端口: ${xhttpRealityPort}"
+}
+
+# Reality management
 manageReality() {
     readInstallProtocolType
     readConfigHostPathUUID
     readCustomPort
 
-    if ! echo "${currentInstallProtocolType}" | grep -q ",3," || [[ -z "${coreInstallType}" ]]; then
+    if [[ -z "${coreInstallType}" ]] \
+        || { ! hasProtocol "${currentInstallProtocolType}" 3 && ! hasProtocol "${currentInstallProtocolType}" 12; }; then
         echoContent red "\n ---> 请先安装Reality协议"
-        exit 0
+        return 1
     fi
 
-    selectCustomInstallType=",3,"
-    initXrayConfig custom 1 true
+    selectCustomInstallType=","
+    hasProtocol "${currentInstallProtocolType}" 3 && selectCustomInstallType+="3,"
+    hasProtocol "${currentInstallProtocolType}" 12 && selectCustomInstallType+="12,"
+    initXrayConfig custom 1 true || return 1
+    syncRelayRouting || return 1
 
     restartXray || return 1
     subscribe false
-}
-
-# 安装reality scanner
-installRealityScanner() {
-    if [[ ! -f "/opt/xray-agent/xray/reality_scan/RealiTLScanner-linux-64" ]]; then
-        version=$(curl -s https://api.github.com/repos/XTLS/RealiTLScanner/releases?per_page=1 | jq -r '.[]|.tag_name')
-        if ! downloadFile "https://github.com/XTLS/RealiTLScanner/releases/download/${version}/RealiTLScanner-linux-64" "/opt/xray-agent/xray/reality_scan/RealiTLScanner-linux-64"; then
-            echoContent red " ---> Reality Scanner 下载失败"
-            return 1
-        fi
-        chmod 755 /opt/xray-agent/xray/reality_scan/RealiTLScanner-linux-64
-    fi
-}
-# reality scanner
-realityScanner() {
-    echoContent skyBlue "\n进度 1/1 : 扫描Reality域名"
-    echoContent red "\n=============================================================="
-    echoContent yellow "# 注意事项"
-    echoContent yellow "扫描完成后，请自行检查扫描网站结果内容是否合规，需个人承担风险"
-    echoContent red "某些IDC不允许扫描操作，比如搬瓦工，其中风险请自行承担\n"
-    echoContent yellow "1.扫描IPv4"
-    echoContent yellow "2.扫描IPv6"
-    echoContent red "=============================================================="
-    read -r -p "请选择:" realityScannerStatus
-    local type=
-    if [[ "${realityScannerStatus}" == "1" ]]; then
-        type=4
-    elif [[ "${realityScannerStatus}" == "2" ]]; then
-        type=6
-    fi
-
-    read -r -p "某些IDC不允许扫描操作，比如搬瓦工，其中风险请自行承担，是否继续？[y/n]:" scanStatus
-
-    if [[ "${scanStatus}" != "y" ]]; then
-        exit 0
-    fi
-
-    publicIP=$(getPublicIP "${type}")
-    echoContent yellow "IP:${publicIP}"
-    if [[ -z "${publicIP}" ]]; then
-        echoContent red " ---> 无法获取IP"
-        exit 0
-    fi
-
-    read -r -p "IP是否正确？[y/n]:" ipStatus
-    if [[ "${ipStatus}" == "y" ]]; then
-        echoContent yellow "结果存储在 /opt/xray-agent/xray/reality_scan/result.log 文件中\n"
-        /opt/xray-agent/xray/reality_scan/RealiTLScanner-linux-64 -addr "${publicIP}" | tee /opt/xray-agent/xray/reality_scan/result.log
-    else
-        echoContent red " ---> 无法读取正确IP"
-    fi
 }

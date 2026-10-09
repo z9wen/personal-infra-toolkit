@@ -1,4 +1,3 @@
-
 initRandomPath() {
     local chars="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     local initCustomPath=
@@ -9,7 +8,7 @@ initRandomPath() {
     customPath=${initCustomPath}
 }
 
-# 自定义/随机路径
+# Custom/random path
 randomPathFunction() {
     if [[ -n $1 ]]; then
         echoContent skyBlue "\n进度  $1/${totalProgress} : 生成随机路径"
@@ -17,7 +16,7 @@ randomPathFunction() {
         echoContent skyBlue "生成随机路径"
     fi
 
-    # 总是询问是否使用上次path，不管lastInstallationConfig的值
+    # Always ask whether to reuse the previous path, regardless of lastInstallationConfig
     if [[ -n "${currentPath}" ]]; then
         echo
         read -r -p "读取到上次安装记录，是否使用上次安装时的path路径 ？[y/n]:" historyPathStatus
@@ -40,25 +39,36 @@ randomPathFunction() {
     echoContent yellow "\n path:${currentPath}"
     echoContent skyBlue "\n----------------------------"
 }
-# 随机数
+# Random number
 randomNum() {
     shuf -i "$1"-"$2" -n 1
 }
 
-# 可靠下载：失败重试、写入临时文件，成功后再替换目标文件。
+# Reliable download: retry on failure, write to a temp file, and replace the target only on success.
+# Download a URL to a file atomically: the destination only appears once the
+# whole body arrived and is non-empty.
+# Usage: downloadFile <url> <destination> [--https-only]
+# --https-only refuses plain HTTP, including on redirects.
 downloadFile() {
-    local url=$1 destination=$2 temporaryFile
+    local url=$1 destination=$2 httpsOnly=${3:-} temporaryFile
+    local -a curlProtocol=() wgetProtocol=()
+    if [[ "${httpsOnly}" == "--https-only" ]]; then
+        [[ "${url}" == https://* ]] || return 1
+        curlProtocol=(--proto '=https' --proto-redir '=https')
+        wgetProtocol=(--https-only)
+    fi
     temporaryFile="${destination}.download.$$"
     mkdir -p "$(dirname "${destination}")"
     rm -f "${temporaryFile}"
 
     if command -v curl >/dev/null 2>&1; then
-        curl --fail --location --silent --show-error --retry 3 --retry-delay 2 --connect-timeout 15 --output "${temporaryFile}" "${url}" || {
+        curl --fail --location --silent --show-error --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 300 \
+            ${curlProtocol[@]+"${curlProtocol[@]}"} --output "${temporaryFile}" "${url}" || {
             rm -f "${temporaryFile}"
             return 1
         }
     elif command -v wget >/dev/null 2>&1; then
-        wget --tries=3 --timeout=30 -q -O "${temporaryFile}" "${url}" || {
+        wget --tries=3 --timeout=30 ${wgetProtocol[@]+"${wgetProtocol[@]}"} -q -O "${temporaryFile}" "${url}" || {
             rm -f "${temporaryFile}"
             return 1
         }
@@ -105,13 +115,6 @@ downloadVerifiedFile() {
     fi
     rm -f "${checksumFile}"
     mv -f "${verifiedFile}" "${destination}"
-}
-
-downloadXrayArchive() {
-    local releaseVersion=$1
-    local archive="/opt/xray-agent/xray/${xrayCoreCPUVendor}.zip"
-    local url="https://github.com/XTLS/Xray-core/releases/download/${releaseVersion}/${xrayCoreCPUVendor}.zip"
-    downloadVerifiedFile "${url}" "${archive}" "${url}.dgst"
 }
 
 downloadGeoData() {
@@ -167,7 +170,7 @@ deployNginxTemplate() {
     fi
     rm -rf "${stagingDir}" "${backupDir}"
 }
-# Nginx伪装博客
+# Nginx masquerade blog
 nginxBlog() {
     if [[ -n "$1" ]]; then
         echoContent skyBlue "\n进度 $1/${totalProgress} : 添加伪装站点"
@@ -196,7 +199,7 @@ nginxBlog() {
 
 }
 
-# 修改http_port_t端口
+# Modify the http_port_t port
 updateSELinuxHTTPPortT() {
 
     $(find /usr/bin /usr/sbin | grep -w journalctl) -xe >/opt/xray-agent/nginx_error.log 2>&1
@@ -219,12 +222,12 @@ updateSELinuxHTTPPortT() {
     fi
 }
 
-# 操作Nginx
+# Manage Nginx
 handleNginx() {
-    # 检测 Nginx 管理方式
+    # Detect how Nginx is managed
     local nginxCtl=""
-    
-    # 优先检测宝塔/1Panel
+
+    # Check for BT Panel/1Panel first
     if [[ -n "${btDomain}" ]] || [[ -n $(pgrep -f "BT-Panel") ]] || [[ -f "/etc/init.d/nginx" ]]; then
         if [[ -f "/etc/init.d/nginx" ]]; then
             nginxCtl="/etc/init.d/nginx"
@@ -232,15 +235,16 @@ handleNginx() {
             nginxCtl="/www/server/nginx/sbin/nginx"
         fi
     fi
-    
-    # 如果不是宝塔，检测 systemd
+
+    # If not BT Panel, check systemd
     if [[ -z "${nginxCtl}" ]] && systemctl list-unit-files | grep -q "nginx.service"; then
         nginxCtl="systemctl"
     fi
-    
-    # 启动 Nginx
-    if [[ "${selectCustomInstallType}" != ",3," ]] && [[ -z $(pgrep -f "nginx") ]] && [[ "$1" == "start" ]]; then
-        # 验证配置语法
+
+    # Start Nginx
+    if { [[ -z "${selectCustomInstallType}" ]] || selectionNeedsTLS "${selectCustomInstallType}"; } \
+        && [[ -z $(pgrep -f "nginx") ]] && [[ "$1" == "start" ]]; then
+        # Validate the config syntax
         local nginxTestResult=
         if [[ "${nginxCtl}" == "/www/server/nginx/sbin/nginx" ]]; then
             nginxTestResult=$(/www/server/nginx/sbin/nginx -t -c /www/server/nginx/conf/nginx.conf 2>&1)
@@ -275,7 +279,7 @@ handleNginx() {
             echoContent green " ---> Nginx启动成功"
         fi
 
-    # 停止 Nginx
+    # Stop Nginx
     elif [[ -n $(pgrep -x nginx) ]] && [[ "$1" == "stop" ]]; then
         if [[ "${nginxCtl}" == "systemctl" ]]; then
             systemctl stop nginx 2>/dev/null
@@ -284,13 +288,13 @@ handleNginx() {
         elif [[ "${nginxCtl}" == "/www/server/nginx/sbin/nginx" ]]; then
             /www/server/nginx/sbin/nginx -s stop 2>/dev/null
         fi
-        
+
         local nginxStopWait=0
         while [[ -n $(pgrep -x nginx) && ${nginxStopWait} -lt 10 ]]; do
             sleep 1
             ((nginxStopWait++)) || true
         done
-        
+
         if [[ -z $(pgrep -x nginx) ]]; then
             echoContent green " ---> Nginx关闭成功"
         elif [[ -z ${btDomain} ]]; then
@@ -302,7 +306,7 @@ handleNginx() {
     fi
 }
 
-# 定时任务更新tls证书
+# Cron job to renew the TLS certificate
 installCronTLS() {
     if [[ -z "${btDomain}" ]]; then
         echoContent skyBlue "\n进度 $1/${totalProgress} : 添加定时维护证书"
@@ -320,7 +324,7 @@ installCronTLS() {
         echoContent green "\n ---> 添加定时维护证书成功"
     fi
 }
-# 定时任务更新geo文件
+# Cron job to update the geo files
 installCronUpdateGeo() {
     if [[ "${coreInstallType}" == "1" ]]; then
         if crontab -l | grep -q "UpdateGeo"; then
@@ -335,7 +339,7 @@ installCronUpdateGeo() {
     fi
 }
 
-# 更新证书
+# Renew the certificate
 renewalTLS() {
 
     if [[ -n $1 ]]; then
@@ -401,8 +405,12 @@ renewalTLS() {
                 renewalDomain="*.${dnsTLSDomain}"
             fi
             sudo "$HOME/.acme.sh/acme.sh" --install-cert -d "${renewalDomain}" --fullchain-file "/opt/xray-agent/tls/${domain}.crt" --key-file "/opt/xray-agent/tls/${domain}.key" --ecc
-            restartXray || return 1
+            # Start nginx regardless of the Xray result so the fallback site,
+            # subscriptions and WS paths are not left down overnight.
+            local restartStatus=0
+            restartXray || restartStatus=$?
             handleNginx start
+            return "${restartStatus}"
         else
             echoContent green " ---> 证书有效"
         fi
@@ -413,13 +421,7 @@ renewalTLS() {
     fi
 }
 
-# 检查wget showProgress
-checkWgetShowProgress() {
-    if find /usr/bin /usr/sbin | grep -q "/wget" && wget --help | grep -q show-progress; then
-        wgetShowProgressStatus="--show-progress"
-    fi
-}
-
+# True when version $1 >= $2 (a leading "v" is ignored).
 xrayVersionAtLeast() {
     local currentVersion=${1#v}
     local requiredVersion=${2#v}
@@ -427,7 +429,7 @@ xrayVersionAtLeast() {
     [[ "$(printf '%s\n%s\n' "${requiredVersion}" "${currentVersion}" | sort -V | head -n 1)" == "${requiredVersion}" ]]
 }
 
-# 安装xray
+# Install xray
 installXray() {
     readInstallType
 
@@ -435,46 +437,30 @@ installXray() {
 
     if [[ ! -f "/opt/xray-agent/xray/xray" ]]; then
 
-        # 首次安装始终使用 GitHub 标记的最新正式版；预览版由安装后的版本管理功能手动切换。
-        version=$(curl -fsSL --retry 3 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | jq -r '.tag_name // empty')
+        # A fresh install uses the latest stable release; pre-releases are
+        # chosen afterwards in version management.
+        version=$(latestStableXray)
         if [[ -z "${version}" ]]; then
             echoContent red " ---> 无法获取 Xray-core 最新正式版版本号"
             return 1
         fi
         echoContent green " ---> Xray-core版本:${version}"
-        if ! downloadXrayArchive "${version}"; then
-            echoContent red " ---> Xray-core 下载或校验失败"
-            return 1
-        fi
+        installXrayVersion "${version}" --no-restart || return 1
 
-        if [[ ! -f "/opt/xray-agent/xray/${xrayCoreCPUVendor}.zip" ]]; then
-            read -r -p "核心下载失败，请重新尝试安装，是否重新尝试？[y/n]" downloadStatus
-            if [[ "${downloadStatus}" == "y" ]]; then
-                installXray "$1"
-            fi
-        else
-            unzip -o "/opt/xray-agent/xray/${xrayCoreCPUVendor}.zip" -d /opt/xray-agent/xray >/dev/null
-            rm -rf "/opt/xray-agent/xray/${xrayCoreCPUVendor}.zip"
-
-            version=$(curl -fsSL --retry 3 https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/releases?per_page=1 | jq -r '.[]|.tag_name')
-            echoContent skyBlue "------------------------Version-------------------------------"
-            echo "version:${version}"
-            downloadGeoData "${version}" "/opt/xray-agent/xray" || return 1
-
-            chmod 755 /opt/xray-agent/xray/xray
-        fi
-    else
-        if [[ -z "${lastInstallationConfig}" ]]; then
-            echoContent green " ---> Xray-core版本:$(/opt/xray-agent/xray/xray --version | awk '{print $2}' | head -1)"
-            read -r -p "是否更新、升级？[y/n]:" reInstallXrayStatus
-            if [[ "${reInstallXrayStatus}" == "y" ]]; then
-                updateXray "" install
-            fi
+        version=$(curl -fsSL --retry 3 https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/releases?per_page=1 | jq -r '.[]|.tag_name')
+        echoContent skyBlue "------------------------Version-------------------------------"
+        echo "version:${version}"
+        downloadGeoData "${version}" "/opt/xray-agent/xray" || return 1
+    elif [[ -z "${lastInstallationConfig}" ]]; then
+        echoContent green " ---> Xray-core版本:$(installedXrayVersion)"
+        read -r -p "是否更新、升级？[y/n]:" reInstallXrayStatus
+        if [[ "${reInstallXrayStatus}" == "y" ]]; then
+            updateXray stable
         fi
     fi
 }
 
-# xray版本管理
+# xray version management
 xrayVersionManageMenu() {
     echoContent skyBlue "\n进度  $1/${totalProgress} : Xray版本管理"
     if [[ "${coreInstallType}" != "1" ]]; then
@@ -484,7 +470,7 @@ xrayVersionManageMenu() {
     echoContent red "\n=============================================================="
     echoContent yellow "1.升级Xray-core"
     echoContent yellow "2.升级Xray-core 预览版"
-    echoContent yellow "3.回退Xray-core"
+    echoContent yellow "3.切换到指定版本(回退)"
     echoContent yellow "4.关闭Xray-core"
     echoContent yellow "5.打开Xray-core"
     echoContent yellow "6.重启Xray-core"
@@ -494,26 +480,11 @@ xrayVersionManageMenu() {
     echoContent red "=============================================================="
     read -r -p "请选择:" selectXrayType
     if [[ "${selectXrayType}" == "1" ]]; then
-        prereleaseStatus=false
-        updateXray
+        updateXray stable
     elif [[ "${selectXrayType}" == "2" ]]; then
-        prereleaseStatus=true
-        updateXray
+        updateXray prerelease
     elif [[ "${selectXrayType}" == "3" ]]; then
-        echoContent yellow "\n1.只可以回退最近的五个版本"
-        echoContent yellow "2.不保证回退后一定可以正常使用"
-        echoContent yellow "3.如果回退的版本不支持当前的config，则会无法连接，谨慎操作"
-        echoContent skyBlue "------------------------Version-------------------------------"
-        curl -s "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=5" | jq -r ".[]|select (.prerelease==false)|.tag_name" | awk '{print ""NR""":"$0}'
-        echoContent skyBlue "--------------------------------------------------------------"
-        read -r -p "请输入要回退的版本:" selectXrayVersionType
-        version=$(curl -s "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=5" | jq -r ".[]|select (.prerelease==false)|.tag_name" | awk '{print ""NR""":"$0}' | grep "${selectXrayVersionType}:" | awk -F "[:]" '{print $2}')
-        if [[ -n "${version}" ]]; then
-            updateXray "${version}"
-        else
-            echoContent red "\n ---> 输入有误，请重新输入"
-            xrayVersionManageMenu 1
-        fi
+        rollbackXray
     elif [[ "${selectXrayType}" == "4" ]]; then
         handleXray stop
     elif [[ "${selectXrayType}" == "5" ]]; then
@@ -529,7 +500,7 @@ xrayVersionManageMenu() {
     fi
 }
 
-# 更新 geosite
+# Update geosite
 updateGeoSite() {
     echoContent yellow "\n来源 https://github.com/Loyalsoldier/v2ray-rules-dat"
 
@@ -543,65 +514,168 @@ updateGeoSite() {
 
 }
 
-# 更新Xray
-updateXray() {
-    readInstallType
+xrayReleasesApi="https://api.github.com/repos/XTLS/Xray-core/releases"
 
-    if [[ "$2" == "install" || -z "${coreInstallType}" || "${coreInstallType}" != "1" ]]; then
-        if [[ -n "$1" ]]; then
-            version=$1
-        else
-            version=$(curl -fsSL --retry 3 "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=5" | jq -r ".[]|select (.prerelease==${prereleaseStatus})|.tag_name" | head -1)
-        fi
+# Installed core version as a release tag (e.g. v26.3.27), empty if none.
+installedXrayVersion() {
+    local version
+    version=$("${xrayBinary}" version 2>/dev/null | awk 'NR == 1 {print $2}')
+    [[ -n "${version}" ]] && echo "v${version}"
+}
 
-        echoContent green " ---> Xray-core版本:${version}"
+# Latest stable release. /releases/latest never returns a pre-release, unlike
+# the first page of /releases, which has been all pre-releases since v26.3.27.
+latestStableXray() {
+    curl -fsSL --retry 3 --max-time 30 "${xrayReleasesApi}/latest" | jq -r '.tag_name // empty'
+}
 
-        if [[ -z "${version}" ]] || ! downloadXrayArchive "${version}"; then
-            echoContent red " ---> Xray-core 下载或校验失败，保留当前版本"
-            return 1
-        fi
+# Print "<tag> <stable|prerelease>" for recent releases, newest first.
+listXrayReleases() {
+    local limit=${1:-10}
+    curl -fsSL --retry 3 --max-time 30 "${xrayReleasesApi}?per_page=100" \
+        | jq -r --argjson limit "${limit}" '
+            [.[] | select(.draft == false)] | .[:$limit][] |
+            .tag_name + " " + (if .prerelease then "prerelease" else "stable" end)'
+}
 
-        unzip -o "/opt/xray-agent/xray/${xrayCoreCPUVendor}.zip" -d /opt/xray-agent/xray >/dev/null
-        rm -rf "/opt/xray-agent/xray/${xrayCoreCPUVendor}.zip"
-        chmod 755 /opt/xray-agent/xray/xray
-        restartXray || return 1
+# Newest pre-release, or the latest stable when that is newer, so "upgrade to
+# pre-release" never downgrades.
+latestPrereleaseXray() {
+    local prerelease stable
+    prerelease=$(listXrayReleases 100 | awk '$2 == "prerelease" {print $1; exit}')
+    stable=$(latestStableXray)
+    if [[ -n "${stable}" ]] && { [[ -z "${prerelease}" ]] || xrayVersionAtLeast "${stable}" "${prerelease}"; }; then
+        echo "${stable}"
     else
-        echoContent green " ---> 当前Xray-core版本:$(/opt/xray-agent/xray/xray --version | awk '{print $2}' | head -1)"
-
-        if [[ -n "$1" ]]; then
-            version=$1
-        else
-            version=$(curl -s "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=10" | jq -r ".[]|select (.prerelease==${prereleaseStatus})|.tag_name" | head -1)
-        fi
-
-        if [[ -n "$1" ]]; then
-            read -r -p "回退版本为${version}，是否继续？[y/n]:" rollbackXrayStatus
-            if [[ "${rollbackXrayStatus}" == "y" ]]; then
-                echoContent green " ---> 当前Xray-core版本:$(/opt/xray-agent/xray/xray --version | awk '{print $2}' | head -1)"
-                updateXray "${version}" install
-            else
-                echoContent green " ---> 放弃回退版本"
-            fi
-        elif [[ "${version}" == "v$(/opt/xray-agent/xray/xray --version | awk '{print $2}' | head -1)" ]]; then
-            read -r -p "当前版本与最新版相同，是否重新安装？[y/n]:" reInstallXrayStatus
-            if [[ "${reInstallXrayStatus}" == "y" ]]; then
-                updateXray "${version}" install
-            else
-                echoContent green " ---> 放弃重新安装"
-            fi
-        else
-            read -r -p "最新版本为:${version}，是否更新？[y/n]:" installXrayStatus
-            if [[ "${installXrayStatus}" == "y" ]]; then
-                updateXray "${version}" install
-            else
-                echoContent green " ---> 放弃更新"
-            fi
-
-        fi
+        echo "${prerelease}"
     fi
 }
 
-# 验证整个服务是否可用
+# Download, verify and switch to an Xray-core release.
+#
+# Only the binary is replaced: the release archive also contains the stock
+# geoip/geosite files, which would overwrite the Loyalsoldier data in use.
+# Before switching, the new binary must accept the current config
+# (`xray run -test`); after switching, the previous binary is restored if the
+# service does not stay up.
+#
+# Usage: installXrayVersion <tag> [--no-restart]
+installXrayVersion() {
+    local version=$1 noRestart=${2:-} stagingDir url output
+    url="https://github.com/XTLS/Xray-core/releases/download/${version}/${xrayCoreCPUVendor}.zip"
+    stagingDir=$(mktemp -d /tmp/xray-core-update.XXXXXX) || return 1
+
+    if ! downloadVerifiedFile "${url}" "${stagingDir}/core.zip" "${url}.dgst" \
+        || ! unzip -oq "${stagingDir}/core.zip" xray -d "${stagingDir}" || [[ ! -s "${stagingDir}/xray" ]]; then
+        echoContent red " ---> Xray-core ${version} 下载或校验失败，保留当前版本"
+        rm -rf "${stagingDir}"
+        return 1
+    fi
+    chmod 755 "${stagingDir}/xray"
+
+    normalizeHysteria2UserField
+    if compgen -G "${configPath}*.json" >/dev/null; then
+        if ! output=$("${stagingDir}/xray" run -test -confdir "${configPath}" 2>&1); then
+            echoContent red " ---> Xray-core ${version} 不接受当前配置，已保留当前版本"
+            echoContent yellow "$(echo "${output}" | grep -iE 'fail|error' | tail -3)"
+            rm -rf "${stagingDir}"
+            return 1
+        fi
+    fi
+
+    mkdir -p "$(dirname "${xrayBinary}")"
+    [[ -f "${xrayBinary}" ]] && cp -p "${xrayBinary}" "${stagingDir}/xray.previous"
+    cp -p "${stagingDir}/xray" "${xrayBinary}.new" && mv -f "${xrayBinary}.new" "${xrayBinary}" || {
+        rm -rf "${stagingDir}"
+        return 1
+    }
+
+    if [[ "${noRestart}" != "--no-restart" ]] && ! restartXray; then
+        if [[ -f "${stagingDir}/xray.previous" ]]; then
+            echoContent yellow " ---> ${version} 未能保持运行，正在恢复之前的版本"
+            mv -f "${stagingDir}/xray.previous" "${xrayBinary}"
+            restartXray
+        fi
+        rm -rf "${stagingDir}"
+        return 1
+    fi
+    rm -rf "${stagingDir}"
+    echoContent green " ---> Xray-core 已切换到 ${version}"
+}
+
+# Hysteria2 configs written by older versions of this script on a v26.5.9+
+# core use "users", which stable v26.3.27 accepts in `run -test` but ignores
+# at runtime. "clients" works everywhere, so convert before switching cores.
+normalizeHysteria2UserField() {
+    local file="${configPath}05_hysteria2_inbounds.json" converted
+    [[ -f "${file}" ]] || return 0
+    jq -e '.inbounds[0].settings | has("users") and (has("clients") | not)' "${file}" >/dev/null 2>&1 || return 0
+    converted=$(jq '.inbounds[0].settings |= (.clients = .users | del(.users))' "${file}") || return 1
+    echo "${converted}" >"${file}.tmp.$$" && mv "${file}.tmp.$$" "${file}"
+}
+
+# Since v26.9.8, REALITY servers reject Client Hellos without an
+# X25519MLKEM768 key share (XTLS/REALITY 8cdf7bf, not configurable). Xray
+# clients send it; some non-Xray clients do not.
+warnRealityClientChange() {
+    local from=$1 to=$2
+    [[ -f "${configPath}07_VLESS_vision_reality_inbounds.json" ]] || return 0
+    if xrayVersionAtLeast "${to}" "v26.9.8" && ! xrayVersionAtLeast "${from:-v0}" "v26.9.8"; then
+        echoContent yellow " ---> 注意: v26.9.8 起 REALITY 只接受带 X25519MLKEM768 的客户端，Xray 内核客户端不受影响，sing-box/Clash Meta 客户端可能无法连接 REALITY"
+    fi
+}
+
+# Usage: updateXray [stable|prerelease|<tag>]
+updateXray() {
+    local target=${1:-stable} current version confirm
+    current=$(installedXrayVersion)
+    case "${target}" in
+        stable) version=$(latestStableXray) ;;
+        prerelease) version=$(latestPrereleaseXray) ;;
+        *) version=${target} ;;
+    esac
+    if [[ -z "${version}" ]]; then
+        echoContent red " ---> 无法获取 Xray-core 版本信息（GitHub API 可能限流），请稍后重试"
+        return 1
+    fi
+
+    echoContent green " ---> 当前版本: ${current:-未安装}  目标版本: ${version}"
+    warnRealityClientChange "${current}" "${version}"
+    if [[ "${version}" == "${current}" ]]; then
+        read -r -p "已是 ${version}，是否重新安装？[y/n]:" confirm
+    else
+        read -r -p "是否切换到 ${version}？[y/n]:" confirm
+    fi
+    if [[ "${confirm}" != "y" ]]; then
+        echoContent green " ---> 已取消"
+        return 0
+    fi
+    installXrayVersion "${version}"
+}
+
+# Pick any of the recent releases (stable or pre-release) to switch to.
+rollbackXray() {
+    local releases count selection version
+    releases=$(listXrayReleases 10)
+    count=$(grep -c . <<<"${releases}")
+    if ((count == 0)); then
+        echoContent red " ---> 无法获取版本列表（GitHub API 可能限流），请稍后重试"
+        return 1
+    fi
+    echoContent yellow "\n回退的版本如果不支持当前配置，会在切换前被拒绝，当前版本保持不变"
+    echoContent skyBlue "------------------------Version-------------------------------"
+    awk '{printf "%d:%s %s\n", NR, $1, ($2 == "stable" ? "[正式版]" : "[预览版]")}' <<<"${releases}"
+    echoContent skyBlue "--------------------------------------------------------------"
+    read -r -p "请输入要切换的版本编号:" selection
+    if [[ ! "${selection}" =~ ^[1-9][0-9]*$ ]] || ((selection > count)); then
+        echoContent red " ---> 输入有误"
+        return 1
+    fi
+    version=$(awk -v n="${selection}" 'NR == n {print $1}' <<<"${releases}")
+    updateXray "${version}"
+}
+
+# Verify that the whole service is working
 checkGFWStatue() {
     readInstallType
     echoContent skyBlue "\n进度 $1/${totalProgress} : 验证服务启动状态"
@@ -613,7 +687,7 @@ checkGFWStatue() {
     fi
 }
 
-# Xray开机自启
+# Enable Xray start on boot
 installXrayService() {
     echoContent skyBlue "\n进度  $1/${totalProgress} : 配置Xray开机自启"
     execStart='/opt/xray-agent/xray/xray run -confdir /opt/xray-agent/xray/conf'
@@ -640,7 +714,7 @@ EOF
     fi
 }
 
-# 操作xray
+# Manage xray
 handleXray() {
     if [[ -n $(find /bin /usr/bin -name "systemctl") ]] && [[ -n $(find /etc/systemd/system/ -name "xray.service") ]]; then
         if [[ -z $(pgrep -f "xray/xray") ]] && [[ "$1" == "start" ]]; then
@@ -675,9 +749,14 @@ xraySystemdServiceAvailable() {
     command -v systemctl >/dev/null 2>&1 && [[ -f /etc/systemd/system/xray.service ]]
 }
 
-# 使用 systemd 原子重启 Xray，避免 stop 成功后脚本在 start 前退出。
+# Restart Xray through systemd in one step, so the script cannot exit between
+# a successful stop and the start.
+#
+# Success requires the service to stay up for several consecutive checks
+# without systemd restarting it; with Restart=on-failure a crash-looping
+# Xray is briefly "active" between crashes and would otherwise pass.
 restartXray() {
-    local attempt
+    local stableChecks=0 restartsBefore restartsNow
     if xraySystemdServiceAvailable; then
         if ! systemctl restart xray.service; then
             echoContent yellow " ---> Xray 重启失败，正在尝试重新启动"
@@ -687,11 +766,20 @@ restartXray() {
             }
         fi
 
-        for attempt in {1..5}; do
-            sleep 0.4
-            if systemctl is-active --quiet xray.service && pgrep -f "xray/xray" >/dev/null; then
-                echoContent green " ---> Xray重启成功"
-                return 0
+        restartsBefore=$(systemctl show -p NRestarts --value xray.service 2>/dev/null)
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            sleep 0.5
+            restartsNow=$(systemctl show -p NRestarts --value xray.service 2>/dev/null)
+            if systemctl is-active --quiet xray.service && pgrep -f "xray/xray" >/dev/null \
+                && [[ "${restartsNow}" == "${restartsBefore}" ]]; then
+                stableChecks=$((stableChecks + 1))
+                if ((stableChecks >= 3)); then
+                    echoContent green " ---> Xray重启成功"
+                    return 0
+                fi
+            else
+                stableChecks=0
+                restartsBefore=${restartsNow}
             fi
         done
         echoContent red " ---> Xray重启后未保持运行"
@@ -703,4 +791,48 @@ restartXray() {
     handleXray start
 }
 
-# 读取Xray用户数据并初始化
+xrayBinary=/opt/xray-agent/xray/xray
+
+# Validate the complete config directory the way the service will load it.
+validateXrayConfig() {
+    "${xrayBinary}" run -test -confdir "${configPath}"
+}
+
+# Apply a change to the Xray configuration as one transaction.
+#
+# The config directory (and the relay state, which lives outside it) is
+# snapshotted, the change command runs, and the result is validated with
+# `xray run -test`. If the command or the validation fails, the snapshot is
+# restored exactly, including removing files the change created. Restarting
+# Xray is left to the caller so several changes can share one restart.
+#
+# Usage: applyXrayConfigChange <description> <command> [args...]
+applyXrayConfigChange() {
+    local description=$1 snapshot validationOutput=""
+    shift
+    snapshot=$(mktemp -d /tmp/xray-config-snapshot.XXXXXX) || return 1
+    if ! cp -Rp "${configPath}." "${snapshot}/conf"; then
+        rm -rf "${snapshot}"
+        return 1
+    fi
+    if [[ -n "${relayStateFile:-}" && -f "${relayStateFile}" ]]; then
+        cp -p "${relayStateFile}" "${snapshot}/relay_state.json"
+    fi
+
+    if "$@" && validationOutput=$(validateXrayConfig 2>&1); then
+        rm -rf "${snapshot}"
+        return 0
+    fi
+
+    find "${configPath}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+    cp -Rp "${snapshot}/conf/." "${configPath}"
+    if [[ -f "${snapshot}/relay_state.json" ]]; then
+        cp -p "${snapshot}/relay_state.json" "${relayStateFile}"
+    fi
+    echoContent red " ---> ${description}失败，已恢复上一版配置"
+    [[ -n "${validationOutput}" ]] && echoContent yellow "${validationOutput}"
+    rm -rf "${snapshot}"
+    return 1
+}
+
+# Read the Xray user data and initialize

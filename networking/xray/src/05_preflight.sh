@@ -1,11 +1,11 @@
-# 读取上次安装的配置
+# Read the previous installation config
 readLastInstallationConfig() {
     if [[ -n "${configPath}" ]]; then
         read -r -p "读取到上次安装的配置，是否使用 ？[y/n]:" lastInstallationConfigStatus
         if [[ "${lastInstallationConfigStatus}" == "y" ]]; then
             lastInstallationConfig=true
         else
-            # 用户选择不使用上次配置，设置标志强制重新选择
+            # The user declined the previous config; set the flag to force re-selection
             forceSelectDomain=true
             lastInstallationConfig=
             currentHost=
@@ -15,7 +15,7 @@ readLastInstallationConfig() {
         fi
     fi
 }
-# 检查文件目录以及path路径
+# Check the file directories and the path
 readConfigHostPathUUID() {
     currentPath=
     currentDefaultPort=
@@ -27,16 +27,16 @@ readConfigHostPathUUID() {
 
     if [[ "${coreInstallType}" == "1" ]]; then
 
-        # 安装
+        # Install
         if [[ -n "${frontingType}" ]]; then
-            # 优先从 VLESS TCP 配置中读取域名（因为它有 TLS 证书）
+            # Prefer reading the domain from the VLESS TCP config (it has the TLS certificate)
             if [[ -f "${configPath}02_VLESS_TCP_inbounds.json" ]]; then
                 currentHost=$(jq -r .inbounds[0].streamSettings.tlsSettings.certificates[0].certificateFile ${configPath}02_VLESS_TCP_inbounds.json | awk -F '[t][l][s][/]' '{print $2}' | awk -F '[.][c][r][t]' '{print $1}')
             else
                 currentHost=$(jq -r .inbounds[0].streamSettings.tlsSettings.certificates[0].certificateFile ${configPath}${frontingType}.json | awk -F '[t][l][s][/]' '{print $2}' | awk -F '[.][c][r][t]' '{print $1}')
             fi
 
-            # 优先从 VLESS TCP 读取端口（对外端口）
+            # Prefer reading the port from VLESS TCP (the external port)
             if [[ -f "${configPath}02_VLESS_TCP_inbounds.json" ]]; then
                 currentPort=$(jq .inbounds[0].port ${configPath}02_VLESS_TCP_inbounds.json)
             else
@@ -49,7 +49,7 @@ readConfigHostPathUUID() {
             if [[ -n "${defaultPortFile}" ]]; then
                 currentDefaultPort=$(echo "${defaultPortFile}" | awk -F [_] '{print $4}')
             elif [[ -f "${configPath}02_VLESS_TCP_inbounds.json" ]]; then
-                # 优先从 VLESS TCP 读取对外端口
+                # Prefer reading the external port from VLESS TCP
                 currentDefaultPort=$(jq -r .inbounds[0].port ${configPath}02_VLESS_TCP_inbounds.json)
             else
                 currentDefaultPort=$(jq -r .inbounds[0].port ${configPath}${frontingType}.json)
@@ -83,11 +83,11 @@ readConfigHostPathUUID() {
         fi
     fi
 
-    # 读取path
+    # Read the path
     if [[ -n "${configPath}" && -n "${frontingType}" ]]; then
         if [[ "${coreInstallType}" == "1" ]]; then
             local fallback
-            # 优先从 VLESS TCP 配置中读取path（因为它有 fallbacks）
+            # Prefer reading the path from the VLESS TCP config (it has the fallbacks)
             if [[ -f "${configPath}02_VLESS_TCP_inbounds.json" ]]; then
                 fallback=$(jq -r -c '.inbounds[0].settings.fallbacks[]?|select(.path)' ${configPath}02_VLESS_TCP_inbounds.json | head -1)
             else
@@ -98,11 +98,17 @@ readConfigHostPathUUID() {
             path=$(echo "${fallback}" | jq -r .path | awk -F "[/]" '{print $2}')
 
             if [[ $(echo "${fallback}" | jq -r .dest) == 31297 ]] || [[ $(echo "${fallback}" | jq -r .dest) == 31299 ]]; then
-                # path已经是纯路径，不需要去除后缀
+                # The path is already a bare path; no suffix to strip
                 currentPath="${path}"
             fi
 
         fi
+    fi
+    # Without WebSocket, recover the shared path from an XHTTP inbound
+    # ("/<path>xhttp").
+    if [[ -z "${currentPath}" && -n "${currentXhttpPath}" ]]; then
+        currentPath=${currentXhttpPath#/}
+        currentPath=${currentPath%xhttp}
     fi
     if [[ -f "/opt/xray-agent/cdn" ]] && [[ -n "$(head -1 /opt/xray-agent/cdn)" ]]; then
         currentCDNAddress=$(head -1 /opt/xray-agent/cdn)
@@ -111,7 +117,7 @@ readConfigHostPathUUID() {
     fi
 }
 
-# 状态展示
+# Status display
 showInstallStatus() {
     if [[ -n "${coreInstallType}" ]]; then
         if [[ -n $(pgrep -f "xray/xray") ]]; then
@@ -119,7 +125,7 @@ showInstallStatus() {
         else
             echoContent yellow "\n核心: Xray-core[未运行]"
         fi
-        # 读取协议类型
+        # Read the protocol types
         readInstallProtocolType
 
         if [[ -n ${currentInstallProtocolType} ]]; then
@@ -129,43 +135,40 @@ showInstallStatus() {
             echoContent yellow "VLESS+TCP[TLS_Vision] \c"
         fi
 
-        if echo ${currentInstallProtocolType} | grep -q ",1,"; then
-            echoContent yellow "VLESS+WS[TLS] \c"
+        if hasProtocol "${currentInstallProtocolType}" 1; then
+            echoContent yellow "VLESS+WS[TLS,已弃用] \c"
         fi
 
-        if echo ${currentInstallProtocolType} | grep -q ",6,"; then
+        if hasProtocol "${currentInstallProtocolType}" 14; then
+            echoContent yellow "VLESS+XHTTP[TLS] \c"
+        fi
+        if hasProtocol "${currentInstallProtocolType}" 6; then
             echoContent yellow "Hysteria2 \c"
         fi
-        if echo ${currentInstallProtocolType} | grep -q ",3,"; then
+        if hasProtocol "${currentInstallProtocolType}" 3; then
             echoContent yellow "VLESS+Reality+Vision \c"
+        fi
+        if hasProtocol "${currentInstallProtocolType}" 12; then
+            echoContent yellow "VLESS+XHTTP+Reality \c"
         fi
     fi
 }
 
-# 清理旧残留
-cleanUp() {
-    if [[ "$1" == "xrayDel" ]]; then
-        handleXray stop
-        rm -rf /opt/xray-agent/xray/*
-    fi
-}
-
-# 检测 native ACME 客户端
+# Detect native ACME clients
 checkNativeACME() {
-    local nativeACMEInstalled=false
     local nativeACMEType=""
-    
-    # 检测 certbot
-    if command -v certbot &> /dev/null; then
-        nativeACMEInstalled=true
+
+    # Detect certbot
+    if command -v certbot &>/dev/null; then
         nativeACMEType="certbot"
-        local certbotVersion=$(certbot --version 2>&1 | head -1)
+        local certbotVersion certCount
+        certbotVersion=$(certbot --version 2>&1 | head -1)
         echoContent skyBlue "\n检测到 Native ACME 客户端: ${nativeACMEType}"
         echoContent green "  版本: ${certbotVersion}"
-        
-        # 检查是否有现有证书
+
+        # Check for existing certificates
         if [[ -d "/etc/letsencrypt/live" ]]; then
-            local certCount=$(find /etc/letsencrypt/live -mindepth 1 -maxdepth 1 -type d | wc -l)
+            certCount=$(find /etc/letsencrypt/live -mindepth 1 -maxdepth 1 -type d | wc -l)
             if [[ ${certCount} -gt 0 ]]; then
                 echoContent yellow "  已有证书数量: ${certCount}"
                 echoContent skyBlue "\n可用证书域名:"
@@ -174,33 +177,28 @@ checkNativeACME() {
         fi
         return 0
     fi
-    
-    # 检测其他 ACME 客户端
-    if command -v lego &> /dev/null; then
-        nativeACMEInstalled=true
+
+    # Detect other ACME clients
+    if command -v lego &>/dev/null; then
         nativeACMEType="lego"
         echoContent skyBlue "\n检测到 Native ACME 客户端: ${nativeACMEType}"
         return 0
     fi
-    
+
     return 1
 }
 
-# 使用 native ACME 证书（初始化阶段的检查）
-useNativeACMECert() {
-    local useNative=false
-    
+# Use native ACME certificates (check during initialization)
+# Tell the user an existing ACME client was found. Certificate choice happens
+# later, in the TLS step.
+showNativeACMENotice() {
     if checkNativeACME; then
         echoContent skyBlue "\n=============================================================="
         echoContent yellow "检测到系统已安装 Native ACME 客户端"
         echoContent yellow "在安装过程中将提供使用现有证书的选项"
         echoContent red "==============================================================\n"
-        # 不再在这里进行证书配置，留到证书安装步骤
     fi
-    
-    echo "${useNative}"
 }
 
-# 检测 Nginx 环境并生成报告
-# 检测 Docker 中的 Nginx 容器
-
+# Detect the Nginx environment and generate a report
+# Detect Nginx containers in Docker

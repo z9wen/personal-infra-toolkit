@@ -1,11 +1,11 @@
-# 检查是否安装宝塔/aaPanel。面板进程名在不同版本中并不固定，
-# 因此同时依据 Nginx、vhost 目录和面板进程判断。
+# Check whether BT Panel/aaPanel is installed. The panel process name is not stable across versions,
+# so decide based on Nginx, the vhost directory and the panel process together.
 isBTPanelEnvironment() {
     [[ -d "/www/server/panel/vhost/nginx" ]] || return 1
     [[ -x "/www/server/nginx/sbin/nginx" ]] || pgrep -f "BT-Panel|aaPanel" >/dev/null 2>&1
 }
 
-# 仅保留具有合法域名文件名并已配置可用 TLS 证书的面板站点。
+# Keep only panel sites that have a valid domain file name and a usable TLS certificate configured.
 isBTPanelSiteConfig() {
     local confFile=$1
     local siteDomain=
@@ -24,10 +24,9 @@ isBTPanelSiteConfig() {
     [[ -f "${certFile}" && -f "${keyFile}" ]]
 }
 
-
 checkBTPanel() {
     if isBTPanelEnvironment; then
-        # 读取域名
+        # Read the domain
         if [[ -d '/www/server/panel/vhost/nginx/' ]]; then
             local -a btDomains=()
             local panelConfFile=
@@ -43,7 +42,7 @@ checkBTPanel() {
             fi
             local selectBTDomain=
 
-            # 如果用户选择不使用上次配置或currentHost为空，则提示用户选择
+            # If the user declines the previous config or currentHost is empty, prompt the user to choose
             if [[ "${forceSelectDomain}" == "true" ]] || [[ -z "${currentHost}" ]]; then
                 echoContent skyBlue "\n读取宝塔/aaPanel配置\n"
 
@@ -54,7 +53,7 @@ checkBTPanel() {
                 done
 
                 read -r -p "请输入编号选择:" selectBTDomain
-                # 选择完成后清除标志
+                # Clear the flag once the selection is done
                 forceSelectDomain=false
             else
                 local displayIndex
@@ -126,16 +125,16 @@ checkBTPanel() {
 }
 check1Panel() {
     if [[ -n $(pgrep -f "1panel") ]]; then
-        # 读取域名
+        # Read the domain
         if [[ -d '/opt/1panel/apps/openresty/openresty/www/sites/' && -n $(find /opt/1panel/apps/openresty/openresty/www/sites/*/ssl/fullchain.pem) ]]; then
-            # 如果用户选择不使用上次配置或currentHost为空，则提示用户选择
+            # If the user declines the previous config or currentHost is empty, prompt the user to choose
             if [[ "${forceSelectDomain}" == "true" ]] || [[ -z "${currentHost}" ]]; then
                 echoContent skyBlue "\n读取1Panel配置\n"
 
                 find /opt/1panel/apps/openresty/openresty/www/sites/*/ssl/fullchain.pem | awk -F "[/]" '{print $9}' | awk '{print NR""":"$0}'
 
                 read -r -p "请输入编号选择:" selectBTDomain
-                # 选择完成后清除标志
+                # Clear the flag once the selection is done
                 forceSelectDomain=false
             else
                 selectBTDomain=$(find /opt/1panel/apps/openresty/openresty/www/sites/*/ssl/fullchain.pem | awk -F "[/]" '{print $9}' | awk '{print NR""":"$0}' | grep "${currentHost}" | cut -d ":" -f 1)
@@ -160,102 +159,6 @@ check1Panel() {
                 echoContent red " ---> 选择错误，请重新选择"
                 check1Panel
             fi
-        fi
-    fi
-}
-checkHestiaPanel() {
-    if [[ -d "/usr/local/hestia" ]]; then
-        local -a hestiaDomains=()
-        local -a hestiaUsers=()
-        while IFS= read -r certDir; do
-            if [[ -z "${certDir}" ]]; then
-                continue
-            fi
-            local hUser hDomain
-            hUser=$(echo "${certDir}" | cut -d'/' -f3)
-            hDomain=$(echo "${certDir}" | cut -d'/' -f6)
-            if [[ -n "${hUser}" && -n "${hDomain}" ]]; then
-                hestiaUsers+=("${hUser}")
-                hestiaDomains+=("${hDomain}")
-            fi
-        done < <(find /home -path "*/conf/web/*/ssl" -type d 2>/dev/null | sort)
-
-        local domainCount=${#hestiaDomains[@]}
-        if ((domainCount == 0)); then
-            return
-        fi
-
-        local selectHestiaDomain=
-        # 如果用户选择不使用上次配置或currentHost为空，则提示用户选择
-        if [[ "${forceSelectDomain}" == "true" ]] || [[ -z "${currentHost}" ]]; then
-            echoContent skyBlue "\n读取HestiaCP配置\n"
-            local displayIndex
-            for ((displayIndex = 0; displayIndex < domainCount; displayIndex++)); do
-                local printIndex=$((displayIndex + 1))
-                echo "${printIndex}:${hestiaDomains[displayIndex]} (user:${hestiaUsers[displayIndex]})"
-            done
-            read -r -p "请输入编号选择:" selectHestiaDomain
-            # 选择完成后清除标志
-            forceSelectDomain=false
-        else
-            for ((displayIndex = 0; displayIndex < domainCount; displayIndex++)); do
-                if [[ "${hestiaDomains[displayIndex]}" == "${currentHost}" ]]; then
-                    selectHestiaDomain=$((displayIndex + 1))
-                    break
-                fi
-            done
-        fi
-
-        if [[ -n "${selectHestiaDomain}" && "${selectHestiaDomain}" =~ ^[0-9]+$ ]]; then
-            local selectedIndex=$((selectHestiaDomain - 1))
-            if ((selectedIndex < 0 || selectedIndex >= domainCount)); then
-                echoContent red " ---> 选择错误，请重新选择"
-                checkHestiaPanel
-                return
-            fi
-
-            local hestiaDomain=${hestiaDomains[selectedIndex]}
-            local hestiaUser=${hestiaUsers[selectedIndex]}
-            local certDir="/home/${hestiaUser}/conf/web/${hestiaDomain}/ssl"
-            local certFile=
-            local keyFile=
-
-            if [[ -f "${certDir}/${hestiaDomain}.crt" ]]; then
-                certFile="${certDir}/${hestiaDomain}.crt"
-            elif [[ -f "${certDir}/fullchain.pem" ]]; then
-                certFile="${certDir}/fullchain.pem"
-            elif [[ -f "${certDir}/cert.pem" ]]; then
-                certFile="${certDir}/cert.pem"
-            fi
-
-            if [[ -f "${certDir}/${hestiaDomain}.key" ]]; then
-                keyFile="${certDir}/${hestiaDomain}.key"
-            elif [[ -f "${certDir}/privkey.pem" ]]; then
-                keyFile="${certDir}/privkey.pem"
-            elif [[ -f "${certDir}/key.pem" ]]; then
-                keyFile="${certDir}/key.pem"
-            fi
-
-            if [[ -z "${certFile}" || -z "${keyFile}" ]]; then
-                echoContent red " ---> 未找到 HestiaCP 证书文件，请先在面板中申请"
-                return
-            fi
-
-            btDomain=${hestiaDomain}
-            domain=${hestiaDomain}
-
-            mkdir -p /opt/xray-agent/tls
-            if [[ ! -f "/opt/xray-agent/tls/${hestiaDomain}.crt" && ! -f "/opt/xray-agent/tls/${hestiaDomain}.key" ]]; then
-                ln -s "${certFile}" "/opt/xray-agent/tls/${hestiaDomain}.crt"
-                ln -s "${keyFile}" "/opt/xray-agent/tls/${hestiaDomain}.key"
-            fi
-
-            nginxStaticPath="/home/${hestiaUser}/web/${hestiaDomain}/public_html/"
-            mkdir -p "${nginxStaticPath}"
-        else
-            echoContent red " ---> 选择错误，请重新选择"
-            checkHestiaPanel
-            return
         fi
     fi
 }

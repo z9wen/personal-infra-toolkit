@@ -1,7 +1,6 @@
-
 normalizeXrayEmail() {
     local value=$1 suffix
-    for suffix in VLESS_TCP/TLS_Vision VLESS_WS vless_reality_vision Hysteria2; do
+    for suffix in VLESS_TCP/TLS_Vision VLESS_WS VLESS_XHTTP_Reality VLESS_XHTTP vless_reality_vision Hysteria2; do
         if [[ "${value}" == *-"${suffix}" ]]; then
             printf '%s\n' "${value%-${suffix}}"
             return 0
@@ -19,14 +18,14 @@ initXrayClients() {
     local newUUID=$2
     local newEmail=$3
     case "${clientType}" in
-    0 | 1 | 3) ;;
-    *)
-        echoContent red "不支持的 Xray 客户端类型: ${clientType}" >&2
-        return 1
-        ;;
+        0 | 1 | 3 | 12 | 14) ;;
+        *)
+            echoContent red "不支持的 Xray 客户端类型: ${clientType}" >&2
+            return 1
+            ;;
     esac
 
-    # 检查 currentClients 是否为空或 null，避免 jq 操作错误
+    # Check whether currentClients is empty or null to avoid jq errors
     if [[ -z "${currentClients}" ]] || [[ "${currentClients}" == "null" ]] || ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"${currentClients}"; then
         currentClients="[]"
     fi
@@ -51,15 +50,19 @@ initXrayClients() {
 buildXrayClient() {
     local clientType=$1 userUUID=$2 userEmail=$3
     case "${clientType}" in
-    0) jq -nc --arg id "${userUUID}" --arg email "${userEmail}-VLESS_TCP/TLS_Vision" '{id:$id,flow:"xtls-rprx-vision",email:$email}' ;;
-    1) jq -nc --arg id "${userUUID}" --arg email "${userEmail}-VLESS_WS" '{id:$id,email:$email}' ;;
-    3) jq -nc --arg id "${userUUID}" --arg email "${userEmail}-vless_reality_vision" '{id:$id,email:$email,flow:"xtls-rprx-vision"}' ;;
-    *) return 1 ;;
+        0) jq -nc --arg id "${userUUID}" --arg email "${userEmail}-VLESS_TCP/TLS_Vision" '{id:$id,flow:"xtls-rprx-vision",email:$email}' ;;
+        1) jq -nc --arg id "${userUUID}" --arg email "${userEmail}-VLESS_WS" '{id:$id,email:$email}' ;;
+        3) jq -nc --arg id "${userUUID}" --arg email "${userEmail}-vless_reality_vision" '{id:$id,email:$email,flow:"xtls-rprx-vision"}' ;;
+        # XHTTP has no XTLS splice; the Vision flow only works there together
+        # with VLESS Encryption, so these users carry no flow.
+        12) jq -nc --arg id "${userUUID}" --arg email "${userEmail}-VLESS_XHTTP_Reality" '{id:$id,email:$email}' ;;
+        14) jq -nc --arg id "${userUUID}" --arg email "${userEmail}-VLESS_XHTTP" '{id:$id,email:$email}' ;;
+        *) return 1 ;;
     esac
 }
 
-# 将脚本现有的 UUID 用户转换为 Xray-core Hysteria2 认证客户端。
-# UUID 作为 auth 使用，便于所有已安装协议共用同一套账号。
+# Convert the script's existing UUID users into Xray-core Hysteria2 auth clients.
+# The UUID is used as auth so that all installed protocols share one set of accounts.
 initXrayHysteria2Clients() {
     local users='[]'
     local user userId userEmail
@@ -74,7 +77,7 @@ initXrayHysteria2Clients() {
 
     echo "${users}"
 }
-# 添加Xray-core 出站
+# Add an Xray-core outbound
 addXrayOutbound() {
     local tag=$1
     local domainStrategy=
@@ -85,36 +88,17 @@ addXrayOutbound() {
         domainStrategy="ForceIPv6"
     fi
 
-    if [[ -n "${domainStrategy}" ]]; then
-        cat <<EOF >"/opt/xray-agent/xray/conf/${tag}.json"
-{
-    "outbounds":[
-        {
-            "protocol":"freedom",
-            "settings":{
-                "domainStrategy":"${domainStrategy}"
-            },
-            "tag":"${tag}"
-        }
-    ]
-}
-EOF
+    # "UseIP" for the plain direct outbound.
+    if [[ -z "${domainStrategy}" ]] && echo "${tag}" | grep -q "direct"; then
+        domainStrategy="UseIP"
     fi
-    # direct
-    if echo "${tag}" | grep -q "direct"; then
-        cat <<EOF >"/opt/xray-agent/xray/conf/${tag}.json"
-{
-    "outbounds":[
-        {
-            "protocol":"freedom",
-            "settings": {
-                "domainStrategy":"UseIP"
-            },
-            "tag":"${tag}"
-        }
-    ]
-}
-EOF
+    if [[ -n "${domainStrategy}" ]]; then
+        # freedom.settings.domainStrategy is deprecated since v26.9; the
+        # sockopt form works on current stable and pre-releases alike.
+        jq -n --arg tag "${tag}" --arg strategy "${domainStrategy}" '{outbounds:[{
+            protocol:"freedom", tag:$tag,
+            streamSettings:{sockopt:{domainStrategy:$strategy}}
+        }]}' >"/opt/xray-agent/xray/conf/${tag}.json"
     fi
     # blackhole
     if echo "${tag}" | grep -q "blackhole"; then
@@ -126,33 +110,6 @@ EOF
             "tag":"${tag}"
         }
     ]
-}
-EOF
-    fi
-    # socks5 outbound
-    if echo "${tag}" | grep -q "socks5"; then
-        cat <<EOF >"/opt/xray-agent/xray/conf/${tag}.json"
-{
-  "outbounds": [
-    {
-      "protocol": "socks",
-      "tag": "${tag}",
-      "settings": {
-        "servers": [
-          {
-            "address": "${socks5RoutingOutboundIP}",
-            "port": ${socks5RoutingOutboundPort},
-            "users": [
-              {
-                "user": "${socks5RoutingOutboundUserName}",
-                "pass": "${socks5RoutingOutboundPassword}"
-              }
-            ]
-          }
-        ]
-      }
-    }
-  ]
 }
 EOF
     fi
@@ -218,34 +175,39 @@ EOF
     fi
 }
 
-# 删除 Xray-core出站
+# Remove an Xray-core outbound
 removeXrayOutbound() {
     local tag=$1
     if [[ -f "/opt/xray-agent/xray/conf/${tag}.json" ]]; then
         rm "/opt/xray-agent/xray/conf/${tag}.json" >/dev/null 2>&1
     fi
 }
-# 初始化Xray 配置文件
+# Initialize the Xray config file
 
 initXrayConfig() {
     echoContent skyBlue "\n进度 $2/${totalProgress} : 初始化Xray配置"
+    if [[ "$1" == "all" ]]; then
+        selectCustomInstallType=${recommendedInstallSelection}
+    fi
+    # Regenerating only some inbounds (e.g. REALITY management) skips the
+    # path prompt; keep the installed path.
+    customPath=${customPath:-${currentPath}}
     echo
-    # 仅保留 Vision、WebSocket、Reality Vision 与 Hysteria2。
-    # 重新安装/升级时删除旧版本遗留的其他协议入站，避免 Xray 继续加载。
+    # Keep only Vision, WebSocket, Reality Vision and Hysteria2.
+    # On reinstall/upgrade, remove leftover inbounds of other protocols from older versions so Xray does not keep loading them.
     find /opt/xray-agent/xray/conf -maxdepth 1 -type f \( \
         -name '*trojan*inbounds.json' -o \
         -name '*VLESS_gRPC_inbounds.json' -o \
         -name '*VLESS_vision_gRPC_inbounds.json' -o \
-        -name '*VLESS_XHTTP_inbounds.json' -o \
         -name '*tuic_inbounds.json' -o \
         -name '*naive_inbounds.json' -o \
         -name '*VMess_HTTPUpgrade_inbounds.json' -o \
         -name '*anytls_inbounds.json' \
-    \) -delete 2>/dev/null
+        \) -delete 2>/dev/null
 
     local uuid=
     local addClientsStatus=
-    # 总是询问是否使用上次用户配置，不管lastInstallationConfig的值
+    # Always ask whether to reuse the previous user config, regardless of lastInstallationConfig
     if [[ -n "${currentUUID}" ]]; then
         read -r -p "读取到上次用户配置，是否使用上次安装的配置 ？[y/n]:" historyUUIDStatus
         if [[ "${historyUUIDStatus}" == "y" ]]; then
@@ -348,11 +310,11 @@ EOF
 }
 EOF
     # VLESS_TCP_TLS_Vision
-    # 回落nginx
+    # Fall back to nginx
     local fallbacksList='{"dest":31300,"xver":1},{"alpn":"h2","dest":31302,"xver":1}'
 
     # VLESS_WS_TLS
-    if echo "${selectCustomInstallType}" | grep -q ",1," || [[ "$1" == "all" ]]; then
+    if hasProtocol "${selectCustomInstallType}" 1; then
         fallbacksList=${fallbacksList}',{"path":"/'${customPath}'","dest":31297,"xver":1}'
         cat <<EOF >/opt/xray-agent/xray/conf/03_VLESS_WS_inbounds.json
 {
@@ -383,17 +345,15 @@ EOF
     fi
 
     # Hysteria2 over QUIC/UDP, implemented directly by Xray-core.
-    if echo "${selectCustomInstallType}" | grep -q ",6," || [[ "$1" == "all" ]]; then
+    if hasProtocol "${selectCustomInstallType}" 6; then
         echoContent skyBlue "\n===================== 配置Hysteria2+TLS =====================\n"
         initHysteria2Port
         initHysteria2BbrProfile
         initHysteria2Masquerade
+        # "clients" works on every supported core. v26.5.9+ also accepts
+        # "users", but stable v26.3.27 silently ignores it (no accounts, every
+        # auth fails), which would break a rollback from a pre-release.
         local hysteria2UserField="clients"
-        local installedXrayVersion=
-        installedXrayVersion=$(/opt/xray-agent/xray/xray --version 2>/dev/null | awk 'NR == 1 {print $2}')
-        if xrayVersionAtLeast "${installedXrayVersion}" "26.5.9"; then
-            hysteria2UserField="users"
-        fi
         cat <<EOF >/opt/xray-agent/xray/conf/05_hysteria2_inbounds.json
 {
   "inbounds": [
@@ -437,11 +397,18 @@ EOF
   ]
 }
 EOF
+        # Masquerading turned off: drop the key instead of keeping "null".
+        if [[ "${hysteria2MasqueradeConfig}" == "null" ]]; then
+            local withoutMasquerade
+            withoutMasquerade=$(jq 'del(.inbounds[0].streamSettings.hysteriaSettings.masquerade)' \
+                /opt/xray-agent/xray/conf/05_hysteria2_inbounds.json) \
+                && echo "${withoutMasquerade}" >/opt/xray-agent/xray/conf/05_hysteria2_inbounds.json
+        fi
     elif [[ -z "$3" ]]; then
         rm /opt/xray-agent/xray/conf/05_hysteria2_inbounds.json >/dev/null 2>&1
     fi
     # VLESS Vision
-    if echo "${selectCustomInstallType}" | grep -q ",0," || [[ "$1" == "all" ]]; then
+    if hasProtocol "${selectCustomInstallType}" 0; then
 
         cat <<EOF >/opt/xray-agent/xray/conf/02_VLESS_TCP_inbounds.json
 {
@@ -481,14 +448,17 @@ EOF
         rm /opt/xray-agent/xray/conf/02_VLESS_TCP_inbounds.json >/dev/null 2>&1
     fi
 
-    # VLESS_TCP/reality
-    if echo "${selectCustomInstallType}" | grep -q ",3," || [[ "$1" == "all" ]]; then
-        echoContent skyBlue "\n===================== 配置VLESS+Reality =====================\n"
-
-        initXrayRealityPort
+    # REALITY: one identity (target, keys) shared by both REALITY inbounds.
+    if hasProtocol "${selectCustomInstallType}" 3 || hasProtocol "${selectCustomInstallType}" 12; then
+        echoContent skyBlue "\n===================== 配置 REALITY =====================\n"
         initRealityClientServersName
         initRealityKey
         initRealityMldsa65
+    fi
+
+    # VLESS_TCP/reality
+    if hasProtocol "${selectCustomInstallType}" 3; then
+        initXrayRealityPort
 
         cat <<EOF >/opt/xray-agent/xray/conf/07_VLESS_vision_reality_inbounds.json
 {
@@ -528,6 +498,43 @@ EOF
 EOF
     elif [[ -z "$3" ]]; then
         rm /opt/xray-agent/xray/conf/07_VLESS_vision_reality_inbounds.json >/dev/null 2>&1
+    fi
+
+    # VLESS + XHTTP + REALITY: direct, no domain needed, its own port.
+    if hasProtocol "${selectCustomInstallType}" 12; then
+        initXrayXhttpRealityPort
+        jq -n --argjson port "${xhttpRealityPort}" --arg path "/${customPath}xhttp" \
+            --argjson clients "$(initXrayClients 12)" --arg sni "${realityServerName}" \
+            --arg dest "${realityServerName}:${realityDomainPort}" --arg privateKey "${realityPrivateKey}" \
+            --arg publicKey "${realityPublicKey}" --arg seed "${realityMldsa65Seed}" --arg verify "${realityMldsa65Verify}" '
+            {inbounds:[{
+                port:$port, protocol:"vless", tag:"VLESSRealityXHTTP",
+                settings:{clients:$clients, decryption:"none"},
+                streamSettings:{
+                    network:"xhttp", security:"reality", xhttpSettings:{path:$path},
+                    realitySettings:({show:false, dest:$dest, xver:0, serverNames:[$sni],
+                        privateKey:$privateKey, publicKey:$publicKey, maxTimeDiff:70000,
+                        shortIds:["", "6ba85179e30d4fc2"]}
+                        + (if $seed != "" then {mldsa65Seed:$seed, mldsa65Verify:$verify} else {} end))
+                }
+            }]}' >/opt/xray-agent/xray/conf/12_VLESS_XHTTP_inbounds.json || return 1
+    elif [[ -z "$3" ]]; then
+        rm -f /opt/xray-agent/xray/conf/12_VLESS_XHTTP_inbounds.json
+    fi
+
+    # VLESS + XHTTP + TLS: nginx (the Vision fallback, or a panel site on
+    # 443) terminates TLS and grpc_passes the path to this local inbound.
+    if hasProtocol "${selectCustomInstallType}" 14; then
+        jq -n --argjson port "${xhttpInboundPort}" --arg path "/${customPath}xhttp" \
+            --arg trusted "${xhttpTrustedHeader}" --argjson clients "$(initXrayClients 14)" '
+            {inbounds:[{
+                listen:"127.0.0.1", port:$port, protocol:"vless", tag:"VLESSXHTTP",
+                settings:{clients:$clients, decryption:"none"},
+                streamSettings:{network:"xhttp", xhttpSettings:{path:$path},
+                    sockopt:{trustedXForwardedFor:[$trusted]}}
+            }]}' >/opt/xray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json || return 1
+    elif [[ -z "$3" ]]; then
+        rm -f /opt/xray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json
     fi
     installSniffing
     if [[ -z "$3" ]]; then

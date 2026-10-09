@@ -1,4 +1,4 @@
-# 通过dns检查域名的IP
+# Check the domain's IP via DNS
 checkDNSIP() {
     local domain=$1
     local dnsIP=
@@ -31,7 +31,7 @@ checkDNSIP() {
         echoContent green " ---> 域名IP校验通过"
     fi
 }
-# 检查端口实际开放状态
+# Check the actual port open status
 checkPortOpen() {
     local port=$1
     local domain=$2
@@ -46,7 +46,7 @@ checkPortOpen() {
     if [[ -z "${btDomain}" ]]; then
 
         handleNginx stop
-        # 初始化nginx配置
+        # Initialize the nginx config
         touch ${nginxConfigPath}checkPortOpen.conf
         local listenIPv6PortConfig=
 
@@ -72,11 +72,11 @@ server {
 }
 EOF
         handleNginx start
-        # 检查域名+端口的开放
+        # Check that the domain + port is reachable
         checkPortOpenResult=$(curl -s -m 10 "http://${domain}:${port}/checkPort")
         localIP=$(curl -s -m 10 "http://${domain}:${port}/ip")
         rm "${nginxConfigPath}checkPortOpen.conf"
-        
+
         handleNginx stop
         if [[ "${checkPortOpenResult}" == "fjkvymb6len" ]]; then
             echoContent green " ---> 检测到${port}端口已开放"
@@ -104,7 +104,7 @@ EOF
     fi
 }
 
-# 初始化Nginx申请证书配置
+# Initialize the Nginx config used for certificate issuance
 initTLSNginxConfig() {
     handleNginx stop
     echoContent skyBlue "\n进度  $1/${totalProgress} : 初始化Nginx申请证书配置"
@@ -135,7 +135,7 @@ initTLSNginxConfig() {
         echoContent red "  域名不可为空--->"
         initTLSNginxConfig 3
     else
-        # 检查域名是否已在 Nginx 中配置
+        # Check whether the domain is already configured in Nginx
         if grep -r "server_name.*${domain}" "${nginxConfigPath}" /etc/nginx/sites-enabled/ 2>/dev/null | grep -v "xray-agent.conf" | grep -q "${domain}"; then
             echoContent red "\n=============================================================="
             echoContent yellow "警告：检测到域名 ${domain} 已在 Nginx 中配置"
@@ -148,15 +148,15 @@ initTLSNginxConfig() {
                 return
             fi
         fi
-        
+
         dnsTLSDomain=$(echo "${domain}" | awk -F "." '{$1="";print $0}' | sed 's/^[[:space:]]*//' | sed 's/ /./g')
         customPortFunction
-        # 修改配置
+        # Modify the config
         handleNginx stop
     fi
 }
 
-# 删除nginx默认的配置
+# Remove the default nginx config
 removeNginxDefaultConf() {
     if [[ -f ${nginxConfigPath}default.conf ]]; then
         if [[ "$(grep -c "server_name" <${nginxConfigPath}default.conf)" == "1" ]] && [[ "$(grep -c "server_name  localhost;" <${nginxConfigPath}default.conf)" == "1" ]]; then
@@ -165,7 +165,7 @@ removeNginxDefaultConf() {
         fi
     fi
 }
-# 修改nginx重定向配置
+# Modify the nginx redirect config
 updateRedirectNginxConf() {
     local nginxConfFile="${nginxConfigPath}xray-agent.conf"
     local nginxConfTmp="${nginxConfFile}.tmp.$$"
@@ -175,13 +175,14 @@ updateRedirectNginxConf() {
         return 1
     fi
 
-    # 备份现有配置
+    # Back up the existing config
     if [[ -f "${nginxConfFile}" ]]; then
-        local backupFile="${nginxConfFile}.bak_$(date +%Y%m%d_%H%M%S)"
+        local backupFile
+        backupFile="${nginxConfFile}.bak_$(date +%Y%m%d_%H%M%S)"
         cp "${nginxConfFile}" "${backupFile}"
         echoContent skyBlue " ---> 已备份原配置: ${backupFile}"
     fi
-    
+
     local redirectDomain=
     redirectDomain=${domain}:${port}
 
@@ -212,7 +213,12 @@ updateRedirectNginxConf() {
         echoContent green " ---> Vision普通HTTPS回落将反向代理到面板站点: https://${btDomain}/"
     fi
 
-    if ! cat <<EOF >"${nginxConfTmp}"
+    local xhttpLocationConfig=
+    if xhttpTlsEnabled; then
+        xhttpLocationConfig=$(xhttpNginxLocation "$(xhttpPublicPath)" "	")
+    fi
+
+    if ! cat <<EOF >"${nginxConfTmp}"; then
     server {
     		listen 127.0.0.1:31300;
     		server_name _;
@@ -227,6 +233,7 @@ server {
 	server_name ${domain};
 	root ${nginxStaticPath};
 
+${xhttpLocationConfig}
 	location / {
 	${fallbackLocationConfig}
 	}
@@ -239,12 +246,12 @@ server {
 	real_ip_header proxy_protocol;
 
 	root ${nginxStaticPath};
+${xhttpLocationConfig}
 	location / {
 	${fallbackLocationConfig}
 	}
 }
 EOF
-    then
         rm -f "${nginxConfTmp}"
         echoContent red " ---> 写入Nginx配置失败: ${nginxConfFile}"
         return 1
@@ -258,4 +265,156 @@ EOF
 
     echoContent green " ---> Nginx配置已写入: ${nginxConfFile}"
 }
-# 检查ip
+# Check the IP
+
+# ==================== XHTTP over nginx ====================
+
+# True when VLESS + XHTTP + TLS is being installed, or is installed and the
+# current operation does not select protocols.
+xhttpTlsEnabled() {
+    if [[ -n "${selectCustomInstallType}" ]]; then
+        hasProtocol "${selectCustomInstallType}" 14
+    else
+        hasProtocol "${currentInstallProtocolType}" 14
+    fi
+}
+
+xhttpPublicPath() {
+    echo "/${customPath:-${currentPath}}xhttp"
+}
+
+# nginx location that hands the XHTTP path to the local XHTTP inbound.
+# grpc_pass speaks h2c to Xray and also serves HTTP/1.1 clients (CDNs often
+# reach the origin over HTTP/1.1). "^~" keeps regex locations in panel site
+# configs from taking these requests.
+# Usage: xhttpNginxLocation <path> [indent]
+xhttpNginxLocation() {
+    local path=$1 indent=${2:-    }
+    printf '%s\n' \
+        "${indent}location ^~ ${path}/ {" \
+        "${indent}    client_max_body_size 0;" \
+        "${indent}    client_body_timeout 5m;" \
+        "${indent}    grpc_read_timeout 315;" \
+        "${indent}    grpc_send_timeout 5m;" \
+        "${indent}    grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;" \
+        "${indent}    grpc_set_header ${xhttpTrustedHeader} 1;" \
+        "${indent}    grpc_pass grpc://127.0.0.1:${xhttpInboundPort};" \
+        "${indent}}"
+}
+
+# aaPanel/BT vhost directory (overridable for tests).
+panelVhostRoot=/www/server/panel/vhost
+xhttpPanelMarkerBegin="# >>> xray-agent XHTTP (managed by xray-agent, do not edit) >>>"
+xhttpPanelMarkerEnd="# <<< xray-agent XHTTP <<<"
+xhttpStateFile=/opt/xray-agent/xhttp_public_port
+
+# Find a file that the panel site config already includes inside its server
+# block, so our location survives the panel rewriting the site config.
+# Prints "<file> own" (the whole file is ours) or "<file> block" (a marked
+# block inside a user-editable file).
+findPanelXhttpTarget() {
+    local siteConf="${panelVhostRoot}/nginx/${btDomain}.conf"
+    if [[ -f "${siteConf}" ]]; then
+        if grep -qF "${panelVhostRoot}/nginx/extension/${btDomain}/*.conf" "${siteConf}"; then
+            echo "${panelVhostRoot}/nginx/extension/${btDomain}/xray-agent-xhttp.conf own"
+            return 0
+        fi
+        if grep -qF "${panelVhostRoot}/rewrite/${btDomain}.conf" "${siteConf}"; then
+            echo "${panelVhostRoot}/rewrite/${btDomain}.conf block"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+panelNginxTest() {
+    if [[ -x /www/server/nginx/sbin/nginx ]]; then
+        /www/server/nginx/sbin/nginx -t -c /www/server/nginx/conf/nginx.conf
+    else
+        nginx -t
+    fi
+}
+
+panelNginxReload() {
+    if [[ -x /www/server/nginx/sbin/nginx ]]; then
+        /www/server/nginx/sbin/nginx -s reload -c /www/server/nginx/conf/nginx.conf
+    elif command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nginx; then
+        systemctl reload nginx
+    else
+        nginx -s reload
+    fi
+}
+
+# Print a file without our marked XHTTP block.
+stripXhttpPanelBlock() {
+    awk -v begin="${xhttpPanelMarkerBegin}" -v end="${xhttpPanelMarkerEnd}" '
+        $0 == begin {skip = 1; next}
+        $0 == end {skip = 0; next}
+        !skip {print}
+    ' "$1"
+}
+
+# Add or remove the XHTTP location in the panel site that serves 443, then
+# test and reload nginx. A failed test restores the previous file.
+# Usage: syncPanelXhttpLocation install|remove
+syncPanelXhttpLocation() {
+    local action=$1 target file mode backup
+    [[ -n "${btDomain}" ]] || return 0
+    if ! target=$(findPanelXhttpTarget); then
+        if [[ "${action}" == "install" ]]; then
+            echoContent yellow " ---> 未找到 ${btDomain} 站点配置中可安全写入的位置（面板会覆盖直接修改）"
+            echoContent yellow " ---> 请在面板中把以下配置加入 ${btDomain} 的 443 server 块后重载 Nginx:"
+            xhttpNginxLocation "$(xhttpPublicPath)"
+        fi
+        return 0
+    fi
+    file=${target% *}
+    mode=${target##* }
+    backup=$(mktemp) || return 1
+    [[ -f "${file}" ]] && cp -p "${file}" "${backup}"
+
+    if [[ "${mode}" == "own" ]]; then
+        rm -f "${file}"
+    elif [[ -f "${file}" ]]; then
+        stripXhttpPanelBlock "${backup}" >"${file}"
+    fi
+    if [[ "${action}" == "install" ]]; then
+        mkdir -p "$(dirname "${file}")"
+        {
+            echo "${xhttpPanelMarkerBegin}"
+            xhttpNginxLocation "$(xhttpPublicPath)"
+            echo "${xhttpPanelMarkerEnd}"
+        } >>"${file}"
+    fi
+
+    local output
+    if ! output=$(panelNginxTest 2>&1); then
+        if [[ -s "${backup}" ]]; then cp -p "${backup}" "${file}"; else rm -f "${file}"; fi
+        rm -f "${backup}"
+        echoContent red " ---> 面板 Nginx 配置测试失败，已恢复: ${file}"
+        echoContent yellow "$(echo "${output}" | tail -3)"
+        return 1
+    fi
+    rm -f "${backup}"
+    panelNginxReload >/dev/null 2>&1
+    if [[ "${action}" == "install" ]]; then
+        echoContent green " ---> XHTTP 已接入面板站点 https://${btDomain}$(xhttpPublicPath)/ (${file})"
+    fi
+}
+
+# Remove our XHTTP location from every panel site (used by uninstall).
+removeAllPanelXhttpLocations() {
+    local file changed=false
+    for file in "${panelVhostRoot}"/nginx/extension/*/xray-agent-xhttp.conf; do
+        [[ -f "${file}" ]] && rm -f "${file}" && changed=true
+    done
+    for file in "${panelVhostRoot}"/rewrite/*.conf; do
+        if [[ -f "${file}" ]] && grep -qF "${xhttpPanelMarkerBegin}" "${file}"; then
+            stripXhttpPanelBlock "${file}" >"${file}.tmp.$$" && mv "${file}.tmp.$$" "${file}" && changed=true
+        fi
+    done
+    if [[ "${changed}" == "true" ]] && panelNginxTest >/dev/null 2>&1; then
+        panelNginxReload >/dev/null 2>&1
+    fi
+    rm -f "${xhttpStateFile}"
+}

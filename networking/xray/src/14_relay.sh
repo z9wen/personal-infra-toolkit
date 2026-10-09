@@ -1,16 +1,54 @@
-# ==================== 中转管理 ====================
+# ==================== Relay management ====================
+#
+# Relay state (relayStateFile) is the single source of truth: a list of
+# upstream profiles, each with the selectors routed through it. A selector is
+# {inboundTags: [...], users: [...]}; an empty users list means the whole
+# inbound. 09_routing.json is regenerated from that state, never edited by
+# hand, and every change goes through commitRelayChange so it is validated by
+# Xray and rolled back on failure.
 
-# 返回本机已安装、可作为中转入口的协议。
+relayStateFile=/opt/xray-agent/relay_config.json
+relayLockFile=/opt/xray-agent/update-relay.lock
+
+# jq definitions shared by every selector query.
+relaySelectorJqDefs='
+    def overlap($left; $right):
+        any($left[]?; . as $item | $right | index($item) != null);
+    # Does $current already claim traffic that $selected wants?
+    def conflicts($current; $selected):
+        overlap($current.inboundTags; $selected.inboundTags) and
+        (
+            (($selected.users // []) | length) == 0 or
+            (
+                ((($current.users // []) | length) > 0) and
+                overlap(($current.users // []); ($selected.users // []))
+            )
+        );
+    # Remove from $current whatever $selected takes over; empty results vanish.
+    def subtractSelector($current; $selected):
+        if (($selected.users // []) | length) == 0 then
+            $current | .inboundTags -= $selected.inboundTags | select((.inboundTags | length) > 0)
+        elif ((($current.users // []) | length) > 0 and overlap($current.inboundTags; $selected.inboundTags)) then
+            $current | .users -= $selected.users | select((.users | length) > 0)
+        else $current end;
+    # Account tag without the protocol suffix added to Xray emails.
+    def displayUser:
+        sub("-(VLESS_TCP/TLS_Vision|VLESS_WS|VLESS_XHTTP_Reality|VLESS_XHTTP|vless_reality_vision|Hysteria2)$"; "");
+'
+
+# Return the protocols installed on this host that can serve as relay entries.
 detectRelayInbounds() {
     relayInboundTags=()
     relayInboundLabels=()
     [[ -f "${configPath}02_VLESS_TCP_inbounds.json" ]] && relayInboundTags+=("VLESSTCP") && relayInboundLabels+=("VLESS + TCP + TLS Vision")
     [[ -f "${configPath}03_VLESS_WS_inbounds.json" ]] && relayInboundTags+=("VLESSWS") && relayInboundLabels+=("VLESS + WebSocket + TLS")
     [[ -f "${configPath}07_VLESS_vision_reality_inbounds.json" ]] && relayInboundTags+=("VLESSReality") && relayInboundLabels+=("VLESS + Reality + Vision")
+    [[ -f "${configPath}14_VLESS_XHTTP_TLS_inbounds.json" ]] && relayInboundTags+=("VLESSXHTTP") && relayInboundLabels+=("VLESS + XHTTP + TLS")
+    [[ -f "${configPath}12_VLESS_XHTTP_inbounds.json" ]] && relayInboundTags+=("VLESSRealityXHTTP") && relayInboundLabels+=("VLESS + XHTTP + Reality")
     [[ -f "${configPath}05_hysteria2_inbounds.json" ]] && relayInboundTags+=("Hysteria2") && relayInboundLabels+=("Hysteria2 + TLS + QUIC")
 }
 
-# 生成可选的“入站 + 账号”目标。每个入站都可选整体，也可精确到有 email 的 UUID/auth。
+# Generate selectable "inbound + account" targets. Each inbound can be selected as a whole, or narrowed to a specific UUID/auth that has an email.
 buildRelayTargetChoices() {
     detectRelayInbounds
     relayTargetChoices='[]'
@@ -24,11 +62,13 @@ buildRelayTargetChoices() {
         inboundTag=${relayInboundTags[index]}
         inboundLabel=${relayInboundLabels[index]}
         case "${inboundTag}" in
-        VLESSTCP) inboundConfig="${configPath}02_VLESS_TCP_inbounds.json" ;;
-        VLESSWS) inboundConfig="${configPath}03_VLESS_WS_inbounds.json" ;;
-        VLESSReality) inboundConfig="${configPath}07_VLESS_vision_reality_inbounds.json" ;;
-        Hysteria2) inboundConfig="${configPath}05_hysteria2_inbounds.json" ;;
-        *) continue ;;
+            VLESSTCP) inboundConfig="${configPath}02_VLESS_TCP_inbounds.json" ;;
+            VLESSWS) inboundConfig="${configPath}03_VLESS_WS_inbounds.json" ;;
+            VLESSReality) inboundConfig="${configPath}07_VLESS_vision_reality_inbounds.json" ;;
+            VLESSXHTTP) inboundConfig="${configPath}14_VLESS_XHTTP_TLS_inbounds.json" ;;
+            VLESSRealityXHTTP) inboundConfig="${configPath}12_VLESS_XHTTP_inbounds.json" ;;
+            Hysteria2) inboundConfig="${configPath}05_hysteria2_inbounds.json" ;;
+            *) continue ;;
         esac
         relayTargetChoices=$(jq -c --arg tag "${inboundTag}" --arg label "${inboundLabel}" '
             . + [{selector:{inboundTags:[$tag],users:[]},label:($label + " / 整个入站（全部 UUID/auth）")}]
@@ -37,9 +77,9 @@ buildRelayTargetChoices() {
             (.inbounds[0].settings.clients // .inbounds[0].settings.users // .inbounds[0].users // [])
             | map(select((.email // "") != ""))
         ' "${inboundConfig}") || return 1
-        relayTargetChoices=$(jq -c --arg tag "${inboundTag}" --arg label "${inboundLabel}" --argjson clients "${clients}" '
+        relayTargetChoices=$(jq -c --arg tag "${inboundTag}" --arg label "${inboundLabel}" --argjson clients "${clients}" "${relaySelectorJqDefs}"'
             reduce $clients[] as $client (.;
-                ($client.email | sub("-(VLESS_TCP/TLS_Vision|VLESS_WS|vless_reality_vision|Hysteria2)$"; "")) as $accountTag |
+                ($client.email | displayUser) as $accountTag |
                 ($client.id // $client.uuid // $client.auth // $client.password // "unknown") as $credential |
                 . + [{selector:{inboundTags:[$tag],users:[$client.email]},
                     label:($label + " / tag: " + $accountTag + " / UUID/auth: " + $credential)}]
@@ -48,7 +88,7 @@ buildRelayTargetChoices() {
     done
 }
 
-# 一次可选多个精确目标，例如某个 Vision UUID 加上 Hysteria2 auth。
+# Multiple exact targets can be selected at once, e.g. a Vision UUID plus a Hysteria2 auth.
 selectRelayTargets() {
     buildRelayTargetChoices || return 1
     local targetCount selection
@@ -87,19 +127,16 @@ selectRelayTargets() {
     echoContent green " ---> 已选择 $(jq 'length' <<<"${relaySelectedSelectors}") 个独立入口规则"
 }
 
-validateRelayPort() {
-    local value=$1
-    [[ "${value}" =~ ^[0-9]+$ ]] && ((value >= 1 && value <= 65535))
-}
-
-# 返回 sing-box JSON 订阅中可转换为 Xray 出站的节点。
-# Reality 暂只接受未配置额外 transport 的 VLESS + Reality（RAW/TCP）。
+# Return the nodes in a sing-box JSON subscription that can be converted to Xray outbounds.
+# For now Reality only accepts VLESS + Reality (RAW/TCP) with no extra transport configured.
 getRelayNodesFromSingBoxSubscription() {
     local subscriptionFile=$1
     jq -c '[
         .outbounds[]? |
         select((.tag | type) == "string" and (.tag | length) > 0) |
-        if .type == "shadowsocks" then
+        # Xray has no SIP003 plugin support; such nodes would pass
+        # `xray -test` but never connect.
+        if .type == "shadowsocks" and ((.plugin // "") == "") then
             . + {_relayType:"shadowsocks"}
         elif (
             .type == "vless" and
@@ -113,7 +150,7 @@ getRelayNodesFromSingBoxSubscription() {
     ]' "${subscriptionFile}"
 }
 
-# 从 sing-box JSON 订阅中读取 Shadowsocks 或 VLESS Reality 出站并转换为 Xray 配置。
+# Read Shadowsocks or VLESS Reality outbounds from a sing-box JSON subscription and convert them to Xray config.
 buildRelayOutboundFromSingBoxSubscription() {
     local subscriptionFile=$1 selectedTag=$2 outboundTag=$3 outputFile=$4
     local supportedNodes node nodeType
@@ -130,14 +167,14 @@ buildRelayOutboundFromSingBoxSubscription() {
     fi
 
     case ${nodeType} in
-    shadowsocks)
-        if ! jq -e '
+        shadowsocks)
+            if ! jq -e '
             (.method | type == "string" and length > 0) and
             (.password | type == "string" and length > 0)
         ' <<<"${node}" >/dev/null; then
-            return 1
-        fi
-        jq -n --arg tag "${outboundTag}" --argjson node "${node}" '
+                return 1
+            fi
+            jq -n --arg tag "${outboundTag}" --argjson node "${node}" '
             {outbounds:[{
                 tag:$tag,
                 protocol:"shadowsocks",
@@ -149,11 +186,11 @@ buildRelayOutboundFromSingBoxSubscription() {
                 }
             }]}
         ' >"${outputFile}" || return 1
-        relayBuiltProtocol="shadowsocks"
-        relayBuiltLabel="Shadowsocks ($(jq -r '.method' <<<"${node}"))"
-        ;;
-    vless-reality)
-        if ! jq -e '
+            relayBuiltProtocol="shadowsocks"
+            relayBuiltLabel="Shadowsocks ($(jq -r '.method' <<<"${node}"))"
+            ;;
+        vless-reality)
+            if ! jq -e '
             (.uuid | type == "string" and length > 0) and
             ((.flow // "") | type == "string" and
                 (. == "" or . == "xtls-rprx-vision" or . == "xtls-rprx-vision-udp443")) and
@@ -162,9 +199,9 @@ buildRelayOutboundFromSingBoxSubscription() {
             ((.tls.reality.short_id // "") | type == "string" and test("^([0-9A-Fa-f]{2}){0,8}$")) and
             ((.tls.utls.fingerprint // "chrome") | type == "string" and length > 0)
         ' <<<"${node}" >/dev/null; then
-            return 1
-        fi
-        jq -n --arg tag "${outboundTag}" --argjson node "${node}" '
+                return 1
+            fi
+            jq -n --arg tag "${outboundTag}" --argjson node "${node}" '
             {outbounds:[{
                 tag:$tag,
                 protocol:"vless",
@@ -190,14 +227,14 @@ buildRelayOutboundFromSingBoxSubscription() {
                 }
             }]}
         ' >"${outputFile}" || return 1
-        relayBuiltProtocol="reality"
-        if [[ -n $(jq -r '.flow // empty' <<<"${node}") ]]; then
-            relayBuiltLabel="VLESS + Reality + Vision"
-        else
-            relayBuiltLabel="VLESS + Reality"
-        fi
-        ;;
-    *) return 1 ;;
+            relayBuiltProtocol="reality"
+            if [[ -n $(jq -r '.flow // empty' <<<"${node}") ]]; then
+                relayBuiltLabel="VLESS + Reality + Vision"
+            else
+                relayBuiltLabel="VLESS + Reality"
+            fi
+            ;;
+        *) return 1 ;;
     esac
 
     relayBuiltSubscriptionType=${nodeType}
@@ -206,13 +243,16 @@ buildRelayOutboundFromSingBoxSubscription() {
     relayBuiltBbrProfile=
 }
 
+# The daily cron job applies whatever the subscription returns as root, so it
+# must come over HTTPS (redirects included); plain HTTP would let anyone on
+# the path swap in their own upstream.
 fetchRelaySubscription() {
     local url=$1 destination=$2
-    if [[ ! "${url}" =~ ^https?:// ]]; then
-        echoContent red " ---> 订阅地址必须以 http:// 或 https:// 开头"
+    if [[ ! "${url}" =~ ^https:// ]]; then
+        echoContent red " ---> 订阅地址必须以 https:// 开头"
         return 1
     fi
-    if ! downloadFile "${url}" "${destination}"; then
+    if ! downloadFile "${url}" "${destination}" --https-only; then
         echoContent red " ---> 中转订阅下载失败"
         return 1
     fi
@@ -222,35 +262,85 @@ fetchRelaySubscription() {
     fi
 }
 
+# Replace the relay refresh entry in root's crontab; with no argument the
+# entry is only removed.
+setRelayCronEntry() {
+    local entry=${1:-} backupFile=/opt/xray-agent/backup_crontab.cron
+    crontab -l >"${backupFile}" 2>/dev/null || true
+    {
+        sed '/xray-agent-update-relay/d;/xray-agent\/install.sh UpdateRelay/d' "${backupFile}"
+        [[ -n "${entry}" ]] && echo "${entry}"
+    } >"${backupFile}.new"
+    mv "${backupFile}.new" "${backupFile}"
+    crontab "${backupFile}"
+}
+
 installCronRelaySubscription() {
     touch /opt/xray-agent/crontab_relay.log
     chmod 600 /opt/xray-agent/crontab_relay.log
-    crontab -l >/opt/xray-agent/backup_crontab.cron 2>/dev/null || true
-    local historyCrontab
-    historyCrontab=$(sed '/xray-agent-update-relay/d;/xray-agent\/install.sh UpdateRelay/d' /opt/xray-agent/backup_crontab.cron)
-    echo "${historyCrontab}" >/opt/xray-agent/backup_crontab.cron
-    echo "17 4 * * * /bin/bash /opt/xray-agent/install.sh UpdateRelay >> /opt/xray-agent/crontab_relay.log 2>&1 # xray-agent-update-relay" >>/opt/xray-agent/backup_crontab.cron
-    crontab /opt/xray-agent/backup_crontab.cron
+    setRelayCronEntry "17 4 * * * /bin/bash /opt/xray-agent/install.sh UpdateRelay >> /opt/xray-agent/crontab_relay.log 2>&1 # xray-agent-update-relay"
 }
 
 removeCronRelaySubscription() {
-    crontab -l >/opt/xray-agent/backup_crontab.cron 2>/dev/null || true
-    local historyCrontab
-    historyCrontab=$(sed '/xray-agent-update-relay/d;/xray-agent\/install.sh UpdateRelay/d' /opt/xray-agent/backup_crontab.cron)
-    echo "${historyCrontab}" >/opt/xray-agent/backup_crontab.cron
-    crontab /opt/xray-agent/backup_crontab.cron
+    setRelayCronEntry
 }
-
-relayStateFile=/opt/xray-agent/relay_config.json
 
 writeRelayState() {
     local content=$1 temporaryFile="${relayStateFile}.tmp.$$"
+    jq -e . >/dev/null 2>&1 <<<"${content}" || return 1
     echo "${content}" >"${temporaryFile}" || return 1
     chmod 600 "${temporaryFile}"
     mv "${temporaryFile}" "${relayStateFile}"
 }
 
-# 将旧版状态转换为“一个上游 profile 对应多个入口 selectors”的格式。
+# Replace the relay state with the output of a state-building command.
+# Usage: updateRelayState <command> [args...]
+updateRelayState() {
+    local newState
+    newState=$("$@") || return 1
+    writeRelayState "${newState}"
+}
+
+# Run a command while holding the relay lock, so the menu and the daily
+# refresh job never modify relay state at the same time. The lock is only
+# held for the duration of one change, not for a whole menu session.
+# Nested calls reuse the lock that is already held.
+withRelayLock() {
+    local status=0
+    if [[ "${relayLockHeld:-false}" == "true" ]] || ! command -v flock >/dev/null 2>&1; then
+        "$@"
+        return
+    fi
+    exec 9>"${relayLockFile}" || return 1
+    if ! flock -w 30 9; then
+        echoContent yellow " ---> 中转配置正被其他任务修改，请稍后重试"
+        exec 9>&-
+        return 1
+    fi
+    relayLockHeld=true
+    "$@" || status=$?
+    relayLockHeld=false
+    exec 9>&-
+    return "${status}"
+}
+
+relayChangeThenRebuild() {
+    "$@" && rebuildRelayRouting
+}
+
+# Apply one relay change transactionally: run it, regenerate routing from
+# the new state, validate with Xray and restore everything on failure. On
+# success, drop outbound files no profile uses and sync the refresh cron job.
+# Usage: commitRelayChange <description> <command> [args...]
+commitRelayChange() {
+    local description=$1
+    shift
+    applyXrayConfigChange "${description}" relayChangeThenRebuild "$@" || return 1
+    removeOrphanedRelayFiles
+    refreshRelaySubscriptionCron
+}
+
+# Convert the legacy state into the "one upstream profile maps to multiple entry selectors" format.
 ensureRelayStateV2() {
     if [[ ! -f "${relayStateFile}" ]]; then
         writeRelayState '{"version":2,"profiles":[]}'
@@ -305,43 +395,15 @@ relayProfileFileIsSafe() {
     [[ $1 =~ ^relay_([A-Za-z0-9_]+_)?outbound\.json$ ]]
 }
 
-# 检查目标选择器是否已绑定到其他上游。
+# Check whether the target selectors are already bound to another upstream.
 relayTargetsAvailable() {
     local selector=$1 destinationId=${2:-}
     ensureRelayStateV2 || return 1
-    if jq -e --argjson selector "${selector}" --arg destinationId "${destinationId}" '
-        def tagOverlap($left; $right):
-            any($left[]?; . as $used | $right | index($used) != null);
-        def userOverlap($left; $right):
-            any($left[]?; . as $used | $right | index($used) != null);
-        def conflicts($current; $selected):
-            tagOverlap($current.inboundTags; $selected.inboundTags) and
-            (
-                (($selected.users // []) | length) == 0 or
-                (
-                    ((($current.users // []) | length) > 0) and
-                    userOverlap(($current.users // []); ($selected.users // []))
-                )
-            );
+    if jq -e --argjson selector "${selector}" --arg destinationId "${destinationId}" "${relaySelectorJqDefs}"'
         any(.profiles[]? | select(.id != $destinationId) | .selectors[]?; conflicts(.; $selector))
     ' "${relayStateFile}" >/dev/null; then
         echoContent yellow " ---> 所选目标已属于以下规则:"
-        jq -r --argjson selector "${selector}" --arg destinationId "${destinationId}" '
-            def tagOverlap($left; $right):
-                any($left[]?; . as $used | $right | index($used) != null);
-            def userOverlap($left; $right):
-                any($left[]?; . as $used | $right | index($used) != null);
-            def displayUser:
-                sub("-(VLESS_TCP/TLS_Vision|VLESS_WS|vless_reality_vision|Hysteria2)$"; "");
-            def conflicts($current; $selected):
-                tagOverlap($current.inboundTags; $selected.inboundTags) and
-                (
-                    (($selected.users // []) | length) == 0 or
-                    (
-                        ((($current.users // []) | length) > 0) and
-                        userOverlap(($current.users // []); ($selected.users // []))
-                    )
-                );
+        jq -r --argjson selector "${selector}" --arg destinationId "${destinationId}" "${relaySelectorJqDefs}"'
             .profiles[] | select(.id != $destinationId) as $profile |
             $profile.selectors[] |
             select(conflicts(.; $selector)) |
@@ -358,54 +420,12 @@ relayTargetsAvailable() {
     fi
 }
 
-# 把一个入口选择器绑定到目标上游，同时从其他冲突选择器中移除它。
-buildRelayStateWithSelector() {
-    local destinationId=$1 selector=$2 newProfile=${3:-null}
-    jq --arg destinationId "${destinationId}" --argjson selector "${selector}" --argjson newProfile "${newProfile}" '
-        def tagOverlap($left; $right):
-            any($left[]?; . as $used | $right | index($used) != null);
-        def subtractSelector($current; $selected):
-            if (($selected.users // []) | length) == 0 then
-                $current |
-                .inboundTags -= $selected.inboundTags |
-                select((.inboundTags | length) > 0)
-            elif (
-                (($current.users // []) | length) > 0 and
-                tagOverlap($current.inboundTags; $selected.inboundTags)
-            ) then
-                $current |
-                .users -= $selected.users |
-                select((.users | length) > 0)
-            else
-                $current
-            end;
-        (if $newProfile == null then . else .profiles += [$newProfile] end) |
-        .profiles |= map(
-            .selectors = (
-                [.selectors[]? | subtractSelector(.; $selector)] +
-                (if .id == $destinationId then [$selector] else [] end)
-            )
-        ) |
-        .profiles |= map(select((.selectors | length) > 0))
-    ' "${relayStateFile}"
-}
-
-# 将多个独立 selector 在一次状态更新中绑定到同一上游。
+# Bind selectors to a destination profile in one state update, removing each
+# from any other profile that claimed the same traffic. Prints the new state.
+# Usage: buildRelayStateWithSelectors <destinationId> <selectors-json-array> [new-profile-json]
 buildRelayStateWithSelectors() {
     local destinationId=$1 selectors=$2 newProfile=${3:-null}
-    jq --arg destinationId "${destinationId}" --argjson selectors "${selectors}" --argjson newProfile "${newProfile}" '
-        def tagOverlap($left; $right):
-            any($left[]?; . as $used | $right | index($used) != null);
-        def subtractSelector($current; $selected):
-            if (($selected.users // []) | length) == 0 then
-                $current |
-                .inboundTags -= $selected.inboundTags |
-                select((.inboundTags | length) > 0)
-            elif ((($current.users // []) | length) > 0 and tagOverlap($current.inboundTags; $selected.inboundTags)) then
-                $current |
-                .users -= $selected.users |
-                select((.users | length) > 0)
-            else $current end;
+    jq --arg destinationId "${destinationId}" --argjson selectors "${selectors}" --argjson newProfile "${newProfile}" "${relaySelectorJqDefs}"'
         (if $newProfile == null then . else .profiles += [$newProfile] end) |
         reduce $selectors[] as $selector (.;
             .profiles |= map(
@@ -419,14 +439,16 @@ buildRelayStateWithSelectors() {
     ' "${relayStateFile}"
 }
 
+# Delete relay outbound files that no profile in the current state uses.
 removeOrphanedRelayFiles() {
-    local previousStateFile=$1 orphanedFile
-    while read -r orphanedFile; do
-        if relayProfileFileIsSafe "${orphanedFile}" &&
-            ! jq -e --arg file "${orphanedFile}" 'any(.profiles[]?; .outboundFile == $file)' "${relayStateFile}" >/dev/null; then
-            rm -f "${configPath}${orphanedFile}"
-        fi
-    done < <(jq -r '.profiles[]?.outboundFile' "${previousStateFile}")
+    local file name
+    for file in "${configPath}"relay_*outbound.json; do
+        [[ -f "${file}" ]] || continue
+        name=${file##*/}
+        relayProfileFileIsSafe "${name}" || continue
+        jq -e --arg file "${name}" 'any(.profiles[]?; .outboundFile == $file)' "${relayStateFile}" >/dev/null \
+            || rm -f "${file}"
+    done
 }
 
 refreshRelaySubscriptionCron() {
@@ -438,97 +460,35 @@ refreshRelaySubscriptionCron() {
     fi
 }
 
-activateRelayProfile() {
-    local profile=$1 generatedOutbound=$2
-    local outboundFile profileId selectors emptyProfile backupDir validationOutput newState
+# Install a generated outbound and bind the profile's selectors to it.
+installRelayProfile() {
+    local profile=$1 generatedOutbound=$2 outboundFile profileId selectors emptyProfile
     outboundFile=$(jq -r '.outboundFile' <<<"${profile}")
     profileId=$(jq -r '.id' <<<"${profile}")
     selectors=$(jq -c '.selectors' <<<"${profile}")
     emptyProfile=$(jq -c '.selectors = []' <<<"${profile}")
+    cp "${generatedOutbound}" "${configPath}${outboundFile}" || return 1
+    chmod 600 "${configPath}${outboundFile}"
+    updateRelayState buildRelayStateWithSelectors "${profileId}" "${selectors}" "${emptyProfile}"
+}
+
+activateRelayProfile() {
+    local profile=$1 generatedOutbound=$2 outboundFile
+    outboundFile=$(jq -r '.outboundFile' <<<"${profile}")
     relayProfileFileIsSafe "${outboundFile}" || return 1
     ensureRelayStateV2 || return 1
-    backupDir=$(mktemp -d /tmp/xray-relay-profile.XXXXXX) || return 1
-    cp "${relayStateFile}" "${backupDir}/relay_config.json"
-    [[ -f "${configPath}09_routing.json" ]] && cp "${configPath}09_routing.json" "${backupDir}/09_routing.json"
-    [[ -f "${configPath}${outboundFile}" ]] && cp "${configPath}${outboundFile}" "${backupDir}/${outboundFile}"
-
-    mv "${generatedOutbound}" "${configPath}${outboundFile}" || {
-        rm -rf "${backupDir}"
-        return 1
-    }
-    chmod 600 "${configPath}${outboundFile}"
-    newState=$(buildRelayStateWithSelectors "${profileId}" "${selectors}" "${emptyProfile}") || {
-        if [[ -f "${backupDir}/${outboundFile}" ]]; then
-            cp "${backupDir}/${outboundFile}" "${configPath}${outboundFile}"
-        else
-            rm -f "${configPath}${outboundFile}"
-        fi
-        rm -rf "${backupDir}"
-        return 1
-    }
-    writeRelayState "${newState}" || {
-        if [[ -f "${backupDir}/${outboundFile}" ]]; then
-            cp "${backupDir}/${outboundFile}" "${configPath}${outboundFile}"
-        else
-            rm -f "${configPath}${outboundFile}"
-        fi
-        rm -rf "${backupDir}"
-        return 1
-    }
-    if ! rebuildRelayRouting || ! validationOutput=$(/opt/xray-agent/xray/xray run -test -confdir "${configPath}" 2>&1); then
-        cp "${backupDir}/relay_config.json" "${relayStateFile}"
-        [[ -f "${backupDir}/09_routing.json" ]] && cp "${backupDir}/09_routing.json" "${configPath}09_routing.json"
-        if [[ -f "${backupDir}/${outboundFile}" ]]; then
-            cp "${backupDir}/${outboundFile}" "${configPath}${outboundFile}"
-        else
-            rm -f "${configPath}${outboundFile}"
-        fi
-        echoContent red " ---> Xray 拒绝了新中转配置，已恢复上一版"
-        [[ -n "${validationOutput}" ]] && echoContent yellow "${validationOutput}"
-        rm -rf "${backupDir}"
-        return 1
-    fi
-    removeOrphanedRelayFiles "${backupDir}/relay_config.json"
-    rm -rf "${backupDir}"
-    refreshRelaySubscriptionCron
-    restartXray || return 1
+    commitRelayChange "启用新中转配置" installRelayProfile "${profile}" "${generatedOutbound}" || return 1
+    restartXray
 }
 
-attachRelaySelector() {
-    local destinationId=$1 selector=$2
-    attachRelaySelectors "${destinationId}" "[$selector]"
-}
-
-# 一次附加多个入口规则，只校验和重启 Xray 一次。
+# Attach several selectors to an existing upstream with one validation and
+# one restart.
 attachRelaySelectors() {
-    local destinationId=$1 selectors=$2
-    local backupDir newState validationOutput profileName
+    local destinationId=$1 selectors=$2 profileName
     ensureRelayStateV2 || return 1
     profileName=$(jq -r --arg id "${destinationId}" 'first(.profiles[] | select(.id == $id)).name // empty' "${relayStateFile}")
-    [[ -n "${profileName}" && -f "${configPath}09_routing.json" ]] || return 1
-    backupDir=$(mktemp -d /tmp/xray-relay-attach.XXXXXX) || return 1
-    cp "${relayStateFile}" "${backupDir}/relay_config.json"
-    cp "${configPath}09_routing.json" "${backupDir}/09_routing.json"
-
-    newState=$(buildRelayStateWithSelectors "${destinationId}" "${selectors}") || {
-        rm -rf "${backupDir}"
-        return 1
-    }
-    writeRelayState "${newState}" || {
-        rm -rf "${backupDir}"
-        return 1
-    }
-    if ! rebuildRelayRouting || ! validationOutput=$(/opt/xray-agent/xray/xray run -test -confdir "${configPath}" 2>&1); then
-        cp "${backupDir}/relay_config.json" "${relayStateFile}"
-        cp "${backupDir}/09_routing.json" "${configPath}09_routing.json"
-        echoContent red " ---> Xray 拒绝了入口规则，已恢复上一版"
-        [[ -n "${validationOutput}" ]] && echoContent yellow "${validationOutput}"
-        rm -rf "${backupDir}"
-        return 1
-    fi
-    removeOrphanedRelayFiles "${backupDir}/relay_config.json"
-    rm -rf "${backupDir}"
-    refreshRelaySubscriptionCron
+    [[ -n "${profileName}" ]] || return 1
+    commitRelayChange "绑定入口规则" updateRelayState buildRelayStateWithSelectors "${destinationId}" "${selectors}" || return 1
     restartXray || return 1
     echoContent green " ---> $(jq 'length' <<<"${selectors}") 个入口规则已绑定到现有上游: ${profileName}"
 }
@@ -540,9 +500,10 @@ selectRelayUdpMode() {
     [[ "${udpRelayStatus}" =~ ^[Yy]$ ]] && relaySelectedUdpMode=shared
 }
 
-# 使用 sing-box JSON 订阅新增 Shadowsocks 或 VLESS Reality 中转规则。
+# Add a Shadowsocks or VLESS Reality relay rule from a sing-box JSON subscription.
 setupRelaySubscription() {
-    local profileName=$1 profileId=$2 outboundTag="relay_profile_${profileId}" outboundFile="relay_${profileId}_outbound.json"
+    local profileName=$1 profileId=$2
+    local outboundTag="relay_profile_${profileId}" outboundFile="relay_${profileId}_outbound.json"
     selectRelayUdpMode
     local subscriptionUrl tempDir subscriptionFile supportedNodes nodeCount nodeIndex selectedTag generatedOutbound
     read -r -p "请输入 sing-box JSON 订阅地址:" subscriptionUrl
@@ -600,7 +561,7 @@ setupRelaySubscription() {
     echoContent green " ---> 中转规则 ${profileName} 已启用: ${selectedTag} -> ${relayBuiltAddress}:${relayBuiltPort}"
 }
 
-# 生成一个上游出站。第三个参数表示该出站是否承载 UDP。
+# Generate one upstream outbound. The third argument indicates whether the outbound carries UDP.
 buildRelayOutbound() {
     local outboundTag=$1 outputFile=$2 carriesUdp=$3 forcedProtocol=${4:-}
     local protocolChoice=${forcedProtocol}
@@ -628,89 +589,89 @@ buildRelayOutbound() {
 
     read -r -p "上游服务器端口[443]:" relayPort
     relayPort=${relayPort:-443}
-    if ! validateRelayPort "${relayPort}"; then
+    if ! isValidPort "${relayPort}"; then
         echoContent red " ---> 端口必须为 1-65535"
         return 1
     fi
 
     case ${protocolChoice} in
-    1)
-        read -r -p "上游 Vision UUID:" relayUUID
-        [[ -z "${relayUUID}" ]] && echoContent red " ---> UUID 不能为空" && return 1
-        read -r -p "SNI[默认使用上游地址]:" relaySNI
-        relaySNI=${relaySNI:-${relayAddress}}
-        relayFlow="xtls-rprx-vision"
-        if [[ "${carriesUdp}" == "true" ]]; then
-            relayFlow="xtls-rprx-vision-udp443"
-        fi
-        jq -n --arg tag "${outboundTag}" --arg address "${relayAddress}" --argjson port "${relayPort}" \
-            --arg id "${relayUUID}" --arg flow "${relayFlow}" --arg sni "${relaySNI}" '
+        1)
+            read -r -p "上游 Vision UUID:" relayUUID
+            [[ -z "${relayUUID}" ]] && echoContent red " ---> UUID 不能为空" && return 1
+            read -r -p "SNI[默认使用上游地址]:" relaySNI
+            relaySNI=${relaySNI:-${relayAddress}}
+            relayFlow="xtls-rprx-vision"
+            if [[ "${carriesUdp}" == "true" ]]; then
+                relayFlow="xtls-rprx-vision-udp443"
+            fi
+            jq -n --arg tag "${outboundTag}" --arg address "${relayAddress}" --argjson port "${relayPort}" \
+                --arg id "${relayUUID}" --arg flow "${relayFlow}" --arg sni "${relaySNI}" '
             {outbounds:[{tag:$tag,protocol:"vless",settings:{vnext:[{address:$address,port:$port,users:[{id:$id,encryption:"none",flow:$flow}]}]},streamSettings:{network:"tcp",security:"tls",tlsSettings:{serverName:$sni,allowInsecure:false}}}]}' >"${outputFile}"
-        relayBuiltProtocol="vision"
-        relayBuiltLabel="VLESS + TCP + TLS Vision"
-        ;;
-    2)
-        read -r -p "上游 WebSocket UUID:" relayUUID
-        [[ -z "${relayUUID}" ]] && echoContent red " ---> UUID 不能为空" && return 1
-        read -r -p "SNI[默认使用上游地址]:" relaySNI
-        relaySNI=${relaySNI:-${relayAddress}}
-        read -r -p "WebSocket Host[默认与 SNI 相同]:" relayHost
-        relayHost=${relayHost:-${relaySNI}}
-        read -r -p "WebSocket 路径[例:/ray]:" relayPath
-        [[ -z "${relayPath}" ]] && echoContent red " ---> WebSocket 路径不能为空" && return 1
-        [[ "${relayPath}" != /* ]] && relayPath="/${relayPath}"
-        jq -n --arg tag "${outboundTag}" --arg address "${relayAddress}" --argjson port "${relayPort}" \
-            --arg id "${relayUUID}" --arg sni "${relaySNI}" --arg host "${relayHost}" --arg path "${relayPath}" '
+            relayBuiltProtocol="vision"
+            relayBuiltLabel="VLESS + TCP + TLS Vision"
+            ;;
+        2)
+            read -r -p "上游 WebSocket UUID:" relayUUID
+            [[ -z "${relayUUID}" ]] && echoContent red " ---> UUID 不能为空" && return 1
+            read -r -p "SNI[默认使用上游地址]:" relaySNI
+            relaySNI=${relaySNI:-${relayAddress}}
+            read -r -p "WebSocket Host[默认与 SNI 相同]:" relayHost
+            relayHost=${relayHost:-${relaySNI}}
+            read -r -p "WebSocket 路径[例:/ray]:" relayPath
+            [[ -z "${relayPath}" ]] && echoContent red " ---> WebSocket 路径不能为空" && return 1
+            [[ "${relayPath}" != /* ]] && relayPath="/${relayPath}"
+            jq -n --arg tag "${outboundTag}" --arg address "${relayAddress}" --argjson port "${relayPort}" \
+                --arg id "${relayUUID}" --arg sni "${relaySNI}" --arg host "${relayHost}" --arg path "${relayPath}" '
             {outbounds:[{tag:$tag,protocol:"vless",settings:{vnext:[{address:$address,port:$port,users:[{id:$id,encryption:"none"}]}]},streamSettings:{network:"ws",security:"tls",tlsSettings:{serverName:$sni,allowInsecure:false},wsSettings:{path:$path,headers:{Host:$host}}}}]}' >"${outputFile}"
-        relayBuiltProtocol="websocket"
-        relayBuiltLabel="VLESS + WebSocket + TLS"
-        ;;
-    3)
-        read -r -p "上游 Reality UUID:" relayUUID
-        [[ -z "${relayUUID}" ]] && echoContent red " ---> UUID 不能为空" && return 1
-        read -r -p "Reality Server Name (SNI):" relaySNI
-        [[ -z "${relaySNI}" ]] && echoContent red " ---> Reality SNI 不能为空" && return 1
-        read -r -p "Reality Password/Public Key:" relayPublicKey
-        [[ -z "${relayPublicKey}" ]] && echoContent red " ---> Reality Password/Public Key 不能为空" && return 1
-        read -r -p "Reality Short ID[可留空]:" relayShortId
-        read -r -p "Reality ML-DSA-65 Verify/PQV[未启用可留空]:" relayMldsa65Verify
-        relayFlow="xtls-rprx-vision"
-        if [[ "${carriesUdp}" == "true" ]]; then
-            relayFlow="xtls-rprx-vision-udp443"
-        fi
-        jq -n --arg tag "${outboundTag}" --arg address "${relayAddress}" --argjson port "${relayPort}" \
-            --arg id "${relayUUID}" --arg flow "${relayFlow}" --arg sni "${relaySNI}" --arg password "${relayPublicKey}" \
-            --arg sid "${relayShortId}" --arg pqv "${relayMldsa65Verify}" '
+            relayBuiltProtocol="websocket"
+            relayBuiltLabel="VLESS + WebSocket + TLS"
+            ;;
+        3)
+            read -r -p "上游 Reality UUID:" relayUUID
+            [[ -z "${relayUUID}" ]] && echoContent red " ---> UUID 不能为空" && return 1
+            read -r -p "Reality Server Name (SNI):" relaySNI
+            [[ -z "${relaySNI}" ]] && echoContent red " ---> Reality SNI 不能为空" && return 1
+            read -r -p "Reality Password/Public Key:" relayPublicKey
+            [[ -z "${relayPublicKey}" ]] && echoContent red " ---> Reality Password/Public Key 不能为空" && return 1
+            read -r -p "Reality Short ID[可留空]:" relayShortId
+            read -r -p "Reality ML-DSA-65 Verify/PQV[未启用可留空]:" relayMldsa65Verify
+            relayFlow="xtls-rprx-vision"
+            if [[ "${carriesUdp}" == "true" ]]; then
+                relayFlow="xtls-rprx-vision-udp443"
+            fi
+            jq -n --arg tag "${outboundTag}" --arg address "${relayAddress}" --argjson port "${relayPort}" \
+                --arg id "${relayUUID}" --arg flow "${relayFlow}" --arg sni "${relaySNI}" --arg password "${relayPublicKey}" \
+                --arg sid "${relayShortId}" --arg pqv "${relayMldsa65Verify}" '
             {outbounds:[{tag:$tag,protocol:"vless",settings:{vnext:[{address:$address,port:$port,users:[{id:$id,encryption:"none",flow:$flow}]}]},streamSettings:{network:"tcp",security:"reality",realitySettings:({show:false,serverName:$sni,fingerprint:"chrome",password:$password,shortId:$sid,spiderX:"/"} + if $pqv == "" then {} else {mldsa65Verify:$pqv} end)}}]}' >"${outputFile}"
-        relayBuiltProtocol="reality"
-        relayBuiltLabel="VLESS + Reality + Vision"
-        ;;
-    4)
-        read -r -p "上游 Hysteria2 认证密码:" relayAuth
-        [[ -z "${relayAuth}" ]] && echoContent red " ---> Hysteria2 认证密码不能为空" && return 1
-        read -r -p "SNI[默认使用上游地址]:" relaySNI
-        relaySNI=${relaySNI:-${relayAddress}}
-        selectHysteria2BbrProfile "standard" "上游Hysteria2"
-        relayBbrProfile=${selectedHysteria2BbrProfile}
-        jq -n --arg tag "${outboundTag}" --arg address "${relayAddress}" --argjson port "${relayPort}" \
-            --arg auth "${relayAuth}" --arg sni "${relaySNI}" --arg bbrProfile "${relayBbrProfile}" '
+            relayBuiltProtocol="reality"
+            relayBuiltLabel="VLESS + Reality + Vision"
+            ;;
+        4)
+            read -r -p "上游 Hysteria2 认证密码:" relayAuth
+            [[ -z "${relayAuth}" ]] && echoContent red " ---> Hysteria2 认证密码不能为空" && return 1
+            read -r -p "SNI[默认使用上游地址]:" relaySNI
+            relaySNI=${relaySNI:-${relayAddress}}
+            selectHysteria2BbrProfile "standard" "上游Hysteria2"
+            relayBbrProfile=${selectedHysteria2BbrProfile}
+            jq -n --arg tag "${outboundTag}" --arg address "${relayAddress}" --argjson port "${relayPort}" \
+                --arg auth "${relayAuth}" --arg sni "${relaySNI}" --arg bbrProfile "${relayBbrProfile}" '
             {outbounds:[{tag:$tag,protocol:"hysteria",settings:{version:2,address:$address,port:$port},streamSettings:{network:"hysteria",security:"tls",tlsSettings:{serverName:$sni,allowInsecure:false,alpn:["h3"]},hysteriaSettings:{version:2,auth:$auth,udpIdleTimeout:60},finalmask:{quicParams:{congestion:"bbr",bbrProfile:$bbrProfile}}}}]}' >"${outputFile}"
-        relayBuiltProtocol="hysteria2"
-        relayBuiltLabel="Hysteria2 + TLS + QUIC"
-        relayBuiltBbrProfile=${relayBbrProfile}
-        ;;
-    5)
-        read -r -p "Shadowsocks 加密方式[aes-256-gcm]:" relayMethod
-        relayMethod=${relayMethod:-aes-256-gcm}
-        read -r -s -p "Shadowsocks 密码:" relayPassword
-        echo
-        [[ -z "${relayPassword}" ]] && echoContent red " ---> Shadowsocks 密码不能为空" && return 1
-        jq -n --arg tag "${outboundTag}" --arg address "${relayAddress}" --argjson port "${relayPort}" \
-            --arg method "${relayMethod}" --arg password "${relayPassword}" '
+            relayBuiltProtocol="hysteria2"
+            relayBuiltLabel="Hysteria2 + TLS + QUIC"
+            relayBuiltBbrProfile=${relayBbrProfile}
+            ;;
+        5)
+            read -r -p "Shadowsocks 加密方式[aes-256-gcm]:" relayMethod
+            relayMethod=${relayMethod:-aes-256-gcm}
+            read -r -s -p "Shadowsocks 密码:" relayPassword
+            echo
+            [[ -z "${relayPassword}" ]] && echoContent red " ---> Shadowsocks 密码不能为空" && return 1
+            jq -n --arg tag "${outboundTag}" --arg address "${relayAddress}" --argjson port "${relayPort}" \
+                --arg method "${relayMethod}" --arg password "${relayPassword}" '
             {outbounds:[{tag:$tag,protocol:"shadowsocks",settings:{address:$address,port:$port,method:$method,password:$password}}]}' >"${outputFile}"
-        relayBuiltProtocol="shadowsocks"
-        relayBuiltLabel="Shadowsocks (${relayMethod})"
-        ;;
+            relayBuiltProtocol="shadowsocks"
+            relayBuiltLabel="Shadowsocks (${relayMethod})"
+            ;;
     esac
 
     relayBuiltAddress=${relayAddress}
@@ -721,10 +682,11 @@ buildRelayOutbound() {
     }
 }
 
-# 根据全部 profiles 重建中转路由，未绑定的入站继续使用原有分流。
+# Rebuild the relay routing from all profiles; inbounds that are not bound keep their existing routing.
 rebuildRelayRouting() {
     local routingFile="${configPath}09_routing.json"
-    [[ -f "${routingFile}" ]] || return 1
+    # Other menus (reinstall, global IPv6/WARP modes) may have deleted it.
+    [[ -f "${routingFile}" ]] || echo '{"routing":{"rules":[]}}' >"${routingFile}" || return 1
     ensureRelayStateV2 || return 1
     local relayRules managedTags newConfig
     relayRules=$(jq '
@@ -756,11 +718,20 @@ rebuildRelayRouting() {
                    (.outboundTag != "relay_udp_outbound") and
                    ((.outboundTag // "") | startswith("relay_profile_") | not))])
     ' "${routingFile}") || return 1
-    echo "${newConfig}" >"${routingFile}"
+    echo "${newConfig}" >"${routingFile}.tmp.$$" && mv "${routingFile}.tmp.$$" "${routingFile}"
+}
+
+# Re-apply relay rules after something else rewrote or deleted
+# 09_routing.json, so relay state and live routing cannot drift apart.
+syncRelayRouting() {
+    [[ -f "${relayStateFile}" ]] || return 0
+    jq -e '(.profiles // []) | length > 0' "${relayStateFile}" >/dev/null 2>&1 || return 0
+    rebuildRelayRouting
 }
 
 setupRelayManual() {
-    local profileName=$1 profileId=$2 outboundTag="relay_profile_${profileId}" outboundFile="relay_${profileId}_outbound.json"
+    local profileName=$1 profileId=$2
+    local outboundTag="relay_profile_${profileId}" outboundFile="relay_${profileId}_outbound.json"
     selectRelayUdpMode
     local tempDir generatedOutbound carriesUdp profile
     tempDir=$(mktemp -d /tmp/xray-relay-manual.XXXXXX) || return 1
@@ -813,21 +784,23 @@ selectRelayDestination() {
 
 setupRelay() {
     echoContent skyBlue "\n新增入口规则"
-    echoContent yellow "# 一个上游可绑定多个入口；指定账号优先于“全部 UUID”兜底规则\n"
+    echoContent yellow "# 一个上游可绑定多个入口；指定账号优先于「全部 UUID」兜底规则\n"
     selectRelayTargets || return
     selectRelayDestination || return
     if [[ "${relayUseExistingProfile}" == "true" ]]; then
         local selector
-        while read -r selector; do
+        # The selector list is read from fd 3 so the y/N prompt inside
+        # relayTargetsAvailable still reads from the terminal.
+        while read -r -u 3 selector; do
             relayTargetsAvailable "${selector}" "${relaySelectedDestinationId}" || return
-        done < <(jq -c '.[]' <<<"${relaySelectedSelectors}")
+        done 3< <(jq -c '.[]' <<<"${relaySelectedSelectors}")
         attachRelaySelectors "${relaySelectedDestinationId}" "${relaySelectedSelectors}"
         return
     fi
     local selector
-    while read -r selector; do
+    while read -r -u 3 selector; do
         relayTargetsAvailable "${selector}" || return
-    done < <(jq -c '.[]' <<<"${relaySelectedSelectors}")
+    done 3< <(jq -c '.[]' <<<"${relaySelectedSelectors}")
 
     echoContent skyBlue "\n请选择上游配置来源"
     echoContent yellow "1.sing-box JSON 订阅中的 Shadowsocks / VLESS Reality 节点"
@@ -839,8 +812,8 @@ setupRelay() {
     profileName=${profileName:-中转规则}
     profileId="$(date +%s)_${RANDOM}"
     case ${relaySource} in
-    1) setupRelaySubscription "${profileName}" "${profileId}" ;;
-    2) setupRelayManual "${profileName}" "${profileId}" ;;
+        1) setupRelaySubscription "${profileName}" "${profileId}" ;;
+        2) setupRelayManual "${profileName}" "${profileId}" ;;
     esac
 }
 
@@ -853,12 +826,12 @@ showRelayConfig() {
         return
     fi
     echoContent skyBlue "\n当前中转上游"
-    jq -r '.profiles | to_entries[] |
+    jq -r "${relaySelectorJqDefs}"'.profiles | to_entries[] |
         "\(.key + 1). \(.value.name)\n" +
         (.value.selectors | to_entries | map(
             "   入口 \(.key + 1): \(.value.inboundTags | join(", ")) / 账号: " +
             (if ((.value.users // []) | length) > 0 then
-                ([.value.users[] | sub("-(VLESS_TCP/TLS_Vision|VLESS_WS|vless_reality_vision|Hysteria2)$"; "")] | join(", "))
+                ([.value.users[] | displayUser] | join(", "))
              else "全部 UUID" end)
         ) | join("\n")) +
         "\n   TCP : \(.value.tcp.label) -> \(.value.tcp.address):\(.value.tcp.port)\n" +
@@ -925,42 +898,30 @@ updateRelaySubscriptionProfile() {
         rm -rf "${tempDir}"
         return 0
     fi
-    local backupFile="${tempDir}/backup.json" validationOutput
-    [[ -f "${configPath}${outboundFile}" ]] && cp "${configPath}${outboundFile}" "${backupFile}"
-    mv "${generatedOutbound}" "${configPath}${outboundFile}"
-    chmod 600 "${configPath}${outboundFile}"
-    if ! validationOutput=$(/opt/xray-agent/xray/xray run -test -confdir "${configPath}" 2>&1); then
-        if [[ -f "${backupFile}" ]]; then
-            cp "${backupFile}" "${configPath}${outboundFile}"
-        else
-            rm -f "${configPath}${outboundFile}"
-        fi
-        echoContent red " ---> 新订阅配置验证失败，已保留旧配置"
-        echoContent yellow "${validationOutput}"
+    if ! commitRelayChange "订阅更新" installRelayOutbound "${generatedOutbound}" "${outboundFile}" "${newState}"; then
+        echoContent red " ---> $(jq -r '.name' <<<"${profile}"): 新订阅配置验证失败，已保留旧配置"
         rm -rf "${tempDir}"
         return 1
     fi
-    writeRelayState "${newState}" || {
-        if [[ -f "${backupFile}" ]]; then
-            cp "${backupFile}" "${configPath}${outboundFile}"
-        else
-            rm -f "${configPath}${outboundFile}"
-        fi
-        rm -rf "${tempDir}"
-        return 1
-    }
     relaySubscriptionChanged=true
     echoContent green " ---> $(jq -r '.name' <<<"${profile}"): 已更新到 ${selectedTag} -> ${relayBuiltAddress}:${relayBuiltPort}"
     rm -rf "${tempDir}"
 }
 
+# Install a refreshed outbound file together with its updated state.
+installRelayOutbound() {
+    local generatedOutbound=$1 outboundFile=$2 newState=$3
+    cp "${generatedOutbound}" "${configPath}${outboundFile}" || return 1
+    chmod 600 "${configPath}${outboundFile}"
+    writeRelayState "${newState}"
+}
+
 updateRelaySubscription() {
+    withRelayLock updateAllRelaySubscriptions
+}
+
+updateAllRelaySubscriptions() {
     ensureRelayStateV2 || return 1
-    exec 9>/opt/xray-agent/update-relay.lock
-    if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
-        echoContent yellow " ---> 中转订阅更新任务正在运行"
-        return 0
-    fi
     local profileId updateFailed=false
     relaySubscriptionChanged=false
     while read -r profileId; do
@@ -974,7 +935,7 @@ updateRelaySubscription() {
 
 removeRelaySelector() {
     ensureRelayStateV2 || return
-    local bindings count selection profileId selectorIndex backupDir newState validationOutput
+    local bindings count selection profileId selectorIndex
     bindings=$(jq -c '[
         .profiles[] as $profile |
         $profile.selectors | to_entries[] |
@@ -988,10 +949,10 @@ removeRelaySelector() {
     ]' "${relayStateFile}") || return 1
     count=$(jq 'length' <<<"${bindings}")
     ((count == 0)) && echoContent yellow " ---> 当前没有入口规则" && return
-    jq -r 'to_entries[] |
+    jq -r "${relaySelectorJqDefs}"'to_entries[] |
         "\(.key + 1).\(.value.profileName) <- \(.value.inboundTags | join(", ")) / 账号: " +
         (if (.value.users | length) > 0 then
-            ([.value.users[] | sub("-(VLESS_TCP/TLS_Vision|VLESS_WS|vless_reality_vision|Hysteria2)$"; "")] | join(", "))
+            ([.value.users[] | displayUser] | join(", "))
          else "全部 UUID" end)
     ' <<<"${bindings}"
     read -r -p "请选择要删除的入口规则:" selection
@@ -1001,41 +962,17 @@ removeRelaySelector() {
     fi
     profileId=$(jq -r --argjson index "$((selection - 1))" '.[$index].profileId' <<<"${bindings}")
     selectorIndex=$(jq -r --argjson index "$((selection - 1))" '.[$index].selectorIndex' <<<"${bindings}")
-    [[ -f "${configPath}09_routing.json" ]] || return 1
-    backupDir=$(mktemp -d /tmp/xray-relay-selector-remove.XXXXXX) || return
-    cp "${relayStateFile}" "${backupDir}/relay_config.json"
-    cp "${configPath}09_routing.json" "${backupDir}/09_routing.json"
-    newState=$(jq --arg id "${profileId}" --argjson selectorIndex "${selectorIndex}" '
-        .profiles |= map(
-            if .id == $id then del(.selectors[$selectorIndex]) else . end
-        ) |
+    commitRelayChange "删除入口规则" updateRelayState jq --arg id "${profileId}" --argjson selectorIndex "${selectorIndex}" '
+        .profiles |= map(if .id == $id then del(.selectors[$selectorIndex]) else . end) |
         .profiles |= map(select((.selectors | length) > 0))
-    ' "${relayStateFile}") || {
-        rm -rf "${backupDir}"
-        return 1
-    }
-    writeRelayState "${newState}" || {
-        rm -rf "${backupDir}"
-        return 1
-    }
-    if ! rebuildRelayRouting || ! validationOutput=$(/opt/xray-agent/xray/xray run -test -confdir "${configPath}" 2>&1); then
-        cp "${backupDir}/relay_config.json" "${relayStateFile}"
-        cp "${backupDir}/09_routing.json" "${configPath}09_routing.json"
-        echoContent red " ---> 删除入口规则后验证失败，已恢复"
-        [[ -n "${validationOutput}" ]] && echoContent yellow "${validationOutput}"
-        rm -rf "${backupDir}"
-        return 1
-    fi
-    removeOrphanedRelayFiles "${backupDir}/relay_config.json"
-    rm -rf "${backupDir}"
-    refreshRelaySubscriptionCron
+    ' "${relayStateFile}" || return 1
     restartXray || return 1
     echoContent green " ---> 入口规则已删除"
 }
 
 removeRelayProfile() {
     ensureRelayStateV2 || return
-    local count selection profile outboundFile backupDir newState validationOutput
+    local count selection
     count=$(jq '.profiles | length' "${relayStateFile}")
     ((count == 0)) && echoContent yellow " ---> 当前没有中转上游" && return
     jq -r '.profiles | to_entries[] | "\(.key + 1).\(.value.name) [入口规则: \(.value.selectors | length) 条]"' "${relayStateFile}"
@@ -1044,42 +981,38 @@ removeRelayProfile() {
         echoContent red " ---> 上游选项无效"
         return
     fi
-    profile=$(jq -c --argjson index "$((selection - 1))" '.profiles[$index]' "${relayStateFile}")
-    outboundFile=$(jq -r '.outboundFile' <<<"${profile}")
-    relayProfileFileIsSafe "${outboundFile}" || return 1
-    backupDir=$(mktemp -d /tmp/xray-relay-remove.XXXXXX) || return
-    cp "${relayStateFile}" "${backupDir}/relay_config.json"
-    cp "${configPath}09_routing.json" "${backupDir}/09_routing.json"
-    [[ -f "${configPath}${outboundFile}" ]] && cp "${configPath}${outboundFile}" "${backupDir}/${outboundFile}"
-    newState=$(jq --argjson index "$((selection - 1))" 'del(.profiles[$index])' "${relayStateFile}") || return 1
-    writeRelayState "${newState}" || return 1
-    rm -f "${configPath}${outboundFile}"
-    if ! rebuildRelayRouting || ! validationOutput=$(/opt/xray-agent/xray/xray run -test -confdir "${configPath}" 2>&1); then
-        cp "${backupDir}/relay_config.json" "${relayStateFile}"
-        cp "${backupDir}/09_routing.json" "${configPath}09_routing.json"
-        [[ -f "${backupDir}/${outboundFile}" ]] && cp "${backupDir}/${outboundFile}" "${configPath}${outboundFile}"
-        echoContent red " ---> 删除后的配置验证失败，已恢复"
-        rm -rf "${backupDir}"
-        return 1
-    fi
-    rm -rf "${backupDir}"
-    refreshRelaySubscriptionCron
+    # The outbound file is removed by commitRelayChange once nothing uses it.
+    commitRelayChange "删除中转上游" updateRelayState jq --argjson index "$((selection - 1))" \
+        'del(.profiles[$index])' "${relayStateFile}" || return 1
     restartXray || return 1
     echoContent green " ---> 中转上游已删除"
 }
 
 removeRelay() {
     ensureRelayStateV2 || return
-    local outboundFile
-    while read -r outboundFile; do
-        relayProfileFileIsSafe "${outboundFile}" && rm -f "${configPath}${outboundFile}"
-    done < <(jq -r '.profiles[]?.outboundFile' "${relayStateFile}")
-    writeRelayState '{"version":2,"profiles":[]}'
-    rebuildRelayRouting
+    commitRelayChange "停用全部中转" writeRelayState '{"version":2,"profiles":[]}' || return 1
     rm -f /opt/xray-agent/relay_config
-    removeCronRelaySubscription
     restartXray || return 1
     echoContent green " ---> 所有中转规则已停用，相关入站恢复原有分流"
+}
+
+# Remove deleted accounts from every selector. A selector that only listed
+# those accounts is dropped entirely: an empty users list would otherwise
+# mean "the whole inbound" and silently widen the rule.
+# Usage: removeRelayUsers <xray-email>...
+removeRelayUsers() {
+    [[ -f "${relayStateFile}" ]] || return 0
+    local emails
+    emails=$(printf '%s\n' "$@" | jq -R . | jq -sc .)
+    jq -e --argjson emails "${emails}" 'any(.profiles[]?.selectors[]?; ((.users // []) - $emails) != (.users // []))' \
+        "${relayStateFile}" >/dev/null 2>&1 || return 0
+    commitRelayChange "清理已删除账号的中转规则" updateRelayState jq --argjson emails "${emails}" '
+        .profiles |= map(.selectors |= map(
+            if ((.users // []) | length) == 0 then .
+            else (.users -= $emails) | select((.users | length) > 0) end
+        )) |
+        .profiles |= map(select((.selectors | length) > 0))
+    ' "${relayStateFile}"
 }
 
 manageRelay() {
@@ -1106,14 +1039,14 @@ manageRelay() {
         echoContent red "=============================================================="
         read -r -p "请选择:" relayType
         case ${relayType} in
-        1) setupRelay ;;
-        2) showRelayConfig ;;
-        3) updateRelaySubscription ;;
-        4) removeRelaySelector ;;
-        5) removeRelayProfile ;;
-        6) removeRelay ;;
-        0) return ;;
-        *) echoContent red " ---> 请输入 0-6" ;;
+            1) withRelayLock setupRelay ;;
+            2) showRelayConfig ;;
+            3) updateRelaySubscription ;;
+            4) withRelayLock removeRelaySelector ;;
+            5) withRelayLock removeRelayProfile ;;
+            6) withRelayLock removeRelay ;;
+            0) return ;;
+            *) echoContent red " ---> 请输入 0-6" ;;
         esac
         read -r -p "按回车键继续..."
     done

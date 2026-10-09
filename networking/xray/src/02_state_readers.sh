@@ -1,9 +1,8 @@
-# 读取tls证书详情
+# Read TLS certificate details
 readAcmeTLS() {
     local readAcmeDomain=
     installedDNSAPIStatus=
     dnsTLSAcmeCertPath=
-    dnsTLSAcmeKeyPath=
     if [[ -n "${currentHost}" ]]; then
         readAcmeDomain="${currentHost}"
     fi
@@ -18,7 +17,7 @@ readAcmeTLS() {
     local candidateDir candidateCert candidateKey
     while IFS= read -r candidateDir; do
         while IFS= read -r candidateCert; do
-            # 目录命名在不同 acme.sh 版本中可能不同，以证书 SAN 为准。
+            # Directory naming differs between acme.sh versions; rely on the certificate SAN.
             if openssl x509 -in "${candidateCert}" -noout -text 2>/dev/null | grep -Fq "DNS:*.${dnsTLSDomain}"; then
                 candidateKey="${candidateCert%.cer}.key"
                 if [[ ! -f "${candidateKey}" ]]; then
@@ -27,7 +26,6 @@ readAcmeTLS() {
                 if [[ -f "${candidateKey}" ]]; then
                     installedDNSAPIStatus=true
                     dnsTLSAcmeCertPath="${candidateCert}"
-                    dnsTLSAcmeKeyPath="${candidateKey}"
                     return 0
                 fi
             fi
@@ -35,7 +33,7 @@ readAcmeTLS() {
     done < <(find "$HOME/.acme.sh" -maxdepth 1 -type d -name "*.${dnsTLSDomain}_ecc" 2>/dev/null)
 }
 
-# 读取默认自定义端口
+# Read the default custom port
 readCustomPort() {
     if [[ -n "${configPath}" && -z "${realityStatus}" && "${coreInstallType}" == "1" ]]; then
         local port=
@@ -46,7 +44,7 @@ readCustomPort() {
     fi
 }
 
-# 读取nginx订阅端口
+# Read the nginx subscription port
 readNginxSubscribe() {
     subscribeType="https"
     if [[ -f "${nginxConfigPath}subscribe.conf" ]]; then
@@ -64,15 +62,15 @@ readNginxSubscribe() {
     fi
 }
 
-# 检测安装方式
+# Detect the installation method
 readInstallType() {
     coreInstallType=
     configPath=
 
-    # 1.检测安装目录
+    # 1. Check the installation directory
     if [[ -d "/opt/xray-agent" ]]; then
         if [[ -f "/opt/xray-agent/xray/xray" ]]; then
-            # 检测xray-core
+            # Detect xray-core
             if [[ -d "/opt/xray-agent/xray/conf" ]] && [[ -f "/opt/xray-agent/xray/conf/02_VLESS_TCP_inbounds.json" || -f "/opt/xray-agent/xray/conf/05_hysteria2_inbounds.json" || -f "/opt/xray-agent/xray/conf/07_VLESS_vision_reality_inbounds.json" ]]; then
                 # xray-core
                 configPath=/opt/xray-agent/xray/conf/
@@ -86,7 +84,7 @@ readInstallType() {
     fi
 }
 
-# 读取协议类型
+# Read the protocol types
 readInstallProtocolType() {
     currentInstallProtocolType=
     frontingType=
@@ -94,17 +92,15 @@ readInstallProtocolType() {
     xrayVLESSRealityPort=
     xrayVLESSRealityServerName=
 
-
     hysteria2Port=
-
+    xrayXhttpRealityPort=
+    currentXhttpPath=
 
     currentRealityPrivateKey=
     currentRealityPublicKey=
 
     currentRealityMldsa65Seed=
     currentRealityMldsa65Verify=
-
-    frontingTypeReality=
 
     while read -r row; do
         if echo "${row}" | grep -q VLESS_TCP_inbounds; then
@@ -114,6 +110,26 @@ readInstallProtocolType() {
         if echo "${row}" | grep -q VLESS_WS_inbounds; then
             currentInstallProtocolType="${currentInstallProtocolType}1,"
             frontingType=03_VLESS_WS_inbounds
+        fi
+        if [[ "${row}" == */14_VLESS_XHTTP_TLS_inbounds ]]; then
+            currentInstallProtocolType="${currentInstallProtocolType}14,"
+            currentXhttpPath=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path // empty' "${row}.json")
+        fi
+        if [[ "${row}" == */12_VLESS_XHTTP_inbounds ]]; then
+            currentInstallProtocolType="${currentInstallProtocolType}12,"
+            xrayXhttpRealityPort=$(jq -r '.inbounds[0].port' "${row}.json")
+            [[ -n "${currentXhttpPath}" ]] || currentXhttpPath=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path // empty' "${row}.json")
+            # Both REALITY inbounds share one identity; read it from here when
+            # Vision + REALITY (07_, read earlier) is not installed.
+            if [[ -z "${currentRealityPublicKey}" ]]; then
+                xrayVLESSRealityServerName=$(jq -r .inbounds[0].streamSettings.realitySettings.serverNames[0] "${row}.json")
+                realityServerName=${xrayVLESSRealityServerName}
+                realityDomainPort=$(jq -r '.inbounds[0].streamSettings.realitySettings.dest // .inbounds[0].streamSettings.realitySettings.target' "${row}.json" | awk -F '[:]' '{print $2}')
+                currentRealityPublicKey=$(jq -r .inbounds[0].streamSettings.realitySettings.publicKey "${row}.json")
+                currentRealityPrivateKey=$(jq -r .inbounds[0].streamSettings.realitySettings.privateKey "${row}.json")
+                currentRealityMldsa65Seed=$(jq -r '.inbounds[0].streamSettings.realitySettings.mldsa65Seed // empty' "${row}.json")
+                currentRealityMldsa65Verify=$(jq -r '.inbounds[0].streamSettings.realitySettings.mldsa65Verify // empty' "${row}.json")
+            fi
         fi
         if echo "${row}" | grep -q hysteria2_inbounds; then
             currentInstallProtocolType="${currentInstallProtocolType}6,"
@@ -133,12 +149,11 @@ readInstallProtocolType() {
             currentRealityMldsa65Seed=$(jq -r .inbounds[0].streamSettings.realitySettings.mldsa65Seed "${row}.json")
             currentRealityMldsa65Verify=$(jq -r .inbounds[0].streamSettings.realitySettings.mldsa65Verify "${row}.json")
 
-            frontingTypeReality=07_VLESS_vision_reality_inbounds
         fi
     done < <(find ${configPath} -name "*inbounds.json" | sort | awk -F "[.]" '{print $1}')
 
     if [[ "${currentInstallProtocolType:0:1}" != "," ]]; then
         currentInstallProtocolType=",${currentInstallProtocolType}"
     fi
+    repairRealityPublicKey
 }
-

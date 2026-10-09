@@ -1,4 +1,4 @@
-# 检查ipv6、ipv4
+# Check IPv6 and IPv4
 checkIPv6() {
     currentIPv6IP=$(curl -s -6 -m 4 http://www.cloudflare.com/cdn-cgi/trace | grep "ip" | cut -d "=" -f 2)
 
@@ -8,7 +8,7 @@ checkIPv6() {
     fi
 }
 
-# ipv6 分流
+# IPv6 split routing
 ipv6Routing() {
     if [[ -z "${configPath}" ]]; then
         echoContent red " ---> 未安装，请使用脚本安装"
@@ -58,7 +58,10 @@ ipv6Routing() {
                 removeXrayOutbound wireguard_out_IPv6
                 removeXrayOutbound socks5_outbound
 
-                rm ${configPath}09_routing.json >/dev/null 2>&1
+                rm -f "${configPath}09_routing.json"
+                # Global outbound mode drops the shared routing rules; relay
+                # bindings are kept and re-applied on top of it.
+                syncRelayRouting
             fi
 
             echoContent green " ---> IPv6全局出站设置完毕"
@@ -76,7 +79,6 @@ ipv6Routing() {
             addXrayOutbound "z_direct_outbound"
         fi
 
-
         echoContent green " ---> IPv6分流卸载成功"
     else
         echoContent red " ---> 选择错误"
@@ -86,8 +88,7 @@ ipv6Routing() {
     restartXray || return 1
 }
 
-
-# ipv6分流规则展示
+# Show IPv6 split routing rules
 showIPv6Routing() {
     if [[ "${coreInstallType}" == "1" ]]; then
         if [[ -f "${configPath}09_routing.json" ]]; then
@@ -102,15 +103,14 @@ showIPv6Routing() {
 
     fi
 }
-# 域名黑名单
+# Domain blocklist
 
-
-# 添加routing配置
+# Add the routing config
 addInstallRouting() {
 
     local tag=$1    # warp-socks
     local type=$2   # outboundTag/inboundTag
-    local domain=$3 # 域名
+    local domain=$3 # Domain
 
     if [[ -z "${tag}" || -z "${type}" || -z "${domain}" ]]; then
         echoContent red " ---> 参数错误"
@@ -167,7 +167,7 @@ EOF
     routing=$(jq -r ".routing.rules += [${routingRule}]" ${configPath}09_routing.json)
     echo "${routing}" | jq . >${configPath}09_routing.json
 }
-# 根据tag卸载Routing
+# Remove Routing by tag
 unInstallRouting() {
     local tag=$1
     local type=$2
@@ -185,19 +185,7 @@ unInstallRouting() {
     fi
 }
 
-# 卸载嗅探
-unInstallSniffing() {
-
-    find ${configPath} -name "*inbounds.json*" | awk -F "[c][o][n][f][/]" '{print $2}' | while read -r inbound; do
-        if grep -q "destOverride" <"${configPath}${inbound}"; then
-            sniffing=$(jq -r 'del(.inbounds[0].sniffing)' "${configPath}${inbound}")
-            echo "${sniffing}" | jq . >"${configPath}${inbound}"
-        fi
-    done
-
-}
-
-# 安装嗅探
+# Install sniffing
 installSniffing() {
     readInstallType
     if [[ "${coreInstallType}" == "1" ]]; then
@@ -210,7 +198,7 @@ installSniffing() {
     fi
 }
 
-# 读取第三方warp配置
+# Read the third-party WARP config
 readConfigWarpReg() {
     if [[ ! -f "/opt/xray-agent/warp/config" ]]; then
         /opt/xray-agent/warp/warp-reg >/opt/xray-agent/warp/config
@@ -225,7 +213,7 @@ readConfigWarpReg() {
     reservedWarpReg=$(grep <"/opt/xray-agent/warp/config" reserved | awk -F "[:]" '{print $2}')
 
 }
-# 安装warp-reg工具
+# Install the warp-reg tool
 installWarpReg() {
     if [[ ! -f "/opt/xray-agent/warp/warp-reg" ]]; then
         echo
@@ -250,7 +238,7 @@ installWarpReg() {
     fi
 }
 
-# 展示warp分流域名
+# Show WARP split-routing domains
 showWireGuardDomain() {
     local type=$1
     # xray
@@ -266,10 +254,9 @@ showWireGuardDomain() {
         fi
     fi
 
-
 }
 
-# 添加WireGuard分流
+# Add WireGuard split routing
 addWireGuardRoute() {
     local type=$1
     local tag=$2
@@ -282,40 +269,7 @@ addWireGuardRoute() {
     fi
 }
 
-# 卸载wireGuard
-unInstallWireGuard() {
-    local type=$1
-    if [[ "${coreInstallType}" == "1" ]]; then
-
-        if [[ "${type}" == "IPv4" ]]; then
-            if [[ ! -f "${configPath}wireguard_out_IPv6.json" ]]; then
-                rm -rf /opt/xray-agent/warp/config >/dev/null 2>&1
-            fi
-        elif [[ "${type}" == "IPv6" ]]; then
-            if [[ ! -f "${configPath}wireguard_out_IPv4.json" ]]; then
-                rm -rf /opt/xray-agent/warp/config >/dev/null 2>&1
-            fi
-        fi
-    fi
-
-}
-# 移除WireGuard分流
-removeWireGuardRoute() {
-    local type=$1
-    if [[ "${coreInstallType}" == "1" ]]; then
-
-        unInstallRouting wireguard_out_"${type}" outboundTag
-
-        removeXrayOutbound "wireguard_out_${type}"
-        if [[ ! -f "${configPath}IPv4_out.json" ]]; then
-            addXrayOutbound IPv4_out
-        fi
-    fi
-
-
-    unInstallWireGuard "${type}"
-}
-# warp分流-第三方IPv4
+# WARP split routing - third-party IPv4
 warpRoutingReg() {
     local type=$2
     echoContent skyBlue "\n进度  $1/${totalProgress} : WARP分流[第三方]"
@@ -372,9 +326,11 @@ warpRoutingReg() {
                 removeXrayOutbound blackhole_out
                 removeXrayOutbound socks5_outbound
 
-                rm ${configPath}09_routing.json >/dev/null 2>&1
+                rm -f "${configPath}09_routing.json"
+                # Global outbound mode drops the shared routing rules; relay
+                # bindings are kept and re-applied on top of it.
+                syncRelayRouting
             fi
-
 
             echoContent green " ---> WARP全局出站设置完毕"
         else
@@ -389,7 +345,6 @@ warpRoutingReg() {
             removeXrayOutbound "wireguard_out_${type}"
             addXrayOutbound "z_direct_outbound"
         fi
-
 
         echoContent green " ---> 卸载WARP ${type}分流完毕"
     else

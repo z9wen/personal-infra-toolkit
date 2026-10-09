@@ -4,7 +4,9 @@ set -euo pipefail
 
 project_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source_dir="${project_dir}/src"
-output_file="${project_dir}/../xray-install.sh"
+# CI writes the committed installer; local checks build a throwaway copy by
+# setting XRAY_BUILD_OUTPUT so the generated file is never edited by hand.
+output_file="${XRAY_BUILD_OUTPUT:-${project_dir}/../xray-install.sh}"
 mode=${1:-build}
 version_marker="__XRAY_AGENT_VERSION__"
 
@@ -32,7 +34,7 @@ modules=(
 )
 
 temp_file=$(mktemp "${output_file}.tmp.XXXXXX")
-trap 'rm -f "${temp_file}"' EXIT
+trap 'rm -f "${temp_file}" "${temp_file}.versioned"' EXIT
 
 for module in "${modules[@]}"; do
     cat "${source_dir}/${module}" >>"${temp_file}"

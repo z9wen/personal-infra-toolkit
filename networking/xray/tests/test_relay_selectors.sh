@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 
+# Globals are shared with the sourced modules, which ShellCheck cannot see.
+# shellcheck disable=SC2034,SC2154
+
 set -euo pipefail
 
 testDirectory=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -64,7 +67,7 @@ jq -n '{inbounds:[{tag:"Hysteria2",protocol:"hysteria",settings:{version:2,clien
     {auth:"ac5e3498-cf56-4e2a-896e-c689221474b6",email:"cn2-Hysteria2"}
 ]},streamSettings:{network:"hysteria",security:"tls"}}]}' >"${configPath}05_hysteria2_inbounds.json"
 
-# 同一 Vision 入站的 UUID 必须分开列出，并可与 Hysteria2 auth 一次多选。
+# UUIDs of the same Vision inbound must be listed separately and can be multi-selected together with a Hysteria2 auth.
 buildRelayTargetChoices
 jq -e '
     length == 5 and
@@ -91,7 +94,7 @@ jq -e '
 
 visionToUsSelector='{"inboundTags":["VLESSTCP"],"users":["vision_jp2us-VLESS_TCP/TLS_Vision"]}'
 
-# 多个 selector 应原子地追加到同一上游。
+# Multiple selectors should be appended to the same upstream atomically.
 multiSelectors='[{"inboundTags":["VLESSTCP"],"users":["vision_jp2us-VLESS_TCP/TLS_Vision"]},{"inboundTags":["Hysteria2"],"users":["cn2-Hysteria2"]}]'
 multiState=$(buildRelayStateWithSelectors "us" "${multiSelectors}")
 jq -e '
@@ -99,15 +102,15 @@ jq -e '
     (first(.profiles[] | select(.id == "us")).selectors | any(.users == ["cn2-Hysteria2"]))
 ' <<<"${multiState}" >/dev/null
 
-# 新增规则时可以直接选择已经配置好的 us 上游。
+# When adding a rule, an already configured us upstream can be selected directly.
 selectRelayDestination <<<"2" >/dev/null
 [[ "${relayUseExistingProfile}" == "true" ]]
 [[ "${relaySelectedDestinationId}" == "us" ]]
 
-# oracle 的整个 Vision 入站是兜底，不应阻止更精确的账号规则绑定到 us。
+# The whole-Vision-inbound rule of oracle is only a fallback and must not prevent a more specific account rule from binding to us.
 relayTargetsAvailable "${visionToUsSelector}" "us" </dev/null
 
-updatedState=$(buildRelayStateWithSelector "us" "${visionToUsSelector}")
+updatedState=$(buildRelayStateWithSelectors "us" "[${visionToUsSelector}]")
 writeRelayState "${updatedState}"
 
 jq -e '
@@ -125,7 +128,7 @@ jq -e '
 showRelayConfig >/dev/null
 rebuildRelayRouting
 
-# 精确账号规则必须排在 oracle 的整个 Vision 入站规则之前。
+# The exact-account rule must come before oracle's whole-Vision-inbound rule.
 jq -e '
     .routing.rules[0] == {
         type:"field",
@@ -149,9 +152,9 @@ jq -e '
     .routing.rules[6].outboundTag == "direct"
 ' "${configPath}09_routing.json" >/dev/null
 
-# 把整个 Vision 入站改派给 us 时，应移除 oracle 以及多余的账号特例。
+# When the whole Vision inbound is reassigned to us, oracle and the redundant per-account exceptions should be removed.
 wholeVisionSelector='{"inboundTags":["VLESSTCP"],"users":[]}'
-updatedState=$(buildRelayStateWithSelector "us" "${wholeVisionSelector}")
+updatedState=$(buildRelayStateWithSelectors "us" "[${wholeVisionSelector}]")
 writeRelayState "${updatedState}"
 
 jq -e '

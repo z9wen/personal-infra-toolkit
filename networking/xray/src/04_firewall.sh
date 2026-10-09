@@ -1,11 +1,11 @@
-# 检查防火墙
+# Check the firewall
 allowPort() {
     local type=$2
     if [[ -z "${type}" ]]; then
         type=tcp
     fi
-    
-    # 只有 UFW 确实启用时才由它处理；仅安装但未启用时继续检查其他防火墙。
+
+    # Only let UFW handle it when it is actually enabled; if it is installed but inactive, keep checking other firewalls.
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
         if ! ufw status | grep -q "$1/${type}"; then
             ufw allow "$1/${type}"
@@ -13,8 +13,8 @@ allowPort() {
         fi
         return
     fi
-    
-    # 检查 firewalld
+
+    # Check firewalld
     if systemctl status firewalld 2>/dev/null | grep -q "active (running)"; then
         local updateFirewalldStatus=
         if ! firewall-cmd --list-ports --permanent | grep -qw "$1/${type}"; then
@@ -32,8 +32,8 @@ allowPort() {
         fi
         return
     fi
-    
-    # 最后检查 iptables (仅当没有其他防火墙时)
+
+    # Check iptables last (only when there is no other firewall)
     if dpkg -l 2>/dev/null | grep -q "^[[:space:]]*ii[[:space:]]\+netfilter-persistent"; then
         if systemctl status netfilter-persistent 2>/dev/null | grep -q "active (exited)"; then
             local updateNetfilterStatus=
@@ -53,7 +53,7 @@ allowPort() {
         fi
     fi
 }
-# 获取公网IP
+# Get the public IP
 getPublicIP() {
     local type=4
     if [[ -n "$1" ]]; then
@@ -72,7 +72,7 @@ getPublicIP() {
 
 }
 
-# 输出ufw端口开放状态
+# Print the UFW port open status
 checkUFWAllowPort() {
     if ufw status | grep -q "$1"; then
         echoContent green " ---> $1端口开放成功"
@@ -82,7 +82,7 @@ checkUFWAllowPort() {
     fi
 }
 
-# 输出firewall-cmd端口开放状态
+# Print the firewall-cmd port open status
 checkFirewalldAllowPort() {
     if firewall-cmd --list-ports --permanent | grep -q "$1"; then
         echoContent green " ---> $1端口开放成功"
@@ -91,4 +91,3 @@ checkFirewalldAllowPort() {
         exit 0
     fi
 }
-

@@ -1,167 +1,145 @@
-# Xray-core个性化安装
-mapInstallMenuSelection() {
-    local menuSelection=${1//[[:space:]]/}
-    [[ "${menuSelection}" =~ ^[1-4](,[1-4])*$ ]] || return 1
+# ==================== Installation ====================
 
-    local mappedSelection= menuItem protocolId
+# Custom-install menu entries and the protocol IDs they map to.
+installMenuProtocols=(0 14 6 3 12 1)
+installMenuLabels=(
+    "VLESS+TCP+TLS Vision      [直连首选，需要域名]"
+    "VLESS+XHTTP+TLS           [走443/可套CDN，需要域名]"
+    "Hysteria2+QUIC            [UDP/游戏首选，需要域名]"
+    "VLESS+Reality+Vision      [无需域名]"
+    "VLESS+XHTTP+Reality       [无需域名]"
+    "VLESS+WebSocket+TLS       [已弃用，建议改用XHTTP]"
+)
+
+# Human-readable names for a protocol ID list such as ",0,14,6,".
+describeInstallSelection() {
+    local index names=""
+    for index in "${!installMenuProtocols[@]}"; do
+        if hasProtocol "$1" "${installMenuProtocols[index]}"; then
+            names+="${installMenuLabels[index]%%[[:space:]]*}, "
+        fi
+    done
+    echo "${names%, }"
+}
+
+# Turn a menu selection such as "1,2,3" into a protocol ID list.
+# Everything that needs a domain certificate (XHTTP+TLS, Hysteria2, WS) keeps
+# Vision as the TLS front: certificate renewal and the nginx fallback hang
+# off it. REALITY protocols can be installed on their own.
+mapInstallMenuSelection() {
+    local menuSelection=${1//[[:space:]]/} menuItem protocolId selection=","
+    [[ "${menuSelection}" =~ ^[1-6](,[1-6])*$ ]] || return 1
     local -a menuItems=()
     IFS=',' read -r -a menuItems <<<"${menuSelection}"
     for menuItem in "${menuItems[@]}"; do
-        case "${menuItem}" in
-        1) protocolId=0 ;;
-        2) protocolId=1 ;;
-        3) protocolId=3 ;;
-        4) protocolId=6 ;;
-        *) return 1 ;;
-        esac
-        if [[ ",${mappedSelection}," != *",${protocolId},"* ]]; then
-            mappedSelection="${mappedSelection:+${mappedSelection},}${protocolId}"
-        fi
+        protocolId=${installMenuProtocols[menuItem - 1]}
+        hasProtocol "${selection}" "${protocolId}" || selection+="${protocolId},"
     done
-
-    # WS 与 Hysteria2 的组合安装沿用 Vision 作为 TLS 前置；Reality 可单独安装。
-    if [[ "${mappedSelection}" != "3" && ",${mappedSelection}," != *",0,"* ]]; then
-        mappedSelection="0,${mappedSelection}"
+    if selectionNeedsTLS "${selection}" && ! hasProtocol "${selection}" 0; then
+        selection=",0${selection}"
     fi
-    printf ',%s,\n' "${mappedSelection}"
+    echo "${selection}"
 }
 
 customXrayInstall() {
-    echoContent skyBlue "\n========================个性化安装============================"
-    echoContent yellow "1.VLESS+TLS Vision+TCP[推荐]"
-    echoContent yellow "2.VLESS+TLS+WebSocket[仅CDN推荐]"
-    echoContent yellow "3.VLESS+Reality+uTLS+Vision[可单独安装]"
-    echoContent yellow "4.Hysteria2+TLS+QUIC[UDP/游戏推荐]"
-    echoContent green "提示：选择WebSocket或Hysteria2时会自动包含TLS Vision前置"
-    local installMenuSelection=
-    read -r -p "请选择[多选]，[例如:1,2,4]:" installMenuSelection
-    echoContent skyBlue "--------------------------------------------------------------"
-    if echo "${installMenuSelection}" | grep -q "，"; then
-        echoContent red " ---> 请使用英文逗号分隔"
-        exit 0
-    fi
+    echoContent skyBlue "\n========================自选协议安装==========================="
+    local index installMenuSelection
+    for index in "${!installMenuLabels[@]}"; do
+        echoContent yellow "$((index + 1)).${installMenuLabels[index]}"
+    done
+    echoContent green "提示：选择需要域名的协议时会自动包含 TLS Vision 作为证书和回落入口"
+    read -r -p "请选择[多选，英文逗号分隔，例如:1,2,3]:" installMenuSelection
+    installMenuSelection=${installMenuSelection//，/,}
     if ! selectCustomInstallType=$(mapInstallMenuSelection "${installMenuSelection}"); then
-        echoContent red " ---> 输入不合法，请使用1-4并以英文逗号分隔"
-        customXrayInstall
-        return
+        echoContent red " ---> 输入不合法，请输入1-6并以逗号分隔"
+        return 1
     fi
-
-    if [[ "${selectCustomInstallType//,/}" =~ ^[0136]+$ ]]; then
-        readLastInstallationConfig
-        unInstallSubscribe
-        checkBTPanel
-        check1Panel
-        checkHestiaPanel
-        totalProgress=12
-        installTools 1
-        if [[ -n "${btDomain}" ]]; then
-            echoContent skyBlue "\n进度  3/${totalProgress} : 检测到宝塔面板/1Panel/HestiaCP，跳过申请TLS步骤"
-            if [[ "${selectCustomInstallType}" != ",3," ]]; then
-                customPortFunction
-            fi
-        else
-            # 申请tls
-            if [[ "${selectCustomInstallType}" != ",3," ]]; then
-                initTLSNginxConfig 2
-                installTLS 3
-            else
-                echoContent skyBlue "\n进度  2/${totalProgress} : 检测到仅安装Reality，跳过TLS证书步骤"
-            fi
-        fi
-
-        handleNginx stop
-        # 随机path
-        if echo "${selectCustomInstallType}" | grep -q ",1,"; then
-            randomPathFunction 4
-        fi
-        if [[ -n "${btDomain}" ]]; then
-            echoContent skyBlue "\n进度  6/${totalProgress} : 检测到宝塔面板/1Panel/HestiaCP，跳过伪装网站"
-        else
-            nginxBlog 6
-        fi
-        if [[ "${selectCustomInstallType}" != ",3," ]]; then
-            if ! updateRedirectNginxConf; then
-                echoContent red " ---> 无法生成Nginx配置，已中止安装并尝试恢复Nginx"
-                handleNginx start
-                return 1
-            fi
-            handleNginx start
-        fi
-
-        # 安装Xray
-        installXray 7 false
-        installXrayService 8
-        initXrayConfig custom 9
-        if [[ "${selectCustomInstallType}" != ",3," ]]; then
-            installCronTLS 10
-        fi
-
-        restartXray || return 1
-        # 生成账号
-        checkGFWStatue 11
-        showAccounts 12
-    else
-        echoContent red " ---> 输入不合法"
-        customXrayInstall
-    fi
+    runInstall
 }
 
-
-selectCoreInstall() {
-    # 现在只支持 Xray-core，直接进入安装
-    if [[ "${selectInstallType}" == "2" ]]; then
-        customXrayInstall
-    else
-        xrayCoreInstall
-    fi
+installRecommended() {
+    selectCustomInstallType=${recommendedInstallSelection}
+    echoContent skyBlue "\n推荐组合: $(describeInstallSelection "${selectCustomInstallType}")"
+    runInstall
 }
 
-# xray-core 安装
-xrayCoreInstall() {
+# Stop an installation after a failed step without leaving nginx (stopped
+# earlier in the flow) down. Always returns 1.
+abortInstall() {
+    echoContent red " ---> $1，已中止安装"
+    handleNginx start
+    return 1
+}
+
+# Install the protocols in selectCustomInstallType.
+runInstall() {
+    local step=0 needsTLS=false restartStatus=0
+    selectionNeedsTLS "${selectCustomInstallType}" && needsTLS=true
+    totalProgress=11
+    echoContent green " ---> 将安装: $(describeInstallSelection "${selectCustomInstallType}")"
+
     readLastInstallationConfig
     unInstallSubscribe
-    checkBTPanel
-    check1Panel
-    checkHestiaPanel
-    selectCustomInstallType=
-    totalProgress=12
-    installTools 2
-    if [[ -n "${btDomain}" ]]; then
-        echoContent skyBlue "\n进度  3/${totalProgress} : 检测到宝塔面板/1Panel/HestiaCP，跳过申请TLS步骤"
+    if [[ "${needsTLS}" == "true" ]]; then
+        checkBTPanel
+        check1Panel
+    fi
+    installTools $((++step))
+
+    if [[ "${needsTLS}" != "true" ]]; then
+        echoContent skyBlue "\n进度  $((++step))/${totalProgress} : 仅安装 Reality，跳过域名与证书"
+    elif [[ -n "${btDomain}" ]]; then
+        echoContent skyBlue "\n进度  $((++step))/${totalProgress} : 检测到宝塔/aaPanel/1Panel，使用面板站点证书"
         customPortFunction
     else
-        # 申请tls
-        initTLSNginxConfig 3
-        installTLS 4
+        initTLSNginxConfig $((++step))
+        installTLS $((++step))
     fi
 
     handleNginx stop
-    randomPathFunction 5
-
-    # 安装Xray
-    installXray 6 false
-    installXrayService 7
-    initXrayConfig all 8
-    installCronTLS 9
-    if [[ -n "${btDomain}" ]]; then
-        echoContent skyBlue "\n进度  11/${totalProgress} : 检测到宝塔面板/1Panel/HestiaCP，跳过伪装网站"
-    else
-        nginxBlog 10
+    if hasProtocol "${selectCustomInstallType}" 1 || hasProtocol "${selectCustomInstallType}" 12 \
+        || hasProtocol "${selectCustomInstallType}" 14; then
+        randomPathFunction $((++step))
     fi
-    if ! updateRedirectNginxConf; then
-        echoContent red " ---> 无法生成Nginx配置，已中止安装并尝试恢复Nginx"
-        handleNginx start
-        return 1
+    if [[ "${needsTLS}" == "true" && -z "${btDomain}" ]]; then
+        nginxBlog $((++step))
     fi
-    restartXray || return 1
 
+    installXray $((++step)) false || abortInstall "Xray 下载或安装失败" || return 1
+    installXrayService $((++step))
+    initXrayConfig custom $((++step)) || abortInstall "Xray 配置生成失败" || return 1
+    syncRelayRouting || abortInstall "无法恢复中转路由" || return 1
+    if hasProtocol "${selectCustomInstallType}" 6; then
+        syncPortHopping
+    elif [[ -n "$(currentPortHopRange)" ]]; then
+        disablePortHopping
+    fi
+
+    if [[ "${needsTLS}" == "true" ]]; then
+        updateRedirectNginxConf || abortInstall "无法生成Nginx配置" || return 1
+        # Panel sites serve 443 themselves; XHTTP goes through a location there.
+        if hasProtocol "${selectCustomInstallType}" 14; then
+            if [[ -n "${btDomain}" ]]; then
+                echo 443 >"${xhttpStateFile}"
+            else
+                echo "${port}" >"${xhttpStateFile}"
+            fi
+            syncPanelXhttpLocation install
+        else
+            syncPanelXhttpLocation remove
+            rm -f "${xhttpStateFile}"
+        fi
+        installCronTLS $((++step))
+    fi
+
+    restartXray || restartStatus=$?
     handleNginx start
-    # 生成账号
-    checkGFWStatue 11
-    showAccounts 12
+    ((restartStatus == 0)) || return 1
+    checkGFWStatue $((++step))
+    showAccounts $((++step))
 }
 
-# 核心管理
+# Core management
 coreVersionManageMenu() {
 
     if [[ -z "${coreInstallType}" ]]; then
@@ -169,10 +147,10 @@ coreVersionManageMenu() {
         menu
         exit 0
     fi
-    # 现在只支持 Xray-core，直接进入版本管理
+    # Only Xray-core is supported now; go straight to version management
     xrayVersionManageMenu 1
 }
-# 定时任务检查
+# Cron job check
 cronFunction() {
     if [[ "${cronName}" == "RenewTLS" ]]; then
         renewalTLS
@@ -186,7 +164,7 @@ cronFunction() {
         exit $?
     fi
 }
-# 账号管理
+# Account management
 manageAccount() {
     if [[ -z "${configPath}" ]]; then
         echoContent red " ---> 未安装"
@@ -207,11 +185,11 @@ manageAccount() {
         echoContent red "=============================================================="
         read -r -p "请输入:" manageAccountStatus
         case ${manageAccountStatus} in
-        1) listAccounts ;;
-        2) addUser ;;
-        3) removeUser ;;
-        0) return ;;
-        *) echoContent red " ---> 选择错误" ;;
+            1) listAccounts ;;
+            2) addUser ;;
+            3) removeUser ;;
+            0) return ;;
+            *) echoContent red " ---> 选择错误" ;;
         esac
         read -r -p "按回车键继续..."
     done

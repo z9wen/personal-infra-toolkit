@@ -1,4 +1,4 @@
-# 安装订阅
+# Install the subscription service
 installSubscribe() {
     readNginxSubscribe
     local nginxSubscribeListen=
@@ -40,7 +40,7 @@ installSubscribe() {
         echo
         local httpSubscribeStatus=
 
-        if ! echo "${selectCustomInstallType}" | grep -qE ",0,|,1,|,3,|,6," && ! echo "${currentInstallProtocolType}" | grep -qE ",0,|,1,|,3,|,6," && [[ -z "${domain}" ]]; then
+        if ! echo "${selectCustomInstallType}" | grep -qE ",(0|1|3|6|12|14)," && ! echo "${currentInstallProtocolType}" | grep -qE ",(0|1|3|6|12|14)," && [[ -z "${domain}" ]]; then
             httpSubscribeStatus=true
         fi
 
@@ -104,12 +104,12 @@ EOF
         handleNginx start
     fi
 }
-# 卸载订阅
+# Uninstall the subscription service
 unInstallSubscribe() {
     rm -rf ${nginxConfigPath}subscribe.conf >/dev/null 2>&1
 }
 
-# 添加订阅
+# Add a subscription
 addSubscribeMenu() {
     echoContent skyBlue "\n===================== 添加其他机器订阅 ======================="
     echoContent yellow "1.添加"
@@ -153,16 +153,16 @@ manageSubscriptions() {
         echoContent red "=============================================================="
         read -r -p "请选择:" subscriptionManageStatus
         case ${subscriptionManageStatus} in
-        1) subscribe ;;
-        2) addSubscribeMenu ;;
-        0) return ;;
-        *) echoContent red " ---> 请输入 0-2" ;;
+            1) subscribe ;;
+            2) addSubscribeMenu ;;
+            0) return ;;
+            *) echoContent red " ---> 请输入 0-2" ;;
         esac
         read -r -p "按回车键继续..."
     done
 }
 
-# 添加其他机器clashMeta订阅
+# Add a clashMeta subscription from another machine
 addOtherSubscribe() {
     echoContent yellow "#注意事项:"
     echoContent skyBlue "录入示例：example.com:443:vps1\n"
@@ -187,7 +187,7 @@ addOtherSubscribe() {
         subscribe
     fi
 }
-# clashMeta配置文件
+# clashMeta config file
 clashMetaConfig() {
     local url=$1
     local id=$2
@@ -570,7 +570,7 @@ rules:
 EOF
 
 }
-# 随机salt
+# Random salt
 initRandomSalt() {
     local chars="abcdefghijklmnopqrtuxyz"
     local initCustomPath=
@@ -580,7 +580,7 @@ initRandomSalt() {
     done
     echo "${initCustomPath}"
 }
-# 订阅
+# Subscription
 subscribe() {
     readInstallProtocolType
     installSubscribe
@@ -692,7 +692,7 @@ subscribe() {
     fi
 }
 
-# 更新远程订阅
+# Update remote subscriptions
 updateRemoteSubscribe() {
 
     local emailMD5=$1

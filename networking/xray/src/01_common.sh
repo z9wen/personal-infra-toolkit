@@ -1,36 +1,36 @@
 #!/usr/bin/env bash
 
-# 检测区
+# Detection section
 # -------------------------------------------------------------
-# 检查系统
+# Check the OS
 export LANG=en_US.UTF-8
 
 echoContent() {
     case $1 in
-    # 红色
-    "red")
-        # shellcheck disable=SC2154
-        ${echoType} "\033[31m${printN}$2 \033[0m"
-        ;;
-        # 天蓝色
-    "skyBlue")
-        ${echoType} "\033[1;36m${printN}$2 \033[0m"
-        ;;
-        # 绿色
-    "green")
-        ${echoType} "\033[32m${printN}$2 \033[0m"
-        ;;
-        # 白色
-    "white")
-        ${echoType} "\033[37m${printN}$2 \033[0m"
-        ;;
-    "magenta")
-        ${echoType} "\033[31m${printN}$2 \033[0m"
-        ;;
-        # 黄色
-    "yellow")
-        ${echoType} "\033[33m${printN}$2 \033[0m"
-        ;;
+        # Red
+        "red")
+            # shellcheck disable=SC2154
+            ${echoType} "\033[31m${printN}$2 \033[0m"
+            ;;
+            # Sky blue
+        "skyBlue")
+            ${echoType} "\033[1;36m${printN}$2 \033[0m"
+            ;;
+            # Green
+        "green")
+            ${echoType} "\033[32m${printN}$2 \033[0m"
+            ;;
+            # White
+        "white")
+            ${echoType} "\033[37m${printN}$2 \033[0m"
+            ;;
+        "magenta")
+            ${echoType} "\033[31m${printN}$2 \033[0m"
+            ;;
+            # Yellow
+        "yellow")
+            ${echoType} "\033[33m${printN}$2 \033[0m"
+            ;;
     esac
 }
 checkSystem() {
@@ -39,14 +39,12 @@ checkSystem() {
         installType='apt -y install'
         upgrade="apt update"
         updateReleaseInfoChange='apt-get --allow-releaseinfo-change update'
-        removeType='apt -y autoremove'
 
     elif { [[ -f "/etc/issue" ]] && grep -qi "ubuntu" /etc/issue; } || { [[ -f "/proc/version" ]] && grep -qi "ubuntu" /proc/version; }; then
         release="ubuntu"
         installType='apt -y install'
         upgrade="apt update"
         updateReleaseInfoChange='apt-get --allow-releaseinfo-change update'
-        removeType='apt -y autoremove'
         if grep </etc/issue -q -i "16."; then
             release=
         fi
@@ -60,24 +58,23 @@ checkSystem() {
     fi
 }
 
-# 检查CPU提供商
+# Check the CPU vendor
 checkCPUVendor() {
     if [[ -n $(which uname) ]]; then
         if [[ "$(uname)" == "Linux" ]]; then
             case "$(uname -m)" in
-            'amd64' | 'x86_64')
-                xrayCoreCPUVendor="Xray-linux-64"
-                warpRegCoreCPUVendor="main-linux-amd64"
-                ;;
-            'armv8' | 'aarch64')
-                cpuVendor="arm"
-                xrayCoreCPUVendor="Xray-linux-arm64-v8a"
-                warpRegCoreCPUVendor="main-linux-arm64"
-                ;;
-            *)
-                echo "  不支持此CPU架构--->"
-                exit 1
-                ;;
+                'amd64' | 'x86_64')
+                    xrayCoreCPUVendor="Xray-linux-64"
+                    warpRegCoreCPUVendor="main-linux-amd64"
+                    ;;
+                'armv8' | 'aarch64')
+                    xrayCoreCPUVendor="Xray-linux-arm64-v8a"
+                    warpRegCoreCPUVendor="main-linux-arm64"
+                    ;;
+                *)
+                    echo "  不支持此CPU架构--->"
+                    exit 1
+                    ;;
             esac
         fi
     else
@@ -86,49 +83,80 @@ checkCPUVendor() {
     fi
 }
 
-# 初始化全局变量
+# Protocol IDs used in selectCustomInstallType / currentInstallProtocolType,
+# always written as a comma-wrapped list such as ",0,14,6,":
+#   0  VLESS + TCP + TLS Vision        3  VLESS + REALITY + Vision
+#   14 VLESS + XHTTP + TLS (via nginx) 12 VLESS + XHTTP + REALITY
+#   6  Hysteria2                       1  VLESS + WebSocket + TLS (deprecated)
+
+# Usage: hasProtocol <list> <id>
+hasProtocol() {
+    [[ "$1" == *",$2,"* ]]
+}
+
+# True when a selection needs a domain and TLS certificate; REALITY-only
+# installs (3 and/or 12) do not.
+selectionNeedsTLS() {
+    local id
+    for id in 0 1 6 14; do
+        hasProtocol "$1" "${id}" && return 0
+    done
+    return 1
+}
+
+# "Recommended" install: Vision for direct use, XHTTP over 443/CDN, REALITY
+# without a domain, Hysteria2 for games.
+recommendedInstallSelection=",0,14,3,6,"
+
+# XHTTP + TLS: nginx terminates TLS and forwards the path to this local
+# inbound. nginx sets the trusted header, so Xray only believes the
+# X-Forwarded-For it receives from nginx.
+xhttpInboundPort=31305
+xhttpTrustedHeader="X-Xray-Agent-Proxy"
+
+# True for a decimal TCP/UDP port number 1-65535 (leading zeros rejected so
+# the value can be used in file names and JSON as-is).
+isValidPort() {
+    [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (($1 <= 65535))
+}
+
+# Initialize global variables
 initVar() {
     installType='apt -y install'
-    removeType='apt -y autoremove'
     upgrade="apt update"
     updateReleaseInfoChange='apt-get --allow-releaseinfo-change update'
     echoType='echo -e'
 
-    # 核心支持的cpu版本
+    # CPU architecture supported by the core
     xrayCoreCPUVendor=""
     warpRegCoreCPUVendor=""
-    cpuVendor=""
 
-    # 域名
+    # Domain
     domain=
-    # 安装总进度
+    # Total installation steps
     totalProgress=1
 
-    # Xray-core 安装状态
+    # Xray-core installation status
     coreInstallType=
-
-    # 核心安装path
-    # coreInstallPath=
 
     # v2ctl Path
     ctlPath=
-    # 当前安装的协议编号：0 Vision、1 WebSocket、3 Reality、6 Hysteria2
+    # Installed protocol IDs: 0 Vision, 1 WebSocket, 3 Reality, 6 Hysteria2
     currentInstallProtocolType=
 
-
-    # 前置类型
+    # Front (fallback) type
     frontingType=
 
-    # 选择的个性化安装方式
+    # Selected custom installation mode
     selectCustomInstallType=
 
-    # Xray-core 配置文件路径
+    # Xray-core config file path
     configPath=
 
-    # xray-core reality状态
+    # xray-core Reality status
     realityStatus=
 
-    # nginx订阅端口
+    # nginx subscription port
     subscribePort=
 
     subscribeType=
@@ -136,15 +164,14 @@ initVar() {
     # xray-core reality serverName publicKey
     xrayVLESSRealityServerName=
     xrayVLESSRealityPort=
-    #    xrayVLESSRealityPublicKey=
 
-    # 配置文件的path
+    # Path in the config file
     currentPath=
 
-    # 配置文件的host
+    # Host in the config file
     currentHost=
 
-    # 随机路径
+    # Random path
     customPath=
 
     # UUID
@@ -153,52 +180,38 @@ initVar() {
     # clients
     currentClients=
 
-    # previousClients
-    #    previousClients=
-
     localIP=
 
-    # 定时任务执行任务名称 RenewTLS-更新证书 UpdateGeo-更新geo文件 UpdateRelay-更新中转订阅
+    # Cron task name: RenewTLS - renew certificate, UpdateGeo - update geo files, UpdateRelay - update relay subscriptions
     cronName=$1
 
-    # tls安装失败后尝试的次数
+    # Number of retries after a failed TLS installation
     installTLSCount=
 
-    # BTPanel状态
-    #	BTPanelStatus=
-    # 宝塔域名
+    # BT Panel domain
     btDomain=
-    # nginx配置文件路径
+    # nginx config file path
     nginxConfigPath=/etc/nginx/conf.d/
     nginxStaticPath=/usr/share/nginx/html/
 
-    # 是否为预览版
-    prereleaseStatus=false
-
-    # ssl类型
+    # SSL type
     sslType=
-    # ssl邮箱
+    # SSL email
     sslEmail=
 
-    # 检查天数
+    # Check interval in days
     sslRenewalDays=90
-
-    # dns ssl状态
-    #    dnsSSLStatus=
 
     # dns tls domain
     dnsTLSDomain=
     ipType=
 
-    # 该域名是否通过dns安装通配符证书
-    #    installDNSACMEStatus=
-
-    # 自定义端口
+    # Custom port
     customPort=
 
-    # hysteria端口
+    # Hysteria port
 
-    # Xray-core Hysteria2 UDP端口
+    # Xray-core Hysteria2 UDP port
     hysteria2Port=
     hysteria2BbrProfile=
     hysteria2MasqueradeConfig=
@@ -207,17 +220,8 @@ initVar() {
     # Reality
     realityPrivateKey=
     realityServerName=
-    realityDestDomain=
-
-    # 端口状态
-    #    isPortOpen=
-    # 通配符域名状态
-    #    wildcardDomainStatus=
-    # 通过nginx检查的端口
-    #    nginxIPort=
 
     # wget show progress
-    wgetShowProgressStatus=
 
     # warp
     reservedWarpReg=
@@ -225,23 +229,21 @@ initVar() {
     addressWarpReg=
     secretKeyWarpReg=
 
-    # 上次安装配置状态
+    # Previous installation config status
     lastInstallationConfig=
 
-    # Native ACME 相关
+    # Native ACME related
     nativeACMEEnabled=
     nativeCertPath=
     nativeKeyPath=
 
-    # 由 acme.sh/acme_manage.sh 管理的现有证书
+    # Existing certificates managed by acme.sh/acme_manage.sh
     acmeManagedCertSelected=
     acmeManagedHome=
     acmeManagedSourceDomain=
-    acmeManagedServiceDomain=
     acmeManagedEcc=
 
-    # 自动发现的泛域名 acme.sh 证书路径
+    # Auto-discovered wildcard acme.sh certificate path
     dnsTLSAcmeCertPath=
-    dnsTLSAcmeKeyPath=
 
 }
