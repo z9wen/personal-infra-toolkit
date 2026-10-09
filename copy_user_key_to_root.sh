@@ -2,31 +2,31 @@
 set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
-  echo "This script must be run as root." >&2
-  exit 1
+    echo "This script must be run as root." >&2
+    exit 1
 fi
 
 if [[ $# -ne 1 ]]; then
-  echo "Usage: $0 <username>" >&2
-  exit 1
+    echo "Usage: $0 <username>" >&2
+    exit 1
 fi
 
 user="$1"
 if ! id "$user" &>/dev/null; then
-  echo "User '$user' does not exist." >&2
-  exit 1
+    echo "User '$user' does not exist." >&2
+    exit 1
 fi
 
 user_home="$(getent passwd "$user" | cut -d: -f6)"
 if [[ -z "$user_home" || ! -d "$user_home" ]]; then
-  echo "Cannot determine home directory for '$user'." >&2
-  exit 1
+    echo "Cannot determine home directory for '$user'." >&2
+    exit 1
 fi
 
 src_file="$user_home/.ssh/authorized_keys"
 if [[ ! -f "$src_file" ]]; then
-  echo "Source authorized_keys not found for user '$user'." >&2
-  exit 1
+    echo "Source authorized_keys not found for user '$user'." >&2
+    exit 1
 fi
 
 root_ssh_dir="/root/.ssh"

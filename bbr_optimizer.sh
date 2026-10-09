@@ -19,6 +19,23 @@ readonly OLD_MODULE_FILE='/etc/modules-load.d/xray-vision-bbr.conf'
 readonly OLD_BACKUP_ROOT='/var/backups/xray-vision-bbr'
 readonly LEGACY_SYSCTL_FILE='/etc/sysctl.conf'
 
+# Files captured by backup_current_state and put back by restore_snapshot.
+# Format: <live path>|<copy name inside the backup dir>|<presence marker name>
+readonly -a SNAPSHOT_FILES=(
+    "${CONFIG_FILE}|managed.conf|had_managed_config"
+    "${OLD_CONFIG_FILE}|old-managed.conf|had_old_managed_config"
+    "${MODULE_FILE}|modules.conf|had_module_config"
+    "${OLD_MODULE_FILE}|old-modules.conf|had_old_module_config"
+    "${LEGACY_SYSCTL_FILE}|sysctl.conf|had_sysctl_conf"
+)
+
+# Seconds the operator has to confirm that disabling IPv6 did not cut access
+# before it is reverted automatically. 0 disables the timed rollback.
+IPV6_ROLLBACK_SECONDS=${BBR_IPV6_ROLLBACK_SECONDS:-60}
+# Extra delay before the detached watchdog reverts, so an answer typed at the
+# very end of the prompt cannot race with it.
+readonly ROLLBACK_GRACE_SECONDS=5
+
 TEMP_CONFIG=
 LAST_BACKUP_DIR=
 PROFILE_NAME=
@@ -159,32 +176,32 @@ create_profile() {
     local buffer_max notsent_lowat output_limit
 
     case "${profile}" in
-    balanced)
-        PROFILE_NAME='Balanced'
-        buffer_max=16777216
-        notsent_lowat=131072
-        output_limit=1048576
-        ;;
-    latency)
-        PROFILE_NAME='Low Latency'
-        buffer_max=16777216
-        notsent_lowat=32768
-        output_limit=262144
-        ;;
-    bandwidth)
-        PROFILE_NAME='High Bandwidth'
-        buffer_max=33554432
-        notsent_lowat=262144
-        output_limit=1048576
-        ;;
-    *)
-        print_error "Unknown profile: ${profile}"
-        return 1
-        ;;
+        balanced)
+            PROFILE_NAME='Balanced'
+            buffer_max=16777216
+            notsent_lowat=131072
+            output_limit=1048576
+            ;;
+        latency)
+            PROFILE_NAME='Low Latency'
+            buffer_max=16777216
+            notsent_lowat=32768
+            output_limit=262144
+            ;;
+        bandwidth)
+            PROFILE_NAME='High Bandwidth'
+            buffer_max=33554432
+            notsent_lowat=262144
+            output_limit=1048576
+            ;;
+        *)
+            print_error "Unknown profile: ${profile}"
+            return 1
+            ;;
     esac
 
-    [[ -z "${TEMP_CONFIG}" || ! -f "${TEMP_CONFIG}" ]] || rm -f "${TEMP_CONFIG}"
-    TEMP_CONFIG=$(mktemp /tmp/bbr-optimizer.XXXXXX.conf)
+    cleanup
+    TEMP_CONFIG=$(mktemp "${TMPDIR:-/tmp}/bbr-optimizer.XXXXXX")
     cat >"${TEMP_CONFIG}" <<EOF
 # Managed by bbr_optimizer.sh - ${PROFILE_NAME}
 # Remove this file and restore a backup through the script to undo the settings.
@@ -228,7 +245,6 @@ EOF
     append_supported_sysctl net.ipv4.tcp_early_retrans 3
     append_supported_sysctl net.ipv4.tcp_thin_linear_timeouts 1
     append_supported_sysctl net.ipv4.tcp_mtu_probing 1
-
 }
 
 append_supported_sysctl() {
@@ -253,33 +269,28 @@ validate_profile() {
 }
 
 backup_current_state() {
-    local backup_dir timestamp key value
+    local backup_dir timestamp key value entry live_path copy_name marker
     timestamp=$(date +%Y%m%d_%H%M%S)
     backup_dir="${BACKUP_ROOT}/${timestamp}_$$"
-    mkdir -p "${backup_dir}"
-
-    if [[ -f "${CONFIG_FILE}" ]]; then
-        cp -a "${CONFIG_FILE}" "${backup_dir}/managed.conf"
-        touch "${backup_dir}/had_managed_config"
-    fi
-    if [[ -f "${OLD_CONFIG_FILE}" ]]; then
-        cp -a "${OLD_CONFIG_FILE}" "${backup_dir}/old-managed.conf"
-        touch "${backup_dir}/had_old_managed_config"
-    fi
-    if [[ -f "${MODULE_FILE}" ]]; then
-        cp -a "${MODULE_FILE}" "${backup_dir}/modules.conf"
-        touch "${backup_dir}/had_module_config"
-    fi
-    if [[ -f "${OLD_MODULE_FILE}" ]]; then
-        cp -a "${OLD_MODULE_FILE}" "${backup_dir}/old-modules.conf"
-        touch "${backup_dir}/had_old_module_config"
-    fi
-    if [[ -f "${LEGACY_SYSCTL_FILE}" ]]; then
-        cp -a "${LEGACY_SYSCTL_FILE}" "${backup_dir}/sysctl.conf"
-        touch "${backup_dir}/had_sysctl_conf"
+    if ! mkdir -p "${backup_dir}"; then
+        print_error "Unable to create backup directory: ${backup_dir}"
+        return 1
     fi
 
-    : >"${backup_dir}/runtime.conf"
+    for entry in "${SNAPSHOT_FILES[@]}"; do
+        IFS='|' read -r live_path copy_name marker <<<"${entry}"
+        [[ -f "${live_path}" ]] || continue
+        if ! cp -a "${live_path}" "${backup_dir}/${copy_name}" \
+            || ! touch "${backup_dir}/${marker}"; then
+            print_error "Unable to back up ${live_path}"
+            return 1
+        fi
+    done
+
+    if ! : >"${backup_dir}/runtime.conf"; then
+        print_error "Unable to write ${backup_dir}/runtime.conf"
+        return 1
+    fi
     for key in "${MANAGED_KEYS[@]}"; do
         if value=$(sysctl -n "${key}" 2>/dev/null); then
             printf '%s = %s\n' "${key}" "${value}" >>"${backup_dir}/runtime.conf"
@@ -299,74 +310,162 @@ remove_legacy_config() {
     fi
 }
 
+# Usage: write_policy_file FILE KEY=VALUE...
+write_policy_file() {
+    local file=$1 entry
+    shift
+    {
+        printf '# Managed separately by bbr_optimizer.sh\n'
+        for entry in "$@"; do
+            printf '%s = %s\n' "${entry%%=*}" "${entry#*=}"
+        done
+    } >"${file}"
+}
+
 migrate_embedded_icmp_policy() {
-    local ipv4_value ipv6_value temporary_icmp managed_config
+    local temporary_icmp managed_config
+    local -a settings=()
     managed_config=${CONFIG_FILE}
     [[ -f "${managed_config}" ]] || managed_config=${OLD_CONFIG_FILE}
     [[ -f "${managed_config}" ]] || return 0
     grep -q 'icmp.*echo_ignore_all' "${managed_config}" || return 0
 
-    ipv4_value=$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null || echo 0)
-    ipv6_value=$(sysctl -n net.ipv6.icmp.echo_ignore_all 2>/dev/null || echo 0)
-    temporary_icmp=$(mktemp /tmp/vps-icmp-policy.XXXXXX.conf)
-    {
-        printf '# Managed separately by bbr_optimizer.sh\n'
-        printf 'net.ipv4.icmp_echo_ignore_all = %s\n' "${ipv4_value}"
-        if [[ -e /proc/sys/net/ipv6/icmp/echo_ignore_all ]]; then
-            printf 'net.ipv6.icmp.echo_ignore_all = %s\n' "${ipv6_value}"
-        fi
-    } >"${temporary_icmp}"
-    mkdir -p "$(dirname "${ICMP_CONFIG_FILE}")"
-    install -m 0644 "${temporary_icmp}" "${ICMP_CONFIG_FILE}"
+    settings=("net.ipv4.icmp_echo_ignore_all=$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null || echo 0)")
+    if [[ -e /proc/sys/net/ipv6/icmp/echo_ignore_all ]]; then
+        settings+=("net.ipv6.icmp.echo_ignore_all=$(sysctl -n net.ipv6.icmp.echo_ignore_all 2>/dev/null || echo 0)")
+    fi
+    temporary_icmp=$(mktemp "${TMPDIR:-/tmp}/vps-icmp-policy.XXXXXX") || return 1
+    write_policy_file "${temporary_icmp}" "${settings[@]}"
+    # Only strip the embedded keys once the standalone policy file is in place.
+    if ! mkdir -p "$(dirname "${ICMP_CONFIG_FILE}")" \
+        || ! install -m 0644 "${temporary_icmp}" "${ICMP_CONFIG_FILE}"; then
+        rm -f "${temporary_icmp}"
+        print_error "Unable to migrate the ICMP policy to ${ICMP_CONFIG_FILE}"
+        return 1
+    fi
     sed -i '/^[[:space:]]*net\.ipv[46]\.icmp.*echo_ignore_all[[:space:]]*=/d' "${managed_config}"
     rm -f "${temporary_icmp}"
     print_info "Migrated the existing ICMP policy to ${ICMP_CONFIG_FILE}"
 }
 
-set_icmp_policy() {
-    local value=$1 description old_ipv4 old_ipv6 temporary_icmp old_config apply_output
-    if [[ "${value}" == '1' ]]; then
-        description='disabled'
+# Usage: restore_sysctl_policy CONFIG_FILE STATE_DIR
+# Reverts a change made by apply_sysctl_policy: puts back the previous policy
+# file (or removes it if there was none) and the previous runtime values.
+restore_sysctl_policy() {
+    local config_file=$1 state_dir=$2 key value
+    if [[ -f "${state_dir}/previous.conf" ]]; then
+        install -m 0644 "${state_dir}/previous.conf" "${config_file}" || true
     else
-        description='enabled'
+        rm -f "${config_file}"
+    fi
+    if [[ -f "${state_dir}/runtime.conf" ]]; then
+        while IFS='=' read -r key value; do
+            [[ -n "${key}" ]] || continue
+            sysctl -w "${key}=${value}" >/dev/null 2>&1 || true
+        done <"${state_dir}/runtime.conf"
+    fi
+}
+
+# Usage: start_rollback_watchdog CONFIG_FILE STATE_DIR SECONDS
+# Starts a detached process that ignores SIGHUP/SIGINT and reverts the policy
+# after SECONDS plus a grace period, even if the SSH session (and this script
+# with it) is lost. Sets ROLLBACK_WATCHDOG_PID.
+start_rollback_watchdog() {
+    local config_file=$1 state_dir=$2 seconds=$3
+    (
+        trap '' HUP INT
+        sleep "$((seconds + ROLLBACK_GRACE_SECONDS))"
+        restore_sysctl_policy "${config_file}" "${state_dir}"
+        rm -rf "${state_dir}"
+    ) </dev/null >/dev/null 2>&1 &
+    ROLLBACK_WATCHDOG_PID=$!
+}
+
+stop_rollback_watchdog() {
+    kill "$1" 2>/dev/null || return 1
+    wait "$1" 2>/dev/null || true
+}
+
+# Usage: confirm_or_rollback CONFIG_FILE STATE_DIR SECONDS LABEL WATCHDOG_PID
+# Keeps a just-applied policy only if the operator types "keep" in time;
+# otherwise reverts it now (or lets the already-fired watchdog's revert stand).
+confirm_or_rollback() {
+    local config_file=$1 state_dir=$2 seconds=$3 label=$4 watchdog_pid=$5 answer=''
+
+    print_warning "The ${label} change will be reverted automatically in ${seconds} seconds unless you confirm it."
+    print_warning 'Check from a NEW SSH session that the host is still reachable before confirming.'
+    read -r -t "${seconds}" -p "Type 'keep' to keep it (anything else reverts now): " answer || true
+
+    if [[ "${answer}" == 'keep' ]] && stop_rollback_watchdog "${watchdog_pid}"; then
+        rm -rf "${state_dir}"
+        return 0
     fi
 
-    old_ipv4=$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null || echo 0)
-    old_ipv6=$(sysctl -n net.ipv6.icmp.echo_ignore_all 2>/dev/null || echo 0)
-    temporary_icmp=$(mktemp /tmp/vps-icmp-policy.XXXXXX.conf)
-    old_config=$(mktemp /tmp/vps-icmp-policy-backup.XXXXXX.conf)
-
-    if [[ -f "${ICMP_CONFIG_FILE}" ]]; then
-        cp -a "${ICMP_CONFIG_FILE}" "${old_config}"
+    if stop_rollback_watchdog "${watchdog_pid}"; then
+        restore_sysctl_policy "${config_file}" "${state_dir}"
+        rm -rf "${state_dir}"
     else
-        : >"${old_config}"
+        # The watchdog already fired and reverted the change.
+        wait "${watchdog_pid}" 2>/dev/null || true
+    fi
+    print_warning "${label} change reverted"
+    return 1
+}
+
+# Usage: apply_sysctl_policy CONFIG_FILE LABEL ROLLBACK_SECONDS KEY=VALUE...
+# Installs CONFIG_FILE with the given settings and applies it immediately. On
+# failure the previous file and runtime values are restored. With
+# ROLLBACK_SECONDS > 0 the change must also be confirmed within that time.
+apply_sysctl_policy() {
+    local config_file=$1 label=$2 rollback_seconds=$3 state_dir entry key apply_output watchdog_pid=''
+    shift 3
+
+    state_dir=$(mktemp -d "${TMPDIR:-/tmp}/bbr-optimizer-policy.XXXXXX") || return 1
+    if [[ -f "${config_file}" ]] && ! cp -p "${config_file}" "${state_dir}/previous.conf"; then
+        print_error "Unable to back up ${config_file}"
+        rm -rf "${state_dir}"
+        return 1
+    fi
+    : >"${state_dir}/runtime.conf"
+    for entry in "$@"; do
+        key=${entry%%=*}
+        printf '%s=%s\n' "${key}" "$(sysctl -n "${key}" 2>/dev/null || echo 0)" >>"${state_dir}/runtime.conf"
+    done
+    write_policy_file "${state_dir}/new.conf" "$@"
+
+    # Arm the watchdog before changing anything, so there is no moment in
+    # which a dropped session would leave the change in place.
+    if ((rollback_seconds > 0)); then
+        start_rollback_watchdog "${config_file}" "${state_dir}" "${rollback_seconds}"
+        watchdog_pid=${ROLLBACK_WATCHDOG_PID}
     fi
 
-    {
-        printf '# Managed separately by bbr_optimizer.sh\n'
-        printf 'net.ipv4.icmp_echo_ignore_all = %s\n' "${value}"
-        if [[ -e /proc/sys/net/ipv6/icmp/echo_ignore_all ]]; then
-            printf 'net.ipv6.icmp.echo_ignore_all = %s\n' "${value}"
-        fi
-    } >"${temporary_icmp}"
-
-    if ! install -m 0644 "${temporary_icmp}" "${ICMP_CONFIG_FILE}" ||
-        ! apply_output=$(sysctl -p "${ICMP_CONFIG_FILE}" 2>&1); then
-        print_error "Failed to set ICMP policy: ${apply_output:-file installation failed}"
-        if [[ -s "${old_config}" ]]; then
-            install -m 0644 "${old_config}" "${ICMP_CONFIG_FILE}"
-        else
-            rm -f "${ICMP_CONFIG_FILE}"
-        fi
-        sysctl -w "net.ipv4.icmp_echo_ignore_all=${old_ipv4}" >/dev/null 2>&1 || true
-        if [[ -e /proc/sys/net/ipv6/icmp/echo_ignore_all ]]; then
-            sysctl -w "net.ipv6.icmp.echo_ignore_all=${old_ipv6}" >/dev/null 2>&1 || true
-        fi
-        rm -f "${temporary_icmp}" "${old_config}"
+    if ! mkdir -p "$(dirname "${config_file}")" \
+        || ! install -m 0644 "${state_dir}/new.conf" "${config_file}" \
+        || ! apply_output=$(sysctl -p "${config_file}" 2>&1); then
+        [[ -z "${watchdog_pid}" ]] || stop_rollback_watchdog "${watchdog_pid}" || true
+        print_error "Failed to set ${label}: ${apply_output:-file installation failed}"
+        restore_sysctl_policy "${config_file}" "${state_dir}"
+        rm -rf "${state_dir}"
         return 1
     fi
 
-    rm -f "${temporary_icmp}" "${old_config}"
+    if ((rollback_seconds > 0)); then
+        confirm_or_rollback "${config_file}" "${state_dir}" "${rollback_seconds}" "${label}" "${watchdog_pid}"
+        return
+    fi
+    rm -rf "${state_dir}"
+}
+
+set_icmp_policy() {
+    local value=$1 description=enabled
+    local -a settings=("net.ipv4.icmp_echo_ignore_all=${value}")
+    [[ "${value}" != '1' ]] || description=disabled
+    if [[ -e /proc/sys/net/ipv6/icmp/echo_ignore_all ]]; then
+        settings+=("net.ipv6.icmp.echo_ignore_all=${value}")
+    fi
+
+    apply_sysctl_policy "${ICMP_CONFIG_FILE}" 'ICMP policy' 0 "${settings[@]}" || return 1
     print_success "ICMP echo response is now ${description}"
 }
 
@@ -389,63 +488,90 @@ manage_icmp() {
     read -r -p 'Please select [0-2]: ' choice
 
     case "${choice}" in
-    1)
-        print_warning 'This hides ordinary ping responses but does not prevent port scanning'
-        read -r -p 'Disable ICMP echo response? [y/N]: ' confirm
-        [[ "${confirm}" =~ ^[Yy]$ ]] && set_icmp_policy 1
-        ;;
-    2)
-        read -r -p 'Enable ICMP echo response? [y/N]: ' confirm
-        [[ "${confirm}" =~ ^[Yy]$ ]] && set_icmp_policy 0
-        ;;
-    0) return 0 ;;
-    *)
-        print_error 'Invalid selection'
-        return 1
-        ;;
+        1)
+            print_warning 'This hides ordinary ping responses but does not prevent port scanning'
+            read -r -p 'Disable ICMP echo response? [y/N]: ' confirm
+            [[ "${confirm}" =~ ^[Yy]$ ]] && set_icmp_policy 1
+            ;;
+        2)
+            read -r -p 'Enable ICMP echo response? [y/N]: ' confirm
+            [[ "${confirm}" =~ ^[Yy]$ ]] && set_icmp_policy 0
+            ;;
+        0) return 0 ;;
+        *)
+            print_error 'Invalid selection'
+            return 1
+            ;;
     esac
 }
 
-set_ipv6_policy() {
-    local value=$1 description old_all old_default temporary_ipv6 old_config apply_output
-    if [[ "${value}" == '1' ]]; then
-        description='disabled'
-    else
-        description='enabled'
-    fi
+# Prints the client address of the current SSH session, if known.
+ssh_client_address() {
+    local connection=${SSH_CONNECTION:-${SSH_CLIENT:-}}
+    printf '%s\n' "${connection%% *}"
+}
 
-    old_all=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 0)
-    old_default=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || echo 0)
-    temporary_ipv6=$(mktemp /tmp/vps-ipv6-policy.XXXXXX.conf)
-    old_config=$(mktemp /tmp/vps-ipv6-policy-backup.XXXXXX.conf)
+# IPv4-mapped addresses (::ffff:a.b.c.d) are IPv4 connections.
+is_ipv6_address() {
+    local address=$1
+    [[ "${address}" == *:* && "${address}" != ::ffff:*.* && "${address}" != ::FFFF:*.* ]]
+}
 
-    if [[ -f "${IPV6_CONFIG_FILE}" ]]; then
-        cp -a "${IPV6_CONFIG_FILE}" "${old_config}"
-    else
-        : >"${old_config}"
-    fi
+# Prints peer addresses of established sshd connections. Used when the SSH_*
+# variables are missing, e.g. because sudo stripped them.
+sshd_peer_addresses() {
+    local peer
+    command -v ss >/dev/null 2>&1 || return 0
+    ss -tnp state established 2>/dev/null | awk '/"sshd/ {print $4}' \
+        | while IFS= read -r peer; do
+            peer=${peer%:*}
+            peer=${peer#\[}
+            printf '%s\n' "${peer%]}"
+        done
+}
 
-    {
-        printf '# Managed separately by bbr_optimizer.sh\n'
-        printf 'net.ipv6.conf.all.disable_ipv6 = %s\n' "${value}"
-        printf 'net.ipv6.conf.default.disable_ipv6 = %s\n' "${value}"
-    } >"${temporary_ipv6}"
-
-    if ! install -m 0644 "${temporary_ipv6}" "${IPV6_CONFIG_FILE}" ||
-        ! apply_output=$(sysctl -p "${IPV6_CONFIG_FILE}" 2>&1); then
-        print_error "Failed to set IPv6 policy: ${apply_output:-file installation failed}"
-        if [[ -s "${old_config}" ]]; then
-            install -m 0644 "${old_config}" "${IPV6_CONFIG_FILE}"
-        else
-            rm -f "${IPV6_CONFIG_FILE}"
+# Returns 1 (with an explanation) when disabling IPv6 could lock the operator
+# out: the SSH session runs over IPv6, or there is no IPv4 default route.
+check_ipv6_disable_safe() {
+    local client peer
+    client=$(ssh_client_address)
+    if [[ -n "${client}" ]]; then
+        if is_ipv6_address "${client}"; then
+            print_error "Refusing to disable IPv6: this SSH session is connected over IPv6 (${client})."
+            print_error 'Disabling IPv6 would cut this session and the setting persists across reboots.'
+            return 1
         fi
-        sysctl -w "net.ipv6.conf.all.disable_ipv6=${old_all}" >/dev/null 2>&1 || true
-        sysctl -w "net.ipv6.conf.default.disable_ipv6=${old_default}" >/dev/null 2>&1 || true
-        rm -f "${temporary_ipv6}" "${old_config}"
+    else
+        while IFS= read -r peer; do
+            if is_ipv6_address "${peer}"; then
+                print_error "Refusing to disable IPv6: an SSH session is connected over IPv6 (${peer})."
+                return 1
+            fi
+        done < <(sshd_peer_addresses)
+    fi
+
+    if [[ -z "$(ip -4 route show default 2>/dev/null)" ]]; then
+        print_error 'Refusing to disable IPv6: this host has no IPv4 default route.'
+        print_error 'It would lose network access (and remote access) until IPv6 is re-enabled locally.'
         return 1
     fi
+}
 
-    rm -f "${temporary_ipv6}" "${old_config}"
+set_ipv6_policy() {
+    local value=$1 description=enabled rollback_seconds=0
+    if [[ "${value}" == '1' ]]; then
+        description=disabled
+        check_ipv6_disable_safe || return 1
+        rollback_seconds=${IPV6_ROLLBACK_SECONDS}
+        if [[ ! "${rollback_seconds}" =~ ^[0-9]+$ ]]; then
+            print_warning "Ignoring invalid BBR_IPV6_ROLLBACK_SECONDS='${rollback_seconds}'; using 60"
+            rollback_seconds=60
+        fi
+    fi
+
+    apply_sysctl_policy "${IPV6_CONFIG_FILE}" 'IPv6 policy' "${rollback_seconds}" \
+        "net.ipv6.conf.all.disable_ipv6=${value}" \
+        "net.ipv6.conf.default.disable_ipv6=${value}" || return 1
     print_success "IPv6 is now ${description}"
 }
 
@@ -475,55 +601,44 @@ manage_ipv6() {
     read -r -p 'Please select [0-2]: ' choice
 
     case "${choice}" in
-    1)
-        print_warning 'Disabling IPv6 immediately interrupts IPv6 connections and may affect IPv6-only services'
-        read -r -p 'Disable IPv6 system-wide? [y/N]: ' confirm
-        [[ "${confirm}" =~ ^[Yy]$ ]] && set_ipv6_policy 1
-        ;;
-    2)
-        read -r -p 'Enable IPv6 system-wide? [y/N]: ' confirm
-        [[ "${confirm}" =~ ^[Yy]$ ]] && set_ipv6_policy 0
-        ;;
-    0) return 0 ;;
-    *)
-        print_error 'Invalid selection'
-        return 1
-        ;;
+        1)
+            print_warning 'Disabling IPv6 immediately interrupts IPv6 connections and may affect IPv6-only services'
+            print_info 'It is refused for IPv6 SSH sessions or hosts without an IPv4 default route, and reverts automatically unless confirmed'
+            read -r -p 'Disable IPv6 system-wide? [y/N]: ' confirm
+            [[ "${confirm}" =~ ^[Yy]$ ]] && set_ipv6_policy 1
+            ;;
+        2)
+            read -r -p 'Enable IPv6 system-wide? [y/N]: ' confirm
+            [[ "${confirm}" =~ ^[Yy]$ ]] && set_ipv6_policy 0
+            ;;
+        0) return 0 ;;
+        *)
+            print_error 'Invalid selection'
+            return 1
+            ;;
     esac
 }
 
+# Puts the files and runtime values recorded in a backup back in place.
+# Returns 1 if anything could not be restored.
 restore_snapshot() {
-    local backup_dir=$1
+    local backup_dir=$1 entry live_path copy_name marker key value failed=0
 
-    if [[ -f "${backup_dir}/had_managed_config" ]]; then
-        cp -a "${backup_dir}/managed.conf" "${CONFIG_FILE}"
-    else
-        rm -f "${CONFIG_FILE}"
+    # Every backup written by this script (and its xray-vision-bbr predecessor)
+    # has runtime.conf; refuse anything else rather than deleting live files.
+    if [[ ! -f "${backup_dir}/runtime.conf" ]]; then
+        print_error "Not an optimizer backup (runtime.conf missing): ${backup_dir}"
+        return 1
     fi
 
-    if [[ -f "${backup_dir}/had_old_managed_config" ]]; then
-        cp -a "${backup_dir}/old-managed.conf" "${OLD_CONFIG_FILE}"
-    else
-        rm -f "${OLD_CONFIG_FILE}"
-    fi
-
-    if [[ -f "${backup_dir}/had_module_config" ]]; then
-        cp -a "${backup_dir}/modules.conf" "${MODULE_FILE}"
-    else
-        rm -f "${MODULE_FILE}"
-    fi
-
-    if [[ -f "${backup_dir}/had_old_module_config" ]]; then
-        cp -a "${backup_dir}/old-modules.conf" "${OLD_MODULE_FILE}"
-    else
-        rm -f "${OLD_MODULE_FILE}"
-    fi
-
-    if [[ -f "${backup_dir}/had_sysctl_conf" ]]; then
-        cp -a "${backup_dir}/sysctl.conf" "${LEGACY_SYSCTL_FILE}"
-    else
-        rm -f "${LEGACY_SYSCTL_FILE}"
-    fi
+    for entry in "${SNAPSHOT_FILES[@]}"; do
+        IFS='|' read -r live_path copy_name marker <<<"${entry}"
+        if [[ -f "${backup_dir}/${marker}" ]]; then
+            cp -a "${backup_dir}/${copy_name}" "${live_path}" || failed=1
+        else
+            rm -f "${live_path}" || failed=1
+        fi
+    done
 
     sysctl --system >/dev/null 2>&1 || true
     if [[ -s "${backup_dir}/runtime.conf" ]]; then
@@ -532,6 +647,11 @@ restore_snapshot() {
             [[ -n "${key}" && "${key}" != *icmp*echo_ignore_all* ]] || continue
             sysctl -w "${key}=${value# }" >/dev/null 2>&1 || true
         done <"${backup_dir}/runtime.conf"
+    fi
+
+    if ((failed)); then
+        print_error "Some files could not be restored from ${backup_dir}"
+        return 1
     fi
 }
 
@@ -552,16 +672,19 @@ apply_profile() {
     fi
 
     prepare_bbr || return 1
-    migrate_embedded_icmp_policy
-    backup_current_state
-    if ! remove_legacy_config ||
-        ! mkdir -p "$(dirname "${CONFIG_FILE}")" "$(dirname "${MODULE_FILE}")" ||
-        ! rm -f "${OLD_CONFIG_FILE}" "${OLD_MODULE_FILE}" ||
-        ! install -m 0644 "${TEMP_CONFIG}" "${CONFIG_FILE}" ||
-        ! printf 'tcp_bbr\n' >"${MODULE_FILE}"; then
+    migrate_embedded_icmp_policy || return 1
+    if ! backup_current_state; then
+        print_error 'No changes were made because the backup could not be created'
+        return 1
+    fi
+    if ! remove_legacy_config \
+        || ! mkdir -p "$(dirname "${CONFIG_FILE}")" "$(dirname "${MODULE_FILE}")" \
+        || ! rm -f "${OLD_CONFIG_FILE}" "${OLD_MODULE_FILE}" \
+        || ! install -m 0644 "${TEMP_CONFIG}" "${CONFIG_FILE}" \
+        || ! printf 'tcp_bbr\n' >"${MODULE_FILE}"; then
         print_error 'Failed to install the persistent BBR configuration'
         print_warning 'Restoring the pre-change state'
-        restore_snapshot "${LAST_BACKUP_DIR}"
+        restore_snapshot "${LAST_BACKUP_DIR}" || true
         return 1
     fi
 
@@ -569,7 +692,7 @@ apply_profile() {
         print_error 'Failed to apply the new sysctl configuration:'
         printf '%s\n' "${apply_output}" >&2
         print_warning 'Restoring the pre-change state'
-        restore_snapshot "${LAST_BACKUP_DIR}"
+        restore_snapshot "${LAST_BACKUP_DIR}" || true
         return 1
     fi
 
@@ -669,7 +792,10 @@ restore_backup() {
     backup=${backups[selection - 1]}
     read -r -p "Restore ${backup}? [y/N]: " confirm
     if [[ "${confirm}" =~ ^[Yy]$ ]]; then
-        restore_snapshot "${backup}"
+        if ! restore_snapshot "${backup}"; then
+            print_error "Backup restore was incomplete: ${backup}"
+            return 1
+        fi
         print_success "Backup restored: ${backup}"
         verify_status
     fi
@@ -687,21 +813,21 @@ main() {
         show_menu
         read -r -p 'Please select [0-7]: ' choice
         case "${choice}" in
-        1) apply_profile balanced || true ;;
-        2) apply_profile latency || true ;;
-        3) apply_profile bandwidth || true ;;
-        4) manage_icmp || true ;;
-        5) manage_ipv6 || true ;;
-        6) verify_status ;;
-        7) restore_backup || true ;;
-        0)
-            print_info 'Exiting script'
-            return 0
-            ;;
-        *)
-            print_error 'Invalid selection'
-            sleep 1
-            ;;
+            1) apply_profile balanced || true ;;
+            2) apply_profile latency || true ;;
+            3) apply_profile bandwidth || true ;;
+            4) manage_icmp || true ;;
+            5) manage_ipv6 || true ;;
+            6) verify_status ;;
+            7) restore_backup || true ;;
+            0)
+                print_info 'Exiting script'
+                return 0
+                ;;
+            *)
+                print_error 'Invalid selection'
+                sleep 1
+                ;;
         esac
         read -r -p 'Press Enter to continue...'
     done
