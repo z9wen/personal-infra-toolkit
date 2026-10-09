@@ -28,6 +28,7 @@ automatically before local state is changed.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import datetime as datetime_module
 import json
@@ -74,7 +75,6 @@ class Candidate:
     rollout_path: str
     archived: bool
     source: str
-    thread_source: str
     has_automation_run: bool = False
     has_surviving_fragments: bool = False
     issue_kind: str = "missing_rollout"
@@ -105,7 +105,6 @@ class TranscriptRecord:
     rollout_id: str
     related_ids: frozenset[str]
     cwd: str
-    thread_source: str
     is_user_rollout: bool
     archived: bool
     modified_at_ms: int
@@ -137,6 +136,14 @@ class WorkspaceMetadata:
     project_assignments: dict[str, str]
     projectless_directories: dict[str, str]
     projectless_ids: frozenset[str]
+
+
+def as_int(value: Any) -> int:
+    """Best-effort integer conversion for timestamps from foreign databases."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def stderr(message: str) -> None:
@@ -292,6 +299,7 @@ def parse_iso_timestamp_ms(value: Any) -> int:
 def scan_transcript_records(home: Path) -> list[TranscriptRecord]:
     archived_root = home / "archived_sessions"
     records: list[TranscriptRecord] = []
+    history_bases: list[str] = []
     for path in iter_transcript_paths(home):
         payload = session_meta_payload(path)
         if payload is None:
@@ -310,10 +318,10 @@ def scan_transcript_records(home: Path) -> list[TranscriptRecord]:
             related_ids.add(raw_rollout_id)
         related_ids.add(raw_session_id)
         history_base = payload.get("history_base")
+        base_id = ""
         if isinstance(history_base, dict):
             base_id = str(history_base.get("thread_id") or "").lower()
-            if THREAD_ID_RE.fullmatch(base_id):
-                related_ids.add(base_id)
+        history_bases.append(base_id if THREAD_ID_RE.fullmatch(base_id) else "")
 
         source = payload.get("source")
         thread_source = str(payload.get("thread_source") or "")
@@ -328,12 +336,26 @@ def scan_transcript_records(home: Path) -> list[TranscriptRecord]:
                 rollout_id=raw_rollout_id,
                 related_ids=frozenset(related_ids),
                 cwd=str(payload.get("cwd") or ""),
-                thread_source=thread_source,
                 is_user_rollout=thread_source == "user" or source == "vscode",
                 archived=archived_root in path.parents,
                 modified_at_ms=modified_at_ms,
             )
         )
+
+    # A paginated rollout names the thread its history continues from. Only
+    # treat that base as part of the same conversation when it belongs to the
+    # same session; otherwise deleting one chat would also delete another.
+    session_of: dict[str, str] = {}
+    for record in records:
+        session_of.setdefault(record.session_id, record.session_id)
+        if record.rollout_id:
+            session_of[record.rollout_id] = record.session_id
+    for index, base_id in enumerate(history_bases):
+        record = records[index]
+        if base_id and session_of.get(base_id, record.session_id) == record.session_id:
+            records[index] = dataclasses.replace(
+                record, related_ids=record.related_ids | {base_id}
+            )
     return records
 
 
@@ -509,9 +531,9 @@ def build_conversation_inventory(layout: Layout) -> list[ProjectGroup]:
             else:
                 project_path = "(旧索引 · 无法定位目录)"
 
-        state_updated_ms = int(state.get("updated_at_ms") or 0)
+        state_updated_ms = as_int(state.get("updated_at_ms"))
         if not state_updated_ms:
-            state_updated_ms = int(state.get("updated_at") or 0) * 1000
+            state_updated_ms = as_int(state.get("updated_at")) * 1000
         updated_at_ms = max(
             [index_updated_ms, state_updated_ms]
             + [record.modified_at_ms for record in session_records]
@@ -599,11 +621,11 @@ def scan(layout: Layout) -> tuple[list[Candidate], int]:
             ("title", "''"),
             ("archived", "0"),
             ("source", "''"),
-            ("thread_source", "''"),
         ):
             expressions.append(name if name in columns else f"{fallback} AS {name}")
+        order = "created_at, id" if "created_at" in columns else "id"
         rows = connection.execute(
-            f"SELECT {', '.join(expressions)} FROM threads ORDER BY created_at, id"
+            f"SELECT {', '.join(expressions)} FROM threads ORDER BY {order}"
         ).fetchall()
 
     candidates: list[Candidate] = []
@@ -613,6 +635,12 @@ def scan(layout: Layout) -> tuple[list[Candidate], int]:
         recorded = Path(os.path.expandvars(os.path.expanduser(raw_path)))
         recorded_exists = bool(raw_path) and recorded.is_file()
         exists_elsewhere = thread_id in present_ids
+        if not recorded_exists and relocated_rollout(recorded, layout.home).is_file():
+            # The same rollout exists under the current CODEX_HOME, so the
+            # stored absolute path is stale (moved home directory, new
+            # username, restored backup). That is not a ghost; deleting it
+            # would wipe real conversations.
+            continue
         # Codex resumes a thread from the exact rollout_path stored in the
         # threads table.  Finding an older fragment with the same thread ID
         # does not make a dangling rollout_path usable: the desktop app still
@@ -632,7 +660,6 @@ def scan(layout: Layout) -> tuple[list[Candidate], int]:
                 rollout_path=raw_path,
                 archived=bool(row["archived"]),
                 source=str(row["source"] or ""),
-                thread_source=str(row["thread_source"] or ""),
                 has_automation_run=thread_id in automated_ids,
                 has_surviving_fragments=exists_elsewhere,
                 issue_kind=issue_kind,
@@ -640,6 +667,15 @@ def scan(layout: Layout) -> tuple[list[Candidate], int]:
             )
         )
     return candidates, len(rows)
+
+
+def relocated_rollout(recorded: Path, home: Path) -> Path:
+    """Map a stored rollout path onto the current CODEX_HOME, if possible."""
+    parts = recorded.parts
+    for index in range(len(parts) - 1, -1, -1):
+        if parts[index] in ("sessions", "archived_sessions"):
+            return home.joinpath(*parts[index:])
+    return home / "sessions" / "__no_relocation__"
 
 
 def clean_display_text(value: str, limit: int = 90) -> str:
@@ -674,10 +710,36 @@ def print_scan_report(candidates: Sequence[Candidate], total: int) -> None:
             print(f"    缺失：{item.rollout_path or '(空路径)'}")
 
 
+APP_BUNDLE_NAMES = ("ChatGPT.app", "Codex.app")
+CLI_PACKAGE_MARKER = "/node_modules/@openai/codex/"
+
+
+def is_codex_command(command: str) -> bool:
+    """Match on what is being executed, not on arbitrary text in arguments.
+
+    A substring search over the whole command line would also match e.g.
+    ``tail -f /Applications/ChatGPT.app/...`` or an editor opened on a file
+    whose name mentions Codex, and those processes would then be killed.
+    """
+    for bundle in APP_BUNDLE_NAMES:
+        for root in ("/Applications", str(Path.home() / "Applications")):
+            if command.startswith(f"{root}/{bundle}/"):
+                return True
+    tokens = command.split()
+    if not tokens:
+        return False
+    executable = Path(tokens[0]).name
+    if executable == "codex":
+        return True
+    return executable in ("node", "nodejs", "bun") and len(tokens) > 1 and (
+        CLI_PACKAGE_MARKER in tokens[1]
+    )
+
+
 def find_running_codex_processes() -> list[ProcessInfo] | None:
     try:
         result = subprocess.run(
-            ["ps", "-axo", "pid=,uid=,command="],
+            ["ps", "-axo", "pid=,ppid=,uid=,command="],
             check=True,
             capture_output=True,
             text=True,
@@ -685,35 +747,31 @@ def find_running_codex_processes() -> list[ProcessInfo] | None:
     except (OSError, subprocess.CalledProcessError):
         return None
 
-    matches: list[ProcessInfo] = []
-    bundle_markers = (
-        "/Applications/ChatGPT.app/",
-        "/Applications/Codex.app/",
-        "ChatGPT Helper",
-        "Codex Helper",
-        "/node_modules/@openai/codex/",
-    )
+    rows: list[tuple[int, int, int, str]] = []
     for raw_line in result.stdout.splitlines():
-        line = raw_line.strip()
-        if not line:
+        parts = raw_line.strip().split(maxsplit=3)
+        if len(parts) != 4:
             continue
-        parts = line.split(maxsplit=2)
-        if len(parts) != 3:
-            continue
-        raw_pid, raw_uid, command = parts
         try:
-            pid = int(raw_pid)
-            uid = int(raw_uid)
+            pid, ppid, uid = int(parts[0]), int(parts[1]), int(parts[2])
         except ValueError:
             continue
-        if uid != os.getuid() or pid == os.getpid():
-            continue
-        first_command = command.split(maxsplit=1)[0]
-        is_bundle_process = any(marker in command for marker in bundle_markers)
-        is_codex_cli = Path(first_command).name == "codex"
-        if is_bundle_process or is_codex_cli:
-            matches.append(ProcessInfo(pid=pid, command=command))
-    return matches
+        rows.append((pid, ppid, uid, parts[3]))
+
+    # Never signal this process or anything it runs under (the terminal,
+    # a Codex CLI session that launched the cleaner, ...).
+    parent_of = {pid: ppid for pid, ppid, _, _ in rows}
+    protected: set[int] = set()
+    current = os.getpid()
+    while current and current not in protected:
+        protected.add(current)
+        current = parent_of.get(current, 0)
+
+    return [
+        ProcessInfo(pid=pid, command=command)
+        for pid, _, uid, command in rows
+        if uid == os.getuid() and pid not in protected and is_codex_command(command)
+    ]
 
 
 def process_details(processes: Sequence[ProcessInfo]) -> str:
@@ -776,6 +834,8 @@ def ensure_app_stopped(allow_running: bool) -> None:
 
 
 def atomic_write(path: Path, data: bytes) -> None:
+    # Write through symlinks instead of replacing the link with a plain file.
+    path = path.resolve() if path.is_symlink() else path
     original_mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
     file_descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.ghost-cleaner-", dir=path.parent
@@ -1089,8 +1149,8 @@ def expand_descendant_thread_ids(state_db: Path, seed_ids: Iterable[str]) -> set
 
 def backup_sqlite_database(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with connect_sqlite(source, readonly=True) as source_connection:
-        with sqlite3.connect(destination) as destination_connection:
+    with contextlib.closing(connect_sqlite(source, readonly=True)) as source_connection:
+        with contextlib.closing(sqlite3.connect(destination)) as destination_connection:
             source_connection.backup(destination_connection)
 
 
@@ -1121,6 +1181,29 @@ def create_index_backup(layout: Layout, quarantine_dir: Path) -> list[str]:
     return backed_up
 
 
+def restore_index_backup(layout: Layout, quarantine_dir: Path) -> None:
+    """Put databases and index files back exactly as they were backed up."""
+    database_dir = quarantine_dir / "index_backup" / "databases"
+    for target in (
+        layout.state_db,
+        layout.catalog_db,
+        layout.summaries_db,
+        *layout.history_dbs,
+    ):
+        backup = database_dir / target.name
+        if not backup.is_file():
+            continue
+        with contextlib.closing(sqlite3.connect(backup)) as source_connection:
+            with contextlib.closing(sqlite3.connect(target)) as target_connection:
+                source_connection.backup(target_connection)
+
+    file_dir = quarantine_dir / "index_backup" / "files"
+    for target in (layout.session_index, *layout.global_state_files):
+        backup = file_dir / target.name
+        if backup.is_file():
+            atomic_write(target, backup.read_bytes())
+
+
 def create_quarantine_dir(home: Path) -> Path:
     stamp = datetime_module.datetime.now(datetime_module.timezone.utc).strftime(
         "%Y%m%dT%H%M%S.%fZ"
@@ -1131,22 +1214,32 @@ def create_quarantine_dir(home: Path) -> Path:
 
 
 def quarantine_transcripts(
-    paths: Iterable[Path], home: Path, quarantine_dir: Path
-) -> list[tuple[Path, Path]]:
-    moved: list[tuple[Path, Path]] = []
+    paths: Iterable[Path],
+    home: Path,
+    quarantine_dir: Path,
+    moved: list[tuple[Path, Path]],
+) -> None:
+    """Move transcripts into quarantine, appending each move to ``moved``.
+
+    Every path is validated before the first file moves, and progress is
+    recorded in the caller's list so a failure halfway can be rolled back.
+    """
+    home_resolved = home.resolve()
+    plan: list[tuple[Path, Path]] = []
     for source in sorted(set(paths)):
         if not source.is_file():
             continue
         resolved = source.resolve()
         try:
-            relative = resolved.relative_to(home.resolve())
+            relative = resolved.relative_to(home_resolved)
         except ValueError as exc:
             raise CleanerError(f"拒绝移动 CODEX_HOME 之外的文件：{resolved}") from exc
-        destination = quarantine_dir / "transcripts" / relative
+        plan.append((resolved, quarantine_dir / "transcripts" / relative))
+
+    for resolved, destination in plan:
         destination.parent.mkdir(parents=True, exist_ok=True)
         os.replace(resolved, destination)
         moved.append((resolved, destination))
-    return moved
 
 
 def rollback_quarantined_transcripts(moved: Sequence[tuple[Path, Path]]) -> None:
@@ -1244,7 +1337,7 @@ def delete_conversations(
     backups = create_index_backup(layout, quarantine_dir)
     moved: list[tuple[Path, Path]] = []
     try:
-        moved = quarantine_transcripts(transcript_paths, layout.home, quarantine_dir)
+        quarantine_transcripts(transcript_paths, layout.home, quarantine_dir, moved)
         write_quarantine_manifest(
             quarantine_dir,
             status="prepared",
@@ -1256,21 +1349,28 @@ def delete_conversations(
         counts = cleanup_thread_ids(
             layout, related_ids, include_automation_runs=False
         )
-    except Exception as exc:
+    except BaseException as exc:
+        # BaseException so Ctrl-C mid-delete also rolls back.
+        status = "failed_rolled_back"
         try:
             rollback_quarantined_transcripts(moved)
+            restore_index_backup(layout, quarantine_dir)
+        except Exception as rollback_exc:
+            status = "failed_rollback_incomplete"
+            stderr(f"回滚未完成，请从 {quarantine_dir} 手动恢复：{rollback_exc}")
+        try:
             write_quarantine_manifest(
                 quarantine_dir,
-                status="failed_rolled_back_transcripts",
+                status=status,
                 conversations=conversations,
                 related_ids=related_ids,
                 moved=moved,
                 backups=backups,
-                error=str(exc),
+                error=str(exc) or type(exc).__name__,
             )
-        except Exception:
-            pass
-        if isinstance(exc, CleanerError):
+        except Exception as manifest_exc:
+            stderr(f"无法写入隔离区清单：{manifest_exc}")
+        if isinstance(exc, (CleanerError, KeyboardInterrupt)):
             raise
         raise CleanerError(f"对话删除失败：{exc}") from exc
 
@@ -1294,9 +1394,13 @@ def transcript_provider(path: Path) -> str | None:
     return str(provider) if isinstance(provider, str) and provider else None
 
 
-def switch_transcript_provider(
-    path: Path, new_provider: str
-) -> tuple[str, str] | None:
+SWITCH_CHANGED = "changed"
+SWITCH_SAME = "same"
+SWITCH_LENGTH = "length_mismatch"
+SWITCH_UNSUPPORTED = "unsupported"
+
+
+def switch_transcript_provider(path: Path, new_provider: str) -> tuple[str, str]:
     """Safely update one rollout's provider marker.
 
     Rollout files are JSONL.  The provider is stored in the first
@@ -1305,6 +1409,9 @@ def switch_transcript_provider(
     byte offsets into source rollouts, so changing the byte length of the
     first line would invalidate every descendant cutoff.  Refuse such a
     change; callers can create a continuation/fork instead.
+
+    Returns ``(outcome, old_provider)`` where outcome is one of the
+    ``SWITCH_*`` constants.
     """
     try:
         original = path.read_bytes()
@@ -1317,32 +1424,33 @@ def switch_transcript_provider(
             remainder = original[first_end + 1 :]
         parsed = json.loads(first_line.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return None
+        return SWITCH_UNSUPPORTED, ""
     if not isinstance(parsed, dict) or parsed.get("type") != "session_meta":
-        return None
+        return SWITCH_UNSUPPORTED, ""
     payload = parsed.get("payload")
     if not isinstance(payload, dict):
-        return None
+        return SWITCH_UNSUPPORTED, ""
     old_provider = payload.get("model_provider")
     if not isinstance(old_provider, str) or not old_provider:
-        return None
+        return SWITCH_UNSUPPORTED, ""
     if old_provider == new_provider:
-        return None
-    marker = f'"model_provider":"{old_provider}"'.encode("utf-8")
+        return SWITCH_SAME, old_provider
+    # json.dumps escapes quotes/backslashes so the rewritten line stays valid.
+    marker = f'"model_provider":{json.dumps(old_provider)}'.encode("utf-8")
     if marker not in first_line:
-        return None
-    replacement = f'"model_provider":"{new_provider}"'.encode("utf-8")
+        return SWITCH_UNSUPPORTED, old_provider
+    replacement = f'"model_provider":{json.dumps(new_provider)}'.encode("utf-8")
     rewritten = first_line.replace(marker, replacement, 1)
     if len(rewritten) != len(first_line):
         # Byte offsets in paginated descendants refer to this exact file.
         # An in-place length change would make the lineage invalid.
-        return None
+        return SWITCH_LENGTH, old_provider
     atomic_write(path, rewritten + remainder)
-    return old_provider, new_provider
+    return SWITCH_CHANGED, old_provider
 
 
 def config_provider_names(home: Path) -> list[str]:
-    """从 config.toml 的 [model_providers.*] 收集自定义 provider 名（不含内建 openai）。"""
+    """Collect custom provider names from config.toml [model_providers.*]."""
     config_path = home / "config.toml"
     try:
         import tomllib
@@ -1352,7 +1460,6 @@ def config_provider_names(home: Path) -> list[str]:
         providers = data.get("model_providers")
         names = [str(key) for key in providers] if isinstance(providers, dict) else []
     except (ImportError, OSError, ValueError):
-        names = []
         try:
             text = config_path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
@@ -1369,27 +1476,25 @@ def config_provider_names(home: Path) -> list[str]:
 
 def switch_conversations_provider(
     conversations: Sequence[Conversation], target: str
-) -> tuple[dict[str, dict[str, int]], list[str]]:
-    """把一批对话的所有 rollout 切到目标 provider。
+) -> tuple[dict[str, dict[str, int]], dict[str, int]]:
+    """Switch every rollout of the given conversations to ``target``.
 
-    返回 (会话统计, 未变化会话列表)；统计形如
-    {session_id: {旧provider: 改动文件数}}。
+    Returns ``(stats, skipped)``: stats maps session_id to
+    {old_provider: files changed}; skipped counts unchanged files by outcome.
     """
     stats: dict[str, dict[str, int]] = {}
-    unchanged: list[str] = []
+    skipped: dict[str, int] = {}
     for conversation in conversations:
         per_session: dict[str, int] = {}
         for path in conversation.transcript_paths:
-            result = switch_transcript_provider(path, target)
-            if result is None:
-                continue
-            old_provider, _ = result
-            per_session[old_provider] = per_session.get(old_provider, 0) + 1
+            outcome, old_provider = switch_transcript_provider(path, target)
+            if outcome == SWITCH_CHANGED:
+                per_session[old_provider] = per_session.get(old_provider, 0) + 1
+            else:
+                skipped[outcome] = skipped.get(outcome, 0) + 1
         if per_session:
             stats[conversation.session_id] = per_session
-        else:
-            unchanged.append(conversation.session_id)
-    return stats, unchanged
+    return stats, skipped
 
 
 def format_updated_at(timestamp_ms: int) -> str:
@@ -1451,7 +1556,7 @@ def run_conversation_tui(
         selected_items = [conversation_by_id[item] for item in sorted(selected_ids)]
         while True:
             screen.erase()
-            height, width = screen.getmaxyx()
+            height, _ = screen.getmaxyx()
             add_text(screen, 1, 2, "确认删除所选对话？", curses.A_BOLD)
             add_text(
                 screen,
@@ -1461,7 +1566,7 @@ def run_conversation_tui(
             )
             add_text(screen, 4, 2, "索引会从本机数据库移除，Codex/ChatGPT 将自动退出。")
             preview_limit = max(height - 10, 0)
-            for index, item in enumerate(selected_items[:preview_limit], start=0):
+            for index, item in enumerate(selected_items[:preview_limit]):
                 add_text(
                     screen,
                     6 + index,
@@ -1507,7 +1612,7 @@ def run_conversation_tui(
             choice = 0
             while True:
                 screen.erase()
-                height, width = screen.getmaxyx()
+                height, _ = screen.getmaxyx()
                 add_text(
                     screen, 1, 2, "选择要切换到的 provider：", curses.A_BOLD
                 )
@@ -1545,7 +1650,7 @@ def run_conversation_tui(
             selected_items = [conversation_by_id[item] for item in sorted(selected)]
             while True:
                 screen.erase()
-                height, width = screen.getmaxyx()
+                height, _ = screen.getmaxyx()
                 add_text(screen, 1, 2, f"确认切换 provider 到 {target}？", curses.A_BOLD)
                 add_text(
                     screen,
@@ -1744,13 +1849,18 @@ def run_conversation_tui(
                         for name in config_provider_names(layout.home)
                         if name != "openai"
                     ]
-                    target = choose_provider(screen, providers)
-                    if target is None:
+                    running = find_running_codex_processes()
+                    target = None if running else choose_provider(screen, providers)
+                    if running is None or running:
+                        # Rewriting a rollout the app is appending to would
+                        # lose the lines written to the replaced file.
+                        message = "请先退出 ChatGPT/Codex 再切换 provider（正在写入的对话可能丢失内容）。"
+                    elif target is None:
                         message = "已取消 provider 切换。"
                     elif not confirm_switch(screen, target):
                         message = "已取消 provider 切换。"
                     else:
-                        stats, unchanged = switch_conversations_provider(
+                        stats, skipped = switch_conversations_provider(
                             [
                                 conversation_by_id[sid]
                                 for sid in sorted(selected)
@@ -1758,8 +1868,20 @@ def run_conversation_tui(
                             target,
                         )
                         provider_by_id = collect_providers()
+                        skipped_note = "；".join(
+                            text
+                            for text in (
+                                f"{skipped.get(SWITCH_SAME, 0)} 个文件已是 {target}"
+                                if skipped.get(SWITCH_SAME) else "",
+                                f"{skipped.get(SWITCH_LENGTH, 0)} 个文件因 provider 名长度不同而跳过（分页偏移量会失效）"
+                                if skipped.get(SWITCH_LENGTH) else "",
+                                f"{skipped.get(SWITCH_UNSUPPORTED, 0)} 个文件格式无法识别"
+                                if skipped.get(SWITCH_UNSUPPORTED) else "",
+                            )
+                            if text
+                        )
                         if not stats:
-                            message = f"所选对话已经全部是 {target}，没有需要修改的。"
+                            message = f"没有文件被修改：{skipped_note or '没有可切换的 rollout'}。"
                         else:
                             aggregate: dict[str, int] = {}
                             for counts in stats.values():
@@ -1774,10 +1896,8 @@ def run_conversation_tui(
                                 f"已将 {len(stats)} 条对话切到 {target}"
                                 f"（{detail}，共 {total} 个文件）"
                             )
-                            if unchanged:
-                                message += (
-                                    f"；{len(unchanged)} 条已经是 {target}，未改动"
-                                )
+                            if skipped_note:
+                                message += f"；{skipped_note}"
             elif key in (ord("d"), ord("D")):
                 if not selected:
                     message = "请先用空格选择至少一条对话。"
@@ -1835,13 +1955,21 @@ def apply_cleanup(
     include_automation_runs: bool,
 ) -> None:
     thread_ids = [item.thread_id for item in candidates]
+    backup_dir = create_quarantine_dir(layout.home)
+    create_index_backup(layout, backup_dir)
     try:
         counts = cleanup_thread_ids(
             layout,
             thread_ids,
             include_automation_runs=include_automation_runs,
         )
-    except Exception as exc:
+    except BaseException as exc:
+        try:
+            restore_index_backup(layout, backup_dir)
+        except Exception as restore_exc:
+            stderr(f"自动恢复失败，请从 {backup_dir} 手动恢复：{restore_exc}")
+        if isinstance(exc, (CleanerError, KeyboardInterrupt)):
+            raise
         raise CleanerError(f"清理失败：{exc}") from exc
 
     print(f"\n已清理 {len(candidates)} 个幽灵任务。")
@@ -1851,7 +1979,17 @@ def apply_cleanup(
         for name, count in sorted(changed_counts.items()):
             print(f"  {name}: {count}")
     print("数据库完整性检查：通过")
+    print(f"索引备份：{backup_dir}")
     print("现在可以重新打开 ChatGPT/Codex 桌面端。")
+
+
+def confirm_repair(count: int, assume_yes: bool) -> bool:
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        raise CleanerError("非交互环境下执行清理需要加 --yes。")
+    answer = input(f"\n确认清理以上 {count} 个幽灵任务？已自动备份索引。[y/N] ")
+    return answer.strip().lower() in ("y", "yes")
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -1891,6 +2029,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="连同幽灵任务关联的自动化运行记录一起删除",
     )
     parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="跳过清理前的确认（非交互环境必需）",
+    )
+    parser.add_argument(
         "--allow-running",
         action="store_true",
         help="跳过桌面端/CLI 自动终止与进程检查（不推荐）",
@@ -1903,8 +2046,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         parser.error("无效的任务 ID：" + ", ".join(invalid_ids))
     if not argv:
         args.tui = True
-    if args.tui and (args.id or args.scan_only or args.include_automation_runs):
-        parser.error("终端管理器不能与 --id/--scan-only/--include-automation-runs 同时使用")
+    if args.tui and (args.id or args.scan_only or args.include_automation_runs or args.yes):
+        parser.error(
+            "终端管理器不能与 --id/--scan-only/--include-automation-runs/--yes 同时使用"
+        )
     return args
 
 
@@ -1973,6 +2118,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if not selected:
             print("\n没有可清理的任务；未修改任何文件。")
+            return 0
+        if not confirm_repair(len(selected), args.yes):
+            print("已取消；没有修改任何文件。")
             return 0
 
         ensure_app_stopped(args.allow_running)
