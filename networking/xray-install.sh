@@ -1456,19 +1456,59 @@ xhttpNginxLocation() {
         "${indent}}"
 }
 
+# Server-level guard that skips the server block's remaining rewrite
+# directives for the XHTTP path. Panel redirects ("send the whole site to
+# another domain") and rewrite presets are server-level if/return/rewrite;
+# they run before a location is chosen, so without the guard the location is
+# never reached and every XHTTP request gets the redirect.
+# Usage: xhttpNginxRedirectGuard <path> [indent]
+xhttpNginxRedirectGuard() {
+    local path=$1 indent=${2:-    } pattern
+    pattern=$(sed 's/[].*+?^$()|{}[]/\\&/g' <<<"${path}")
+    printf '%s\n' \
+        "${indent}if (\$uri ~ \"^${pattern}/\") {" \
+        "${indent}    break;" \
+        "${indent}}"
+}
+
 # aaPanel/BT vhost directory (overridable for tests).
 panelVhostRoot=/www/server/panel/vhost
 xhttpPanelMarkerBegin="# >>> xray-agent XHTTP (managed by xray-agent, do not edit) >>>"
 xhttpPanelMarkerEnd="# <<< xray-agent XHTTP <<<"
 xhttpStateFile=/opt/xray-agent/xhttp_public_port
+# Sorts before the panel's "<md5>_<domain>.conf" redirect files, so the guard
+# runs before their rules.
+xhttpPanelRedirectFile=0-xray-agent-xhttp.conf
+
+# The marked block added to a panel site: the guard, then the location.
+xhttpPanelBlock() {
+    echo "${xhttpPanelMarkerBegin}"
+    xhttpNginxRedirectGuard "$(xhttpPublicPath)"
+    xhttpNginxLocation "$(xhttpPublicPath)"
+    echo "${xhttpPanelMarkerEnd}"
+}
+
+# Every file that may hold our block for the panel site, as "<file> own"
+# (the whole file is ours) or "<file> block" (a marked block inside a
+# user-editable file). Earlier versions used the extension or rewrite file.
+panelXhttpFiles() {
+    echo "${panelVhostRoot}/nginx/redirect/${btDomain}/${xhttpPanelRedirectFile} own"
+    echo "${panelVhostRoot}/nginx/extension/${btDomain}/xray-agent-xhttp.conf own"
+    echo "${panelVhostRoot}/rewrite/${btDomain}.conf block"
+}
 
 # Find a file that the panel site config already includes inside its server
-# block, so our location survives the panel rewriting the site config.
-# Prints "<file> own" (the whole file is ours) or "<file> block" (a marked
-# block inside a user-editable file).
+# block, so our block survives the panel rewriting the site config. Prefers
+# the redirect directory: it is included before the URL rewrite file, so the
+# guard runs before the panel's redirects and the user's rewrite rules.
+# Prints a line of panelXhttpFiles.
 findPanelXhttpTarget() {
     local siteConf="${panelVhostRoot}/nginx/${btDomain}.conf"
     if [[ -f "${siteConf}" ]]; then
+        if grep -qF "${panelVhostRoot}/nginx/redirect/${btDomain}/*.conf" "${siteConf}"; then
+            echo "${panelVhostRoot}/nginx/redirect/${btDomain}/${xhttpPanelRedirectFile} own"
+            return 0
+        fi
         if grep -qF "${panelVhostRoot}/nginx/extension/${btDomain}/*.conf" "${siteConf}"; then
             echo "${panelVhostRoot}/nginx/extension/${btDomain}/xray-agent-xhttp.conf own"
             return 0
@@ -1508,48 +1548,64 @@ stripXhttpPanelBlock() {
     ' "$1"
 }
 
-# Add or remove the XHTTP location in the panel site that serves 443, then
-# test and reload nginx. A failed test restores the previous file.
+# Add or remove the XHTTP block in the panel site that serves 443, then test
+# and reload nginx. The block is first removed from every file that may hold
+# it (an older install may have used another one); a failed test restores
+# all of them.
 # Usage: syncPanelXhttpLocation install|remove
 syncPanelXhttpLocation() {
-    local action=$1 target file mode backup
+    local action=$1 target file mode backupDir index=0 output
     [[ -n "${btDomain}" ]] || return 0
     if ! target=$(findPanelXhttpTarget); then
         if [[ "${action}" == "install" ]]; then
             echoContent yellow " ---> 未找到 ${btDomain} 站点配置中可安全写入的位置（面板会覆盖直接修改）"
-            echoContent yellow " ---> 请在面板中把以下配置加入 ${btDomain} 的 443 server 块后重载 Nginx:"
-            xhttpNginxLocation "$(xhttpPublicPath)"
+            echoContent yellow " ---> 请在面板中把以下配置加入 ${btDomain} 的 443 server 块（放在重定向和伪静态规则之前）后重载 Nginx:"
+            xhttpPanelBlock
         fi
         return 0
     fi
-    file=${target% *}
-    mode=${target##* }
-    backup=$(mktemp) || return 1
-    [[ -f "${file}" ]] && cp -p "${file}" "${backup}"
+    backupDir=$(mktemp -d) || return 1
 
-    if [[ "${mode}" == "own" ]]; then
-        rm -f "${file}"
-    elif [[ -f "${file}" ]]; then
-        stripXhttpPanelBlock "${backup}" >"${file}"
-    fi
+    while read -r file mode; do
+        ((++index))
+        [[ -f "${file}" ]] || continue
+        cp -p "${file}" "${backupDir}/${index}"
+        if [[ "${mode}" == "own" ]]; then
+            rm -f "${file}"
+        else
+            stripXhttpPanelBlock "${backupDir}/${index}" >"${file}"
+        fi
+    done < <(panelXhttpFiles)
+
     if [[ "${action}" == "install" ]]; then
+        # Our block goes first: in a shared rewrite file the guard has to run
+        # before the user's own server-level rewrites.
+        file=${target% *}
         mkdir -p "$(dirname "${file}")"
+        : >"${backupDir}/body"
+        [[ -f "${file}" ]] && cat "${file}" >"${backupDir}/body"
         {
-            echo "${xhttpPanelMarkerBegin}"
-            xhttpNginxLocation "$(xhttpPublicPath)"
-            echo "${xhttpPanelMarkerEnd}"
-        } >>"${file}"
+            xhttpPanelBlock
+            cat "${backupDir}/body"
+        } >"${file}"
     fi
 
-    local output
     if ! output=$(panelNginxTest 2>&1); then
-        if [[ -s "${backup}" ]]; then cp -p "${backup}" "${file}"; else rm -f "${file}"; fi
-        rm -f "${backup}"
-        echoContent red " ---> 面板 Nginx 配置测试失败，已恢复: ${file}"
+        index=0
+        while read -r file mode; do
+            ((++index))
+            if [[ -f "${backupDir}/${index}" ]]; then
+                cp -p "${backupDir}/${index}" "${file}"
+            else
+                rm -f "${file}"
+            fi
+        done < <(panelXhttpFiles)
+        rm -rf "${backupDir}"
+        echoContent red " ---> 面板 Nginx 配置测试失败，已恢复 ${btDomain} 的站点配置"
         echoContent yellow "$(echo "${output}" | tail -3)"
         return 1
     fi
-    rm -f "${backup}"
+    rm -rf "${backupDir}"
     panelNginxReload >/dev/null 2>&1
     if [[ "${action}" == "install" ]]; then
         echoContent green " ---> XHTTP 已接入面板站点 https://${btDomain}$(xhttpPublicPath)/ (${file})"
@@ -1559,7 +1615,8 @@ syncPanelXhttpLocation() {
 # Remove our XHTTP location from every panel site (used by uninstall).
 removeAllPanelXhttpLocations() {
     local file changed=false
-    for file in "${panelVhostRoot}"/nginx/extension/*/xray-agent-xhttp.conf; do
+    for file in "${panelVhostRoot}"/nginx/redirect/*/"${xhttpPanelRedirectFile}" \
+        "${panelVhostRoot}"/nginx/extension/*/xray-agent-xhttp.conf; do
         [[ -f "${file}" ]] && rm -f "${file}" && changed=true
     done
     for file in "${panelVhostRoot}"/rewrite/*.conf; do
@@ -1571,6 +1628,26 @@ removeAllPanelXhttpLocations() {
         panelNginxReload >/dev/null 2>&1
     fi
     rm -f "${xhttpStateFile}"
+}
+
+# Request the XHTTP path from the panel site the way a client does and warn
+# when it does not reach Xray (which answers a bare GET with 400): a redirect
+# or the site's own 404 means a rule the guard cannot precede still takes the
+# path, e.g. a return/rewrite written directly into the site config.
+checkPanelXhttpReachable() {
+    local result code
+    [[ -n "${btDomain}" ]] || return 0
+    command -v curl >/dev/null 2>&1 || return 0
+    result=$(curl -sk --max-time 5 --resolve "${btDomain}:443:127.0.0.1" -o /dev/null \
+        -w '%{http_code} %{redirect_url}' "https://${btDomain}$(xhttpPublicPath)/") || return 0
+    code=${result%% *}
+    case ${code} in
+        3??) echoContent red " ---> XHTTP 路径被站点 ${btDomain} 重定向 (${code} -> ${result#* })，客户端将无法连接" ;;
+        404) echoContent red " ---> XHTTP 路径未到达 Xray（站点 ${btDomain} 返回 404），客户端将无法连接" ;;
+        *) return 0 ;;
+    esac
+    echoContent yellow " ---> 请检查站点配置中的 if/return/rewrite 规则，并在它们之前加入:"
+    xhttpNginxRedirectGuard "$(xhttpPublicPath)"
 }
 checkIP() {
     echoContent skyBlue "\n ---> 检查域名ip中"
@@ -6511,6 +6588,9 @@ runInstall() {
     restartXray || restartStatus=$?
     handleNginx start
     ((restartStatus == 0)) || return 1
+    if hasProtocol "${selectCustomInstallType}" 14; then
+        checkPanelXhttpReachable
+    fi
     checkGFWStatue $((++step))
     showAccounts $((++step))
 }
@@ -7882,7 +7962,7 @@ managePortHopping() {
 menu() {
     cd "$HOME" || exit
     echoContent red "\n=============================================================="
-    echoContent green "当前版本：v2026.10.09.1791525114"
+    echoContent green "当前版本：v2026.10.11.1791718797"
     echoContent green "描述：Xray 一键安装管理脚本\c"
     showInstallStatus
     echoContent skyBlue "快捷命令：xraya"
