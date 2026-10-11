@@ -135,6 +135,9 @@ runInstall() {
     restartXray || restartStatus=$?
     handleNginx start
     ((restartStatus == 0)) || return 1
+    if hasProtocol "${selectCustomInstallType}" 14; then
+        checkPanelXhttpReachable
+    fi
     checkGFWStatue $((++step))
     showAccounts $((++step))
 }
