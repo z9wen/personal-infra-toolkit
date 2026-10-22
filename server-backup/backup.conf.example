@@ -1,0 +1,49 @@
+# Settings for backup-local.sh and rclone-backup.sh, sourced as bash.
+# Copy to backup.conf next to the scripts, or point BACKUP_CONFIG at it, e.g. in cron:
+#   0 6 * * * BACKUP_CONFIG=/etc/server-backup/backup.conf /opt/server-backup/rclone-backup.sh >>/var/log/server-backup.log 2>&1
+
+# Local archives: <BACKUP_BASE>/{database,web,config}/<item>-<YYYYMMDD>.tar.gz
+BACKUP_BASE="/var/backups/server-backup"
+# Archives kept locally per site/database
+KEEP_LOCAL=2
+
+# Every directory under WEB_ROOT becomes web-<directory>-<YYYYMMDD>.tar.gz
+WEB_ROOT="/var/www"
+
+# MariaDB: option file ([client] user=... password=...) of a read-only account:
+#   GRANT SELECT, SHOW VIEW, TRIGGER, LOCK TABLES, EVENT ON *.* TO 'backup'@'localhost';
+# Every database is dumped. Map "<database> <site>" so db-<site> pairs with web-<site>;
+# unmapped databases are saved as db-mariadb-<database>. Leave empty to skip MariaDB.
+MYSQL_DEFAULTS="/etc/server-backup/mariadb-backup.cnf"
+MARIADB_SITES=(
+    "wordpress blog.example.com"
+)
+
+# Other databases, one entry each: "<site> <type> <source>"
+#   postgres  <docker container>  pg_dump with the container's POSTGRES_USER / POSTGRES_DB
+#   sqlite    <database file>     online backup, safe while the app is running
+#   script    <executable>        the app's own backup command, run with BACKUP_ROOT=<scratch dir>
+DATABASES=(
+    "app.example.com postgres app-db"
+    "vault.example.com sqlite /var/www/vault.example.com/data/db.sqlite3"
+    "api.example.com script /var/www/api.example.com/backup.sh"
+)
+
+# Host configuration archived into config-<YYYYMMDD>.tar.gz, relative to /; missing paths are skipped
+CONFIG_PATHS=(
+    etc/nginx etc/mysql etc/php
+    etc/systemd/system
+    etc/server-backup
+    root/.acme.sh
+)
+# Credentials and API tokens can be recreated and are never archived
+CONFIG_EXCLUDES=(
+    etc/server-backup/mariadb-backup.cnf
+    root/.acme.sh/account.conf
+)
+
+# Upload destination (any rclone remote) and rotation per site/database
+RCLONE_DEST="remote:server-backup"
+KEEP_DAILY=2
+KEEP_WEEKLY=1  # copies made on Sundays
+KEEP_MONTHLY=1 # copies made on the 1st
