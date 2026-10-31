@@ -1,5 +1,17 @@
-# Accounts
+# Users of an inbound config, one JSON object per line, keyed like
+# collectAccounts; only the account whose id/auth is $2 when given.
+inboundUsers() {
+    jq -c --arg id "${2:-}" '
+        (.inbounds[0].settings.clients // .inbounds[0].settings.users // .inbounds[0].users // [])[]
+        | select($id == "" or (.id // .uuid // .auth // .password // "") == $id)
+    ' "$1"
+}
+
+# Share links and QR-code links of every installed protocol. A protocol the
+# selected account is not in is skipped, header included.
+# Usage: showAccounts [progress step] [account id: only this account]
 showAccounts() {
+    local accountId=${2:-}
     readInstallType
     readInstallProtocolType
     readConfigHostPathUUID
@@ -9,10 +21,11 @@ showAccounts() {
 
     initSubscribeLocalConfig
     # VLESS TCP
-    if echo ${currentInstallProtocolType} | grep -q ",0,"; then
+    if echo ${currentInstallProtocolType} | grep -q ",0," \
+        && [[ -n "$(inboundUsers "${configPath}02_VLESS_TCP_inbounds.json" "${accountId}")" ]]; then
 
         echoContent skyBlue "============================= VLESS TCP TLS_Vision [推荐] ==============================\n"
-        jq -c '.inbounds[0].settings.clients//.inbounds[0].users//[] | .[]' ${configPath}02_VLESS_TCP_inbounds.json | while read -r user; do
+        inboundUsers "${configPath}02_VLESS_TCP_inbounds.json" "${accountId}" | while read -r user; do
             local email=
             email=$(echo "${user}" | jq -r .email//.name)
 
@@ -23,10 +36,11 @@ showAccounts() {
     fi
 
     # VLESS WS
-    if echo ${currentInstallProtocolType} | grep -q ",1,"; then
+    if echo ${currentInstallProtocolType} | grep -q ",1," \
+        && [[ -n "$(inboundUsers "${configPath}03_VLESS_WS_inbounds.json" "${accountId}")" ]]; then
         echoContent skyBlue "\n================================ VLESS WS TLS [仅CDN推荐] ================================\n"
 
-        jq -c '.inbounds[0].settings.clients//.inbounds[0].users//[] | .[]' ${configPath}03_VLESS_WS_inbounds.json | while read -r user; do
+        inboundUsers "${configPath}03_VLESS_WS_inbounds.json" "${accountId}" | while read -r user; do
             local email=
             email=$(echo "${user}" | jq -r .email//.name)
 
@@ -47,12 +61,13 @@ showAccounts() {
     fi
 
     # VLESS XHTTP TLS (nginx: Vision fallback or the panel site on 443)
-    if hasProtocol "${currentInstallProtocolType}" 14; then
+    if hasProtocol "${currentInstallProtocolType}" 14 \
+        && [[ -n "$(inboundUsers "${configPath}14_VLESS_XHTTP_TLS_inbounds.json" "${accountId}")" ]]; then
         echoContent skyBlue "\n============================= VLESS XHTTP TLS [443/CDN推荐] =============================\n"
         local xhttpPort
         xhttpPort=$(cat "${xhttpStateFile}" 2>/dev/null)
         xhttpPort=${xhttpPort:-${currentDefaultPort}}
-        jq -c '.inbounds[0].settings.clients//.inbounds[0].users//[] | .[]' "${configPath}14_VLESS_XHTTP_TLS_inbounds.json" | while read -r user; do
+        inboundUsers "${configPath}14_VLESS_XHTTP_TLS_inbounds.json" "${accountId}" | while read -r user; do
             local email count=
             email=$(echo "${user}" | jq -r .email//.name)
             while read -r line; do
@@ -65,9 +80,10 @@ showAccounts() {
     fi
 
     # Hysteria2
-    if echo ${currentInstallProtocolType} | grep -q ",6,"; then
+    if echo ${currentInstallProtocolType} | grep -q ",6," \
+        && [[ -n "$(inboundUsers "${configPath}05_hysteria2_inbounds.json" "${accountId}")" ]]; then
         echoContent skyBlue "\n================================ Hysteria2 TLS/QUIC [游戏推荐] ================================\n"
-        jq -c '(.inbounds[0].settings.clients // .inbounds[0].settings.users // [])[]' "${configPath}05_hysteria2_inbounds.json" | while read -r user; do
+        inboundUsers "${configPath}05_hysteria2_inbounds.json" "${accountId}" | while read -r user; do
             local email=
             email=$(echo "${user}" | jq -r '.email')
             echoContent skyBlue "\n ---> 账号:${email}"
@@ -76,9 +92,10 @@ showAccounts() {
         done
     fi
     # VLESS reality vision
-    if echo ${currentInstallProtocolType} | grep -q ",3,"; then
+    if echo ${currentInstallProtocolType} | grep -q ",3," \
+        && [[ -n "$(inboundUsers "${configPath}07_VLESS_vision_reality_inbounds.json" "${accountId}")" ]]; then
         echoContent skyBlue "============================= VLESS reality_vision [推荐]  ==============================\n"
-        jq -c '.inbounds[0].settings.clients//.inbounds[0].users//[] | .[]' ${configPath}07_VLESS_vision_reality_inbounds.json | while read -r user; do
+        inboundUsers "${configPath}07_VLESS_vision_reality_inbounds.json" "${accountId}" | while read -r user; do
             local email=
             email=$(echo "${user}" | jq -r .email//.name)
 
@@ -89,9 +106,10 @@ showAccounts() {
     fi
 
     # VLESS XHTTP REALITY
-    if hasProtocol "${currentInstallProtocolType}" 12; then
+    if hasProtocol "${currentInstallProtocolType}" 12 \
+        && [[ -n "$(inboundUsers "${configPath}12_VLESS_XHTTP_inbounds.json" "${accountId}")" ]]; then
         echoContent skyBlue "\n============================ VLESS XHTTP Reality [无需域名] ============================\n"
-        jq -c '.inbounds[0].settings.clients//.inbounds[0].users//[] | .[]' "${configPath}12_VLESS_XHTTP_inbounds.json" | while read -r user; do
+        inboundUsers "${configPath}12_VLESS_XHTTP_inbounds.json" "${accountId}" | while read -r user; do
             local email=
             email=$(echo "${user}" | jq -r .email//.name)
             echoContent skyBlue "\n ---> 账号:${email}"

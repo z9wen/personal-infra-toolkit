@@ -83,6 +83,15 @@ HPORT=$(jq -r '.inbounds[0].port' ${configPath}05_hysteria2_inbounds.json)
 PUB=$(jq -r '.inbounds[0].streamSettings.realitySettings.publicKey' ${configPath}07_VLESS_vision_reality_inbounds.json)
 PUB12=$(jq -r '.inbounds[0].streamSettings.realitySettings.publicKey' ${configPath}12_VLESS_XHTTP_inbounds.json)
 [[ "${PUB}" == "${PUB12}" ]] && echo "REALITY identity shared: yes (publicKey=${PUB:0:8}..., valid: $([[ ${PUB} =~ ^[A-Za-z0-9_-]{43}$ ]] && echo yes || echo NO))" || echo "REALITY identity shared: NO"
+# Share links of one account (account management): one per installed
+# protocol, none for an account that does not exist.
+rm -rf /opt/xray-agent/subscribe_local/default/*
+showAccounts 1 "${UUID}" >/dev/null 2>&1
+links=$(cat /opt/xray-agent/subscribe_local/default/* 2>/dev/null | grep -c "${UUID}")
+echo "share links of one account: $([[ ${links} -eq 5 ]] && echo "one per protocol" || echo "FAILED (${links} of 5)")"
+rm -rf /opt/xray-agent/subscribe_local/default/*
+showAccounts 1 no-such-account >/dev/null 2>&1
+echo "share links of an unknown account: $([[ -z $(ls /opt/xray-agent/subscribe_local/default/) ]] && echo none || echo FAILED)"
 CA='[{usage:"verify",certificateFile:"/opt/xray-agent/tls/example.com.crt"}]'
 stream() { # kind -> streamSettings JSON
     case $1 in

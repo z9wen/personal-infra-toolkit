@@ -266,6 +266,7 @@ installed protocols instead of being copied to every inbound. The account menu
 discovers these choices from the active inbound JSON files rather than from a
 fixed list of installation type numbers.
 
-Account management only lists, adds and removes server-side identities.
+Account management lists, adds and removes server-side identities, and
+prints every installed protocol's share links and QR-code links for them.
 Subscription generation and remote-subscription aggregation live under a
 separate top-level subscription menu.

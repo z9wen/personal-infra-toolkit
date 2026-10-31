@@ -238,6 +238,31 @@ listAccounts() {
     ' <<<"${discoveredAccounts}"
 }
 
+# Print the share links and QR-code links of one account, or of all of them.
+# Only prints: the subscribe_local scratch files showAccounts writes are
+# rebuilt from scratch by subscribe(), published subscriptions are untouched.
+showAccountShareLinks() {
+    local userCount selection userId=
+    collectAccounts
+    userCount=$(jq 'length' <<<"${discoveredAccounts}")
+    if ((userCount == 0)); then
+        echoContent yellow " ---> 当前没有账号"
+        return
+    fi
+    if ((userCount > 1)); then
+        jq -r 'to_entries[] | "\(.key + 1):\(.value.tag) [\(.value.protocols | join(", "))]"' <<<"${discoveredAccounts}"
+        read -r -p "请选择账号编号，[回车]查看全部:" selection
+        if [[ -n "${selection}" ]]; then
+            if [[ ! "${selection}" =~ ^[0-9]+$ || ${selection} -lt 1 || ${selection} -gt ${userCount} ]]; then
+                echoContent red " ---> 选择错误"
+                return 1
+            fi
+            userId=$(jq -r --argjson index "$((selection - 1))" '.[$index].uuid' <<<"${discoveredAccounts}")
+        fi
+    fi
+    showAccounts 1 "${userId}"
+}
+
 # Add a user
 addUser() {
     read -r -p "请输入要添加的账号数量:" userNum
@@ -359,6 +384,7 @@ manageAccount() {
         echoContent yellow "1.查看账号"
         echoContent yellow "2.添加账号"
         echoContent yellow "3.删除账号"
+        echoContent yellow "4.查看分享链接和二维码"
         echoContent yellow "0.返回主菜单"
         echoContent red "=============================================================="
         read -r -p "请输入:" manageAccountStatus
@@ -366,6 +392,7 @@ manageAccount() {
             1) listAccounts ;;
             2) addUser ;;
             3) removeUser ;;
+            4) showAccountShareLinks ;;
             0) return ;;
             *) echoContent red " ---> 选择错误" ;;
         esac
