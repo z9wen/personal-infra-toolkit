@@ -89,5 +89,6 @@ readInstallProtocolType
 readConfigHostPathUUID
 readCustomPort
 checkNginxEnvironment
+trap restoreStoppedNginx EXIT
 cronFunction
 menu

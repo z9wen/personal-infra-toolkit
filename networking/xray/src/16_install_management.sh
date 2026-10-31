@@ -96,7 +96,10 @@ runInstall() {
         installTLS $((++step))
     fi
 
-    handleNginx stop
+    # REALITY-only installs do not use nginx; keep the host's sites up.
+    if [[ "${needsTLS}" == "true" ]]; then
+        handleNginx stop
+    fi
     if hasProtocol "${selectCustomInstallType}" 1 || hasProtocol "${selectCustomInstallType}" 12 \
         || hasProtocol "${selectCustomInstallType}" 14; then
         randomPathFunction $((++step))

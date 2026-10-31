@@ -156,6 +156,59 @@ initTLSNginxConfig() {
     fi
 }
 
+# Run the nginx that serves this host: aaPanel ships its own binary and
+# config outside PATH.
+hostNginx() {
+    if [[ -x /www/server/nginx/sbin/nginx ]]; then
+        /www/server/nginx/sbin/nginx -c /www/server/nginx/conf/nginx.conf "$@"
+    else
+        nginx "$@"
+    fi
+}
+
+# TCP ports the host nginx config listens on, one per line. Read from
+# "nginx -T", so it also works while the install has nginx stopped. QUIC
+# (UDP) and unix sockets are skipped, and so is a port-check config left
+# behind by an interrupted run.
+nginxListenPorts() {
+    hostNginx -T 2>/dev/null | awk '
+        /^# configuration file / {skip = ($4 ~ /checkPortOpen\.conf:$/); next}
+        skip {next}
+        {
+            sub(/#.*/, "")
+            gsub(/;/, " ; ")
+            for (i = 1; i <= NF; i++) {
+                if ($i != "listen") continue
+                spec = $(i + 1)
+                quic = 0
+                for (j = i + 2; j <= NF && $j != ";"; j++) if ($j == "quic") quic = 1
+                if (quic || spec ~ /^unix:/) continue
+                if (spec ~ /^[0-9]+$/) port = spec
+                else if (spec ~ /:[0-9]+$/) {port = spec; sub(/.*:/, "", port)}
+                else port = 80
+                print port
+            }
+        }' | sort -un
+}
+
+# True when a site of the host nginx already listens on TCP port $1. Our own
+# config only listens on loopback ports, so this means another site.
+nginxListensOnPort() {
+    nginxListenPorts | grep -qx "$1"
+}
+
+# Fail when the host nginx does not load a config file we wrote, e.g. a
+# custom nginx.conf without an include for the conf.d directory. A config
+# that does not test cleanly is left to handleNginx to report.
+checkNginxLoadsConf() {
+    local file=$1 dump
+    dump=$(hostNginx -T 2>/dev/null) || return 0
+    grep -qxF "# configuration file ${file}:" <<<"${dump}" && return 0
+    echoContent red " ---> Nginx 没有加载 ${file}，回落和 XHTTP 将无法工作"
+    echoContent yellow " ---> 请在 nginx.conf 的 http 块中加入 include ${nginxConfigPath}*.conf; 后重新安装"
+    return 1
+}
+
 # Remove the default nginx config
 removeNginxDefaultConf() {
     if [[ -f ${nginxConfigPath}default.conf ]]; then
@@ -264,6 +317,10 @@ EOF
     fi
 
     echoContent green " ---> Nginx配置已写入: ${nginxConfFile}"
+    # Native nginx only; the panels include their vhost directory themselves.
+    if [[ "${nginxConfigPath}" == /etc/nginx/* ]]; then
+        checkNginxLoadsConf "${nginxConfFile}" || return 1
+    fi
 }
 # Check the IP
 
@@ -368,11 +425,7 @@ findPanelXhttpTarget() {
 }
 
 panelNginxTest() {
-    if [[ -x /www/server/nginx/sbin/nginx ]]; then
-        /www/server/nginx/sbin/nginx -t -c /www/server/nginx/conf/nginx.conf
-    else
-        nginx -t
-    fi
+    hostNginx -t
 }
 
 panelNginxReload() {

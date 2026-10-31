@@ -316,6 +316,15 @@ customPortFunction() {
 
         if [[ -n "${port}" ]]; then
             if ((port >= 1 && port <= 65535)); then
+                # Xray listens on this port itself. Catch an existing site
+                # here, before the port check stops nginx and fails on it.
+                if nginxListensOnPort "${port}"; then
+                    echoContent red " ---> 端口 ${port} 已被现有 Nginx 站点监听，Xray 需要独占此端口"
+                    echoContent yellow " ---> 请换一个端口，或先把这些站点从 ${port} 端口移走"
+                    port=
+                    customPortFunction
+                    return
+                fi
                 allowPort "${port}"
                 echoContent yellow "\n ---> 端口: ${port}"
                 if [[ -z "${btDomain}" ]]; then
@@ -494,7 +503,8 @@ initHysteria2Masquerade() {
 
 # Check whether the port is in use
 checkPort() {
-    if [[ -n "$1" ]] && lsof -i "tcp:$1" | grep -q LISTEN; then
+    [[ -n "$1" ]] || return 0
+    if lsof -i "tcp:$1" | grep -q LISTEN; then
         echoContent red "\n=============================================================="
         echoContent yellow "端口 $1 已被占用"
         echoContent skyBlue "\n占用进程信息："
@@ -506,12 +516,20 @@ checkPort() {
             echoContent red "警告：强制使用此端口可能影响现有服务！"
         fi
         echoContent red "==============================================================\n"
+    elif nginxListensOnPort "$1"; then
+        # The install stops nginx before asking for ports, so lsof misses it
+        echoContent red "\n=============================================================="
+        echoContent yellow "端口 $1 已配置给现有 Nginx 站点（Nginx 当前未运行）"
+        echoContent red "警告：强制使用此端口会导致 Nginx 或 Xray 无法启动！"
+        echoContent red "==============================================================\n"
+    else
+        return 0
+    fi
 
-        read -r -p "是否继续（可能导致冲突）？[y/n]:" continueWithConflict
-        if [[ "${continueWithConflict}" != "y" ]]; then
-            echoContent yellow "请更换端口或关闭占用进程后重试"
-            exit 0
-        fi
+    read -r -p "是否继续（可能导致冲突）？[y/n]:" continueWithConflict
+    if [[ "${continueWithConflict}" != "y" ]]; then
+        echoContent yellow "请更换端口或关闭占用进程后重试"
+        exit 0
     fi
 }
 

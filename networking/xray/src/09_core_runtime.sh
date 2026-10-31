@@ -222,10 +222,34 @@ updateSELinuxHTTPPortT() {
     fi
 }
 
+# True when nginx runs on this host. nginx inside a container (another PID
+# namespace) also shows up in pgrep here and must not count, or a Docker
+# nginx would keep the host nginx from being started or seem to never stop.
+hostNginxRunning() {
+    local pid namespace ownNamespace
+    ownNamespace=$(readlink /proc/self/ns/pid 2>/dev/null)
+    for pid in $(pgrep -x nginx); do
+        namespace=$(readlink "/proc/${pid}/ns/pid" 2>/dev/null)
+        [[ -z "${namespace}" || "${namespace}" == "${ownNamespace}" ]] && return 0
+    done
+    return 1
+}
+
+# Start nginx again when this run stopped it and is about to exit without
+# having started it (an install that stopped half-way, uninstall), so other
+# sites on a shared nginx are not left down.
+restoreStoppedNginx() {
+    [[ "${nginxStoppedByAgent}" == "true" ]] || return 0
+    handleNginx start
+}
+
 # Manage Nginx
 handleNginx() {
     # Detect how Nginx is managed
     local nginxCtl=""
+    local errorLog=/opt/xray-agent/nginx_error.log
+    # Uninstall removes /opt/xray-agent before nginx is started again
+    [[ -d /opt/xray-agent ]] || errorLog=/dev/null
 
     # Check for BT Panel/1Panel first
     if [[ -n "${btDomain}" ]] || [[ -n $(pgrep -f "BT-Panel") ]] || [[ -f "/etc/init.d/nginx" ]]; then
@@ -241,9 +265,11 @@ handleNginx() {
         nginxCtl="systemctl"
     fi
 
-    # Start Nginx
-    if { [[ -z "${selectCustomInstallType}" ]] || selectionNeedsTLS "${selectCustomInstallType}"; } \
-        && [[ -z $(pgrep -f "nginx") ]] && [[ "$1" == "start" ]]; then
+    # Start Nginx. Installs that need no certificate leave nginx alone,
+    # unless this run stopped it.
+    if { [[ -z "${selectCustomInstallType}" ]] || selectionNeedsTLS "${selectCustomInstallType}" \
+        || [[ "${nginxStoppedByAgent}" == "true" ]]; } \
+        && ! hostNginxRunning && [[ "$1" == "start" ]]; then
         # Validate the config syntax
         local nginxTestResult=
         if [[ "${nginxCtl}" == "/www/server/nginx/sbin/nginx" ]]; then
@@ -253,49 +279,54 @@ handleNginx() {
         fi
         if ! echo "${nginxTestResult}" | grep -q "successful"; then
             echoContent red " ---> Nginx配置验证失败，请检查配置"
-            echo "${nginxTestResult}" | tee /opt/xray-agent/nginx_error.log
+            echo "${nginxTestResult}" | tee "${errorLog}"
             return 1
         fi
         if [[ "${nginxCtl}" == "systemctl" ]]; then
-            systemctl start nginx 2>/opt/xray-agent/nginx_error.log
+            systemctl start nginx 2>"${errorLog}"
         elif [[ "${nginxCtl}" == "/etc/init.d/nginx" ]]; then
-            /etc/init.d/nginx start 2>/opt/xray-agent/nginx_error.log
+            /etc/init.d/nginx start 2>"${errorLog}"
         elif [[ "${nginxCtl}" == "/www/server/nginx/sbin/nginx" ]]; then
-            /www/server/nginx/sbin/nginx -c /www/server/nginx/conf/nginx.conf 2>/opt/xray-agent/nginx_error.log
+            /www/server/nginx/sbin/nginx -c /www/server/nginx/conf/nginx.conf 2>"${errorLog}"
         else
-            nginx 2>/opt/xray-agent/nginx_error.log
+            nginx 2>"${errorLog}"
         fi
 
         sleep 0.5
 
-        if [[ -z $(pgrep -f "nginx") ]]; then
+        if ! hostNginxRunning; then
             echoContent red " ---> Nginx启动失败"
             echoContent red " ---> 请将下方日志反馈给开发者"
-            cat /opt/xray-agent/nginx_error.log 2>/dev/null
-            if grep -q "journalctl -xe" </opt/xray-agent/nginx_error.log; then
+            cat "${errorLog}" 2>/dev/null
+            if grep -q "journalctl -xe" <"${errorLog}"; then
                 updateSELinuxHTTPPortT
             fi
         else
+            nginxStoppedByAgent=
             echoContent green " ---> Nginx启动成功"
         fi
 
     # Stop Nginx
-    elif [[ -n $(pgrep -x nginx) ]] && [[ "$1" == "stop" ]]; then
+    elif hostNginxRunning && [[ "$1" == "stop" ]]; then
         if [[ "${nginxCtl}" == "systemctl" ]]; then
             systemctl stop nginx 2>/dev/null
         elif [[ "${nginxCtl}" == "/etc/init.d/nginx" ]]; then
             /etc/init.d/nginx stop 2>/dev/null
         elif [[ "${nginxCtl}" == "/www/server/nginx/sbin/nginx" ]]; then
             /www/server/nginx/sbin/nginx -s stop 2>/dev/null
+        else
+            # Started by hand, without a service manager
+            nginx -s stop 2>/dev/null
         fi
 
         local nginxStopWait=0
-        while [[ -n $(pgrep -x nginx) && ${nginxStopWait} -lt 10 ]]; do
+        while hostNginxRunning && ((nginxStopWait < 10)); do
             sleep 1
             ((nginxStopWait++)) || true
         done
 
-        if [[ -z $(pgrep -x nginx) ]]; then
+        if ! hostNginxRunning; then
+            nginxStoppedByAgent=true
             echoContent green " ---> Nginx关闭成功"
         elif [[ -z ${btDomain} ]]; then
             echoContent red " ---> Nginx未能正常停止，已保留进程以免强制中断现有网站"

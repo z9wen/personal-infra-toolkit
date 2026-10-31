@@ -193,6 +193,8 @@ initVar() {
     # nginx config file path
     nginxConfigPath=/etc/nginx/conf.d/
     nginxStaticPath=/usr/share/nginx/html/
+    # Set while nginx is stopped by this run; see restoreStoppedNginx
+    nginxStoppedByAgent=
 
     # SSL type
     sslType=

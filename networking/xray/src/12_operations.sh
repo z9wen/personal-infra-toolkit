@@ -372,6 +372,8 @@ unInstall() {
         rm -rf "${nginxStaticPath}"
         echoContent green " ---> 删除伪装网站完成"
     fi
+    # Other sites on the same nginx keep running without our config.
+    restoreStoppedNginx
 
     rm -rf /usr/bin/xraya
     rm -rf /usr/sbin/xraya
