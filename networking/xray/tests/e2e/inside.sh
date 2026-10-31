@@ -18,7 +18,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 
     -addext "subjectAltName=DNS:example.com" -keyout /opt/xray-agent/tls/example.com.key -out /opt/xray-agent/tls/example.com.crt >/dev/null 2>&1
 echo "127.0.0.1 example.com" >>/etc/hosts
 cp /bins/linux-${GEN}/xray /opt/xray-agent/xray/xray
-for m in /src/[01][0-9]_*.sh; do source "$m" >/dev/null 2>&1; done
+while read -r m; do source "/src/$m" >/dev/null 2>&1; done < <(grep -v '^[[:space:]]*\(#\|$\)' /src/modules.list)
 initVar "" >/dev/null 2>&1
 checkCPUVendor >/dev/null 2>&1
 

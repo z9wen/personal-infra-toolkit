@@ -9,10 +9,7 @@
 set -euo pipefail
 
 testDirectory=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-for module in 01_common 07_nginx 10_xray_config 12_operations 16_install_management; do
-    # shellcheck source=/dev/null
-    source "${testDirectory}/../src/${module}.sh"
-done
+source "${testDirectory}/load_modules.sh"
 
 temporaryDirectory=$(mktemp -d /tmp/xray-xhttp-test.XXXXXX)
 trap 'rm -rf "${temporaryDirectory}"' EXIT

@@ -138,34 +138,54 @@ keeps the previous choice); change it under Hysteria2 management.
 
 ```text
 xray/
-├── src/                  # Maintained source modules
+├── src/
+│   ├── modules.list      # Build order of the library modules
+│   ├── main.sh           # Entry point, appended last
+│   ├── core/             # Shared helpers, downloads, firewall, installed state
+│   ├── nginx/            # Generated config, host nginx control, panels, decoy site
+│   ├── tls/              # Certificates
+│   ├── xray/             # Xray config, service, core versions
+│   ├── protocols/        # REALITY and Hysteria2
+│   ├── features/         # Accounts, extra ports, relays, routing, subscriptions
+│   └── app/              # Install flow, maintenance, menus
+├── tests/
 └── build.sh              # Builds and verifies ../xray-install.sh
 ```
 
-The source modules follow runtime dependency order:
+`build.sh` concatenates the modules in `src/modules.list` order and then
+`main.sh`; it refuses to build when a file under `src/` is not listed. Only
+`main.sh` runs code when loaded, every other module only defines functions and
+constants, so the order matters little beyond `core/common.sh` coming first.
 
 | Module | Responsibility |
 | --- | --- |
-| `01_common.sh` | System detection, global state and shared helpers |
-| `02_state_readers.sh` | Read existing TLS, ports and installed protocols |
-| `03_panels.sh` | aaPanel and 1Panel adapters |
-| `04_firewall.sh` | UFW, firewalld and iptables operations |
-| `05_preflight.sh` | Existing-install discovery and native ACME checks |
-| `06_host_provisioning.sh` | Packages, directories, Nginx discovery and host tools |
-| `07_nginx.sh` | Domain checks, fallback sites and generated Nginx config |
-| `08_tls_hysteria.sh` | ACME/TLS lifecycle and Hysteria2 transport settings |
-| `09_core_runtime.sh` | Downloads, Xray versions, services and scheduled jobs |
-| `10_xray_config.sh` | Users, inbounds, outbounds and Xray JSON generation |
-| `11_client_output.sh` | Share links, QR links and client-facing output |
-| `12_operations.sh` | Site, port, account, uninstall and log operations |
-| `13_network_routing.sh` | IPv6, WARP and WireGuard routing helpers |
-| `14_relay.sh` | Chained-proxy outbound, sing-box JSON subscription updates and routing management |
-| `15_routing_tools.sh` | SNI, DNS and routing-tool menus |
-| `16_install_management.sh` | Install/reinstall workflows and core management |
-| `17_subscriptions.sh` | Local and remote subscription generation |
-| `18_reality.sh` | REALITY keys, destination checks and management |
-| `19_hysteria_management.sh` | Runtime QUIC BBR profile management |
-| `20_menu.sh` | Interactive entry point |
+| `core/common.sh` | Output, system and CPU detection, global state (`initVar`), protocol ID helpers |
+| `core/download.sh` | Retrying downloads and SHA-256 verification |
+| `core/firewall.sh` | UFW, firewalld and iptables port rules, public IP |
+| `core/state.sh` | Read the installed protocols, ports, host, path and accounts |
+| `nginx/nginx.sh` | Generated fallback config, XHTTP location, host nginx start/stop, listen-port checks |
+| `nginx/native.sh` | nginx.org package install and its default site |
+| `nginx/aapanel.sh` | aaPanel/BT site selection and the XHTTP block in panel sites |
+| `nginx/1panel.sh` | 1Panel site selection |
+| `nginx/site.sh` | Decoy site templates and the 302 redirect |
+| `tls/tls.sh` | ACME issuance and renewal, existing acme.sh and native ACME certificates |
+| `xray/config.sh` | Users, inbounds, outbounds and Xray JSON generation |
+| `xray/runtime.sh` | Xray service, restarts, config transactions and logs |
+| `xray/versions.sh` | Core install, upgrade, rollback and geo data |
+| `protocols/reality.sh` | REALITY keys, destination checks and management |
+| `protocols/hysteria2.sh` | Hysteria2 port, BBR profile and masquerade |
+| `protocols/hysteria2_port_hopping.sh` | Hysteria2 port hopping with nftables |
+| `features/share_links.sh` | Share links and client-facing account output |
+| `features/subscriptions.sh` | Local and remote subscription generation |
+| `features/clash_meta.sh` | Clash Meta profile template |
+| `features/accounts.sh` | Adding, listing and removing accounts |
+| `features/extra_ports.sh` | Extra ports forwarded to the main TLS port |
+| `features/relay.sh` | Chained-proxy outbound, sing-box JSON subscription updates and routing management |
+| `features/routing.sh` | IPv6, WARP, WireGuard and SNI routing |
+| `app/install_checks.sh` | Domain, DNS and port checks before an install |
+| `app/install.sh` | Packages, install menu and the install workflow |
+| `app/maintenance.sh` | Uninstall, script update and the `xraya` shortcut |
+| `app/menu.sh` | Menus, status display and cron entry points |
 
 ## Development
 
@@ -191,9 +211,10 @@ real nginx serves it (including a simulated aaPanel site), and real Xray
 clients connect through every protocol, with every core. This is what caught
 the two compatibility bugs below.
 
-Tests in `tests/` source individual modules and replace commands such as
-`systemctl` and `pgrep` with shell functions, so they run on any machine
-without root or a real Xray install.
+Tests in `tests/` load every module through `tests/load_modules.sh` (the
+same list the build uses) and replace commands such as `systemctl` and
+`pgrep` with shell functions, so they run on any machine without root or a
+real Xray install.
 
 Each build stamps the generated installer with
 `vYYYY.MM.DD.<Unix timestamp>` using the UTC+8 calendar date.

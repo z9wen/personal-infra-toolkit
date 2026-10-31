@@ -10,10 +10,7 @@
 set -euo pipefail
 
 testDirectory=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-for module in 01_common 19_hysteria_management; do
-    # shellcheck source=/dev/null
-    source "${testDirectory}/../src/${module}.sh"
-done
+source "${testDirectory}/load_modules.sh"
 
 temporaryDirectory=$(mktemp -d /tmp/xray-port-hopping-test.XXXXXX)
 trap 'rm -rf "${temporaryDirectory}"' EXIT

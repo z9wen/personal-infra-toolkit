@@ -338,5 +338,3 @@ EOF
     fi
 
 }
-
-# Remove the nginx 302 config

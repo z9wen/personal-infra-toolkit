@@ -1,30 +1,81 @@
-checkIP() {
-    echoContent skyBlue "\n ---> 检查域名ip中"
-    local localIP=$1
+# Read TLS certificate details
+readAcmeTLS() {
+    local readAcmeDomain=
+    installedDNSAPIStatus=
+    dnsTLSAcmeCertPath=
+    if [[ -n "${currentHost}" ]]; then
+        readAcmeDomain="${currentHost}"
+    fi
 
-    if [[ -z ${localIP} ]] || ! echo "${localIP}" | sed '1{s/[^(]*(//;s/).*//;q}' | grep -q '\.' && ! echo "${localIP}" | sed '1{s/[^(]*(//;s/).*//;q}' | grep -q ':'; then
-        echoContent red "\n ---> 未检测到当前域名的ip"
-        echoContent skyBlue " ---> 请依次进行下列检查"
-        echoContent yellow " --->  1.检查域名是否书写正确"
-        echoContent yellow " --->  2.检查域名dns解析是否正确"
-        echoContent yellow " --->  3.如解析正确，请等待dns生效，预计三分钟内生效"
-        echoContent yellow " --->  4.如报Nginx启动问题，请手动启动nginx查看错误，如自己无法处理请提issues"
-        echo
-        echoContent skyBlue " ---> 如以上设置都正确，请重新安装纯净系统后再次尝试"
+    if [[ -n "${domain}" ]]; then
+        readAcmeDomain="${domain}"
+    fi
 
-        if [[ -n ${localIP} ]]; then
-            echoContent yellow " ---> 检测返回值异常，建议手动卸载nginx后重新执行脚本"
-            echoContent red " ---> 异常结果：${localIP}"
+    dnsTLSDomain=$(echo "${readAcmeDomain}" | awk -F "." '{$1="";print $0}' | sed 's/^[[:space:]]*//' | sed 's/ /./g')
+    [[ -z "${dnsTLSDomain}" || ! -d "$HOME/.acme.sh" ]] && return 0
+
+    local candidateDir candidateCert candidateKey
+    while IFS= read -r candidateDir; do
+        while IFS= read -r candidateCert; do
+            # Directory naming differs between acme.sh versions; rely on the certificate SAN.
+            if openssl x509 -in "${candidateCert}" -noout -text 2>/dev/null | grep -Fq "DNS:*.${dnsTLSDomain}"; then
+                candidateKey="${candidateCert%.cer}.key"
+                if [[ ! -f "${candidateKey}" ]]; then
+                    candidateKey=$(find "${candidateDir}" -maxdepth 1 -type f -name '*.key' -print -quit 2>/dev/null)
+                fi
+                if [[ -f "${candidateKey}" ]]; then
+                    installedDNSAPIStatus=true
+                    dnsTLSAcmeCertPath="${candidateCert}"
+                    return 0
+                fi
+            fi
+        done < <(find "${candidateDir}" -maxdepth 1 -type f -name '*.cer' 2>/dev/null)
+    done < <(find "$HOME/.acme.sh" -maxdepth 1 -type d -name "*.${dnsTLSDomain}_ecc" 2>/dev/null)
+}
+
+# Detect native ACME clients
+checkNativeACME() {
+    local nativeACMEType=""
+
+    # Detect certbot
+    if command -v certbot &>/dev/null; then
+        nativeACMEType="certbot"
+        local certbotVersion certCount
+        certbotVersion=$(certbot --version 2>&1 | head -1)
+        echoContent skyBlue "\n检测到 Native ACME 客户端: ${nativeACMEType}"
+        echoContent green "  版本: ${certbotVersion}"
+
+        # Check for existing certificates
+        if [[ -d "/etc/letsencrypt/live" ]]; then
+            certCount=$(find /etc/letsencrypt/live -mindepth 1 -maxdepth 1 -type d | wc -l)
+            if [[ ${certCount} -gt 0 ]]; then
+                echoContent yellow "  已有证书数量: ${certCount}"
+                echoContent skyBlue "\n可用证书域名:"
+                find /etc/letsencrypt/live -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | nl
+            fi
         fi
-        exit 0
-    else
-        if echo "${localIP}" | awk -F "[,]" '{print $2}' | grep -q "." || echo "${localIP}" | awk -F "[,]" '{print $2}' | grep -q ":"; then
-            echoContent red "\n ---> 检测到多个ip，请确认是否关闭cloudflare的云朵"
-            echoContent yellow " ---> 关闭云朵后等待三分钟后重试"
-            echoContent yellow " ---> 检测到的ip如下:[${localIP}]"
-            exit 0
-        fi
-        echoContent green " ---> 检查当前域名IP正确"
+        return 0
+    fi
+
+    # Detect other ACME clients
+    if command -v lego &>/dev/null; then
+        nativeACMEType="lego"
+        echoContent skyBlue "\n检测到 Native ACME 客户端: ${nativeACMEType}"
+        return 0
+    fi
+
+    return 1
+}
+
+# Use native ACME certificates (check during initialization)
+# Tell the user an existing ACME client was found. Certificate choice happens
+# later, in the TLS step.
+showNativeACMENotice() {
+    if checkNativeACME; then
+        echoContent skyBlue "\n=============================================================="
+        echoContent yellow "检测到系统已安装 Native ACME 客户端"
+        echoContent yellow "在安装过程中将提供使用现有证书的选项"
+        echoContent red "==============================================================\n"
     fi
 }
 # Custom email
@@ -284,254 +335,6 @@ acmeInstallSSL() {
     # Restart Nginx after the certificate is issued
     handleNginx start
 }
-# Custom port
-customPortFunction() {
-    local historyCustomPortStatus=
-    if [[ -n "${customPort}" || -n "${currentPort}" ]]; then
-        echo
-        # Always ask whether to reuse the previous port, regardless of lastInstallationConfig
-        read -r -p "读取到上次安装时的端口，是否使用上次安装时的端口？[y/n]:" historyCustomPortStatus
-        if [[ "${historyCustomPortStatus}" == "y" ]]; then
-            port=${currentPort}
-            echoContent yellow "\n ---> 端口: ${port}"
-        fi
-    fi
-    if [[ -z "${currentPort}" ]] || [[ "${historyCustomPortStatus}" == "n" ]]; then
-        echo
-
-        if [[ -n "${btDomain}" ]]; then
-            echoContent yellow "请输入端口[不可与宝塔/aaPanel/1Panel 或其 Nginx 的端口相同，回车随机]"
-            read -r -p "端口:" port
-            if [[ -z "${port}" ]]; then
-                port=$((RANDOM % 20001 + 10000))
-            fi
-        else
-            echo
-            echoContent yellow "请输入端口[默认: 443]，可自定义端口[回车使用默认]"
-            read -r -p "端口:" port
-            if [[ -z "${port}" ]]; then
-                port=443
-            fi
-        fi
-
-        if [[ -n "${port}" ]]; then
-            if ((port >= 1 && port <= 65535)); then
-                # Xray listens on this port itself. Catch an existing site
-                # here, before the port check stops nginx and fails on it.
-                if nginxListensOnPort "${port}"; then
-                    echoContent red " ---> 端口 ${port} 已被现有 Nginx 站点监听，Xray 需要独占此端口"
-                    echoContent yellow " ---> 请换一个端口，或先把这些站点从 ${port} 端口移走"
-                    port=
-                    customPortFunction
-                    return
-                fi
-                allowPort "${port}"
-                echoContent yellow "\n ---> 端口: ${port}"
-                if [[ -z "${btDomain}" ]]; then
-                    checkDNSIP "${domain}"
-                    removeNginxDefaultConf
-                    checkPortOpen "${port}" "${domain}"
-                fi
-            else
-                echoContent red " ---> 端口输入错误"
-                exit 0
-            fi
-        else
-            echoContent red " ---> 端口不可为空"
-            exit 0
-        fi
-    fi
-}
-
-# Initialize the Xray-core Hysteria2 UDP listen port.
-# TCP/443 and UDP/443 can be listened on simultaneously, so the main TLS port is reused by default.
-initHysteria2Port() {
-    local defaultPort=${port:-443}
-    local selectedPort=
-
-    if [[ -n "${hysteria2Port}" && "${hysteria2Port}" != "null" ]]; then
-        read -r -p "读取到上次 Hysteria2 UDP 端口 ${hysteria2Port}，是否继续使用？[y/n]:" historyHysteria2PortStatus
-        if [[ "${historyHysteria2PortStatus}" == "y" ]]; then
-            selectedPort=${hysteria2Port}
-        fi
-    fi
-
-    if [[ -z "${selectedPort}" ]]; then
-        read -r -p "请输入 Hysteria2 UDP 端口[默认:${defaultPort}]:" selectedPort
-        selectedPort=${selectedPort:-${defaultPort}}
-    fi
-
-    if [[ ! "${selectedPort}" =~ ^[0-9]+$ ]] || ((selectedPort < 1 || selectedPort > 65535)); then
-        echoContent red " ---> Hysteria2 UDP端口输入错误"
-        exit 1
-    fi
-
-    hysteria2Port=${selectedPort}
-    allowPort "${hysteria2Port}" udp
-    echoContent yellow "\n ---> Hysteria2 UDP端口: ${hysteria2Port}"
-    initHysteria2PortHopping
-}
-
-# Choose the Xray QUIC BBR behavior profile; the result is written to selectedHysteria2BbrProfile.
-selectHysteria2BbrProfile() {
-    local defaultProfile=${1:-standard}
-    local contextLabel=${2:-Hysteria2}
-    local defaultChoice=2
-    local profileChoice=
-
-    case ${defaultProfile} in
-        conservative) defaultChoice=1 ;;
-        aggressive) defaultChoice=3 ;;
-        *) defaultProfile=standard ;;
-    esac
-
-    echoContent skyBlue "\n---------- ${contextLabel} QUIC BBR Profile ----------"
-    echoContent yellow "1.conservative [低抖动/保守]"
-    echoContent yellow "2.standard [均衡/推荐]"
-    echoContent yellow "3.aggressive [吞吐优先]"
-    echoContent skyBlue "------------------------------------------------------"
-    read -r -p "请选择[默认:${defaultChoice}]：" profileChoice
-    profileChoice=${profileChoice:-${defaultChoice}}
-
-    case ${profileChoice} in
-        1) selectedHysteria2BbrProfile=conservative ;;
-        2) selectedHysteria2BbrProfile=standard ;;
-        3) selectedHysteria2BbrProfile=aggressive ;;
-        *)
-            echoContent red " ---> 请选择 1-3"
-            selectHysteria2BbrProfile "${defaultProfile}" "${contextLabel}"
-            return
-            ;;
-    esac
-    echoContent green " ---> ${contextLabel} QUIC拥塞控制: BBR/${selectedHysteria2BbrProfile}"
-}
-
-# The BBR profile is not asked during installation. New installs use
-# "standard"; a reinstall keeps the profile chosen earlier in Hysteria2
-# management (hysteria2BbrProfile is read from the existing config).
-initHysteria2BbrProfile() {
-    [[ "${hysteria2BbrProfile}" =~ ^(conservative|standard|aggressive)$ ]] || hysteria2BbrProfile=standard
-    echoContent green " ---> Hysteria2 QUIC拥塞控制: BBR/${hysteria2BbrProfile}（可在「协议设置 → Hysteria2管理」中修改）"
-}
-
-# Expand a bare domain into an HTTPS URL, rejecting non-HTTP(S) schemes and whitespace.
-normalizeHTTPURL() {
-    local inputURL=$1
-
-    [[ -n "${inputURL}" && "${inputURL}" != *[[:space:]]* ]] || return 1
-    case "${inputURL}" in
-        http://* | https://*) ;;
-        *://*) return 1 ;;
-        *) inputURL="https://${inputURL}" ;;
-    esac
-
-    [[ "${inputURL}" =~ ^https?://[^/[:space:]]+(/[^[:space:]]*)?$ ]] || return 1
-    if [[ "${inputURL#*://}" != */* ]]; then
-        inputURL="${inputURL}/"
-    fi
-    printf '%s\n' "${inputURL}"
-}
-
-# Choose the masquerade method for unauthenticated Hysteria2 HTTP/3 requests.
-# Sets hysteria2MasqueradeConfig to a JSON object, or to "null" when
-# masquerading is turned off (the inbound then has no masquerade at all).
-initHysteria2Masquerade() {
-    # The panel site already serves a full website with valid TLS, so use it directly as the Hysteria2 masquerade target.
-    # Hysteria2 uses a UDP inbound while the target site uses TCP/443, so there is no port conflict.
-    if [[ -n "${btDomain:-}" ]]; then
-        local panelProxyURL=
-        if panelProxyURL=$(normalizeHTTPURL "${btDomain}"); then
-            hysteria2MasqueradeConfig=$(jq -nc --arg url "${panelProxyURL}" '{type:"proxy",url:$url,rewriteHost:true,insecure:false}')
-            echoContent skyBlue "\n---------- Hysteria2 HTTP/3伪装 ----------"
-            echoContent green " ---> 检测到宝塔/aaPanel站点，自动反向代理到: ${panelProxyURL}"
-            return
-        fi
-        echoContent yellow " ---> 面板站点域名无效，改为手动选择Hysteria2伪装"
-    fi
-
-    echoContent skyBlue "\n---------- Hysteria2 HTTP/3伪装 ----------"
-    echoContent yellow "1.本地静态网站[默认]"
-    echoContent yellow "2.301跳转"
-    echoContent yellow "3.反向代理现有网站"
-    echoContent yellow "4.不启用伪装"
-    echoContent skyBlue "------------------------------------------"
-
-    local masqueradeType=
-    read -r -p "请选择[默认:1]:" masqueradeType
-    masqueradeType=${masqueradeType:-1}
-
-    case ${masqueradeType} in
-        1)
-            hysteria2MasqueradeConfig=$(jq -nc --arg dir "${nginxStaticPath}" '{type:"file",dir:$dir}')
-            echoContent green " ---> 使用本地静态网站: ${nginxStaticPath}"
-            ;;
-        4)
-            hysteria2MasqueradeConfig=null
-            echoContent yellow " ---> 不启用HTTP/3伪装"
-            ;;
-        2)
-            local redirectURL=
-            read -r -p "请输入跳转域名[例:v.domain.com]:" redirectURL
-            if ! redirectURL=$(normalizeHTTPURL "${redirectURL}"); then
-                echoContent red " ---> 跳转域名格式错误"
-                initHysteria2Masquerade
-                return
-            fi
-            hysteria2MasqueradeConfig=$(jq -nc --arg url "${redirectURL}" '{type:"string",content:"",headers:{Location:$url},statusCode:301}')
-            echoContent green " ---> HTTP/3未认证访问将301跳转到: ${redirectURL}"
-            ;;
-        3)
-            local proxyURL=
-            local defaultProxyURL=
-            read -r -p "请输入反向代理地址${defaultProxyURL:+[默认:${defaultProxyURL}]}:" proxyURL
-            proxyURL=${proxyURL:-${defaultProxyURL}}
-            if ! proxyURL=$(normalizeHTTPURL "${proxyURL}"); then
-                echoContent red " ---> 反向代理地址格式错误，请输入域名或完整的 http(s) URL"
-                initHysteria2Masquerade
-                return
-            fi
-            hysteria2MasqueradeConfig=$(jq -nc --arg url "${proxyURL}" '{type:"proxy",url:$url,rewriteHost:true,insecure:false}')
-            echoContent green " ---> HTTP/3未认证访问将反向代理到: ${proxyURL}"
-            ;;
-        *)
-            echoContent red " ---> 选择错误"
-            initHysteria2Masquerade
-            return
-            ;;
-    esac
-}
-
-# Check whether the port is in use
-checkPort() {
-    [[ -n "$1" ]] || return 0
-    if lsof -i "tcp:$1" | grep -q LISTEN; then
-        echoContent red "\n=============================================================="
-        echoContent yellow "端口 $1 已被占用"
-        echoContent skyBlue "\n占用进程信息："
-        lsof -i "tcp:$1" | grep LISTEN
-
-        # Check whether Nginx is the one using it
-        if lsof -i "tcp:$1" | grep -q nginx; then
-            echoContent yellow "\n检测到端口被 Nginx 占用，这可能是现有业务"
-            echoContent red "警告：强制使用此端口可能影响现有服务！"
-        fi
-        echoContent red "==============================================================\n"
-    elif nginxListensOnPort "$1"; then
-        # The install stops nginx before asking for ports, so lsof misses it
-        echoContent red "\n=============================================================="
-        echoContent yellow "端口 $1 已配置给现有 Nginx 站点（Nginx 当前未运行）"
-        echoContent red "警告：强制使用此端口会导致 Nginx 或 Xray 无法启动！"
-        echoContent red "==============================================================\n"
-    else
-        return 0
-    fi
-
-    read -r -p "是否继续（可能导致冲突）？[y/n]:" continueWithConflict
-    if [[ "${continueWithConflict}" != "y" ]]; then
-        echoContent yellow "请更换端口或关闭占用进程后重试"
-        exit 0
-    fi
-}
 
 # Install TLS
 installTLS() {
@@ -640,4 +443,103 @@ installTLS() {
     fi
 }
 
-# Initialize a random string
+# Cron job to renew the TLS certificate
+installCronTLS() {
+    if [[ -z "${btDomain}" ]]; then
+        echoContent skyBlue "\n进度 $1/${totalProgress} : 添加定时维护证书"
+        if [[ "${acmeManagedCertSelected}" == "true" || -f "/opt/xray-agent/tls/acme_managed.conf" ]]; then
+            echoContent green " ---> 证书由 acme.sh 管理，保留 acme.sh 原有续期任务"
+            echoContent green " ---> 续期部署完成后会自动重载 Xray"
+            return 0
+        fi
+        crontab -l >/opt/xray-agent/backup_crontab.cron 2>/dev/null || true
+        local historyCrontab
+        historyCrontab=$(sed '/xray-agent-renew-tls/d;/xray-agent\/install.sh RenewTLS/d' /opt/xray-agent/backup_crontab.cron)
+        echo "${historyCrontab}" >/opt/xray-agent/backup_crontab.cron
+        echo "30 1 * * * /bin/bash /opt/xray-agent/install.sh RenewTLS >> /opt/xray-agent/crontab_tls.log 2>&1 # xray-agent-renew-tls" >>/opt/xray-agent/backup_crontab.cron
+        crontab /opt/xray-agent/backup_crontab.cron
+        echoContent green "\n ---> 添加定时维护证书成功"
+    fi
+}
+
+# Renew the certificate
+renewalTLS() {
+
+    if [[ -n $1 ]]; then
+        echoContent skyBlue "\n进度  $1/1 : 更新证书"
+    fi
+
+    if [[ -f "/opt/xray-agent/tls/acme_managed.conf" ]]; then
+        local managedAcmeHome=
+        managedAcmeHome=$(awk -F= '$1 == "ACME_HOME" {sub(/^ACME_HOME=/, ""); print; exit}' /opt/xray-agent/tls/acme_managed.conf)
+        if [[ -x "${managedAcmeHome}/acme.sh" ]]; then
+            echoContent green " ---> 使用 acme.sh 原有配置检查并续期证书"
+            "${managedAcmeHome}/acme.sh" --cron --home "${managedAcmeHome}"
+            echoContent green " ---> acme.sh 证书维护完成"
+            return 0
+        fi
+        echoContent red " ---> 找不到已登记的 acme.sh: ${managedAcmeHome}/acme.sh"
+        return 1
+    fi
+
+    readAcmeTLS
+    local domain=${currentHost}
+    if [[ -z "${currentHost}" && -n "${tlsDomain}" ]]; then
+        domain=${tlsDomain}
+    fi
+
+    if [[ -d "$HOME/.acme.sh/${domain}_ecc" && -f "$HOME/.acme.sh/${domain}_ecc/${domain}.key" && -f "$HOME/.acme.sh/${domain}_ecc/${domain}.cer" ]] || [[ "${installedDNSAPIStatus}" == "true" ]]; then
+        modifyTime=
+
+        if [[ "${installedDNSAPIStatus}" == "true" ]]; then
+            modifyTime=$(stat --format=%z "${dnsTLSAcmeCertPath}")
+        else
+            modifyTime=$(stat --format=%z "$HOME/.acme.sh/${domain}_ecc/${domain}.cer")
+        fi
+
+        modifyTime=$(date +%s -d "${modifyTime}")
+        currentTime=$(date +%s)
+        ((stampDiff = currentTime - modifyTime))
+        ((days = stampDiff / 86400))
+        ((remainingDays = sslRenewalDays - days))
+
+        tlsStatus=${remainingDays}
+        if [[ ${remainingDays} -le 0 ]]; then
+            tlsStatus="已过期"
+        fi
+
+        echoContent skyBlue " ---> 证书检查日期:$(date "+%F %H:%M:%S")"
+        echoContent skyBlue " ---> 证书生成日期:$(date -d @"${modifyTime}" +"%F %H:%M:%S")"
+        echoContent skyBlue " ---> 证书生成天数:${days}"
+        echoContent skyBlue " ---> 证书剩余天数:"${tlsStatus}
+        echoContent skyBlue " ---> 证书过期前最后一天自动更新，如更新失败请手动更新"
+
+        if [[ ${remainingDays} -le 1 ]]; then
+            echoContent yellow " ---> 重新生成证书"
+            handleNginx stop || return 1
+
+            if [[ "${coreInstallType}" == "1" ]]; then
+                handleXray stop
+            fi
+
+            sudo "$HOME/.acme.sh/acme.sh" --cron --home "$HOME/.acme.sh"
+            local renewalDomain="${domain}"
+            if [[ "${installedDNSAPIStatus}" == "true" ]]; then
+                renewalDomain="*.${dnsTLSDomain}"
+            fi
+            sudo "$HOME/.acme.sh/acme.sh" --install-cert -d "${renewalDomain}" --fullchain-file "/opt/xray-agent/tls/${domain}.crt" --key-file "/opt/xray-agent/tls/${domain}.key" --ecc
+            # Start nginx regardless of the Xray result so the fallback site,
+            # subscriptions and WS paths are not left down overnight.
+            local restartStatus=0
+            restartXray || restartStatus=$?
+            handleNginx start
+            return "${restartStatus}"
+        else
+            echoContent green " ---> 证书有效"
+        fi
+    elif [[ -f "/opt/xray-agent/tls/${tlsDomain}.crt" && -f "/opt/xray-agent/tls/${tlsDomain}.key" && -n $(cat "/opt/xray-agent/tls/${tlsDomain}.crt") ]]; then
+        echoContent yellow " ---> 检测到使用自定义证书，无法执行renew操作。"
+    else
+        echoContent red " ---> 未安装"
+    fi
+}

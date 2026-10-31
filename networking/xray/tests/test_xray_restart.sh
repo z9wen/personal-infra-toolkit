@@ -3,7 +3,7 @@
 set -euo pipefail
 
 testDirectory=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-source "${testDirectory}/../src/09_core_runtime.sh"
+source "${testDirectory}/load_modules.sh"
 
 echoContent() {
     :

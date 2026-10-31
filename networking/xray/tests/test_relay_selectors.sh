@@ -6,7 +6,7 @@
 set -euo pipefail
 
 testDirectory=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-source "${testDirectory}/../src/14_relay.sh"
+source "${testDirectory}/load_modules.sh"
 
 temporaryDirectory=$(mktemp -d /tmp/xray-relay-selectors-test.XXXXXX)
 trap 'rm -rf "${temporaryDirectory}"' EXIT

@@ -249,3 +249,13 @@ initVar() {
     dnsTLSAcmeCertPath=
 
 }
+# Enable start on boot
+bootStartup() {
+    local serviceName=$1
+    systemctl daemon-reload
+    systemctl enable "${serviceName}"
+}
+# Random number
+randomNum() {
+    shuf -i "$1"-"$2" -n 1
+}

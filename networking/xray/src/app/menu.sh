@@ -1,3 +1,53 @@
+# Status display
+showInstallStatus() {
+    if [[ -n "${coreInstallType}" ]]; then
+        if [[ -n $(pgrep -f "xray/xray") ]]; then
+            echoContent yellow "\n核心: Xray-core[运行中]"
+        else
+            echoContent yellow "\n核心: Xray-core[未运行]"
+        fi
+        # Read the protocol types
+        readInstallProtocolType
+
+        if [[ -n ${currentInstallProtocolType} ]]; then
+            echoContent yellow "已安装协议: \c"
+        fi
+        if echo ${currentInstallProtocolType} | grep -q ",0,"; then
+            echoContent yellow "VLESS+TCP[TLS_Vision] \c"
+        fi
+
+        if hasProtocol "${currentInstallProtocolType}" 1; then
+            echoContent yellow "VLESS+WS[TLS,已弃用] \c"
+        fi
+
+        if hasProtocol "${currentInstallProtocolType}" 14; then
+            echoContent yellow "VLESS+XHTTP[TLS] \c"
+        fi
+        if hasProtocol "${currentInstallProtocolType}" 6; then
+            echoContent yellow "Hysteria2 \c"
+        fi
+        if hasProtocol "${currentInstallProtocolType}" 3; then
+            echoContent yellow "VLESS+Reality+Vision \c"
+        fi
+        if hasProtocol "${currentInstallProtocolType}" 12; then
+            echoContent yellow "VLESS+XHTTP+Reality \c"
+        fi
+    fi
+}
+# Cron job check
+cronFunction() {
+    if [[ "${cronName}" == "RenewTLS" ]]; then
+        renewalTLS
+        exit 0
+    elif [[ "${cronName}" == "UpdateGeo" ]]; then
+        updateGeoSite >>/opt/xray-agent/crontab_updateGeoSite.log
+        echoContent green " ---> geo更新日期:$(date "+%F %H:%M:%S")" >>/opt/xray-agent/crontab_updateGeoSite.log
+        exit 0
+    elif [[ "${cronName}" == "UpdateRelay" ]]; then
+        updateRelaySubscription
+        exit $?
+    fi
+}
 # Main menu
 menu() {
     cd "$HOME" || exit
@@ -77,18 +127,3 @@ siteAndCertificateMenu() {
         *) echoContent red " ---> 请输入 0-2" ;;
     esac
 }
-
-# ===== Entry Point =====
-# Runs after every module is loaded, so initialization can use any function.
-initVar "$1"
-checkSystem
-checkCPUVendor
-detectPanelNginxPath
-readInstallType
-readInstallProtocolType
-readConfigHostPathUUID
-readCustomPort
-checkNginxEnvironment
-trap restoreStoppedNginx EXIT
-cronFunction
-menu

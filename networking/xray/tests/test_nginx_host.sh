@@ -10,10 +10,7 @@
 set -euo pipefail
 
 testDirectory=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-for module in 01_common 07_nginx 09_core_runtime; do
-    # shellcheck source=/dev/null
-    source "${testDirectory}/../src/${module}.sh"
-done
+source "${testDirectory}/load_modules.sh"
 
 echoContent() { :; }
 sleep() { :; }

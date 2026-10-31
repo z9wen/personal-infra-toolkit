@@ -1,0 +1,29 @@
+# Library modules in build order. build.sh concatenates them and then
+# appends main.sh, the entry point; tests source the same list without it.
+core/common.sh
+core/download.sh
+core/firewall.sh
+core/state.sh
+nginx/nginx.sh
+nginx/native.sh
+nginx/aapanel.sh
+nginx/1panel.sh
+nginx/site.sh
+tls/tls.sh
+xray/runtime.sh
+xray/versions.sh
+xray/config.sh
+protocols/reality.sh
+protocols/hysteria2.sh
+protocols/hysteria2_port_hopping.sh
+features/share_links.sh
+features/subscriptions.sh
+features/clash_meta.sh
+features/accounts.sh
+features/extra_ports.sh
+features/relay.sh
+features/routing.sh
+app/install_checks.sh
+app/install.sh
+app/maintenance.sh
+app/menu.sh
