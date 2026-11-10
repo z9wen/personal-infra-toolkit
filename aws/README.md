@@ -49,17 +49,6 @@ flowchart LR
 | `POST /links` | Body `{"url": "https://...", "ttl_days": 30}` returns `201 {"code", "short_url"}` |
 | `GET /{code}` | `301` redirect, or `404` when unknown or expired |
 
-## Exam-domain mapping
-
-| AWS DevOps Engineer Professional domain | Where it shows up |
-| --- | --- |
-| SDLC automation | `.github/workflows/iac.yml` tests and validates every change; `aws-deploy.yml` plans, applies, canaries and smoke-tests |
-| Configuration management and IaC | Two Terraform stacks, remote state with S3 native locking, pinned providers via lock files |
-| Resilient cloud solutions | Immutable Lambda versions behind an alias, blue/green traffic shifting, automatic rollback, DynamoDB PITR |
-| Monitoring and logging | Structured JSON logs, X-Ray tracing, API access logs, four alarms, a CloudWatch dashboard |
-| Incident and event response | Alarms and CodeDeploy deployment events publish to SNS; a failed canary rolls back without a human |
-| Security and compliance | GitHub OIDC (no access keys), trust limited to one repository environment, name-scoped deploy role, permissions boundary, TLS-only encrypted state bucket |
-
 ## Design decisions
 
 **Why CodeDeploy instead of letting Terraform move the alias?**

@@ -1,33 +1,17 @@
 SHELL := bash
 
 SCRIPT_FILES := $(shell find . -type f -name '*.sh' -not -path './.git/*' -not -path '*/.terraform/*' | sort)
-# Xray modules share globals across files, so they are linted as one freshly
-# assembled installer. The committed networking/xray-install.sh is generated
-# by CI and is not linted or edited locally.
-XRAY_MODULES := $(filter ./networking/xray/src/%,$(SCRIPT_FILES))
-LINT_FILES := $(filter-out $(XRAY_MODULES) ./networking/xray-install.sh,$(SCRIPT_FILES))
-# The installer is generated, so formatting is checked on its sources instead.
-FORMAT_FILES := $(filter-out ./networking/xray-install.sh,$(SCRIPT_FILES))
+LINT_FILES := $(SCRIPT_FILES)
+FORMAT_FILES := $(SCRIPT_FILES)
 YAML_FILES := $(shell find . -type f \( -name '*.yml' -o -name '*.yaml' \) -not -path './.git/*' -not -path '*/.terraform/*' | sort)
 WORKFLOW_FILES := $(shell find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) 2>/dev/null | sort)
-XRAY_BUILD := networking/xray/build.sh
 TEST_FILES := $(shell find . -type f -path '*/tests/test_*.sh' -not -path './.git/*' | sort)
 PYTHON_FILES := $(shell find . -type f -name '*.py' -not -path './.git/*' -not -path '*/.terraform/*' | sort)
 TERRAFORM_DIRS := aws/terraform/bootstrap aws/terraform/app azure/terraform
 
-.PHONY: check syntax lint format-check yaml-lint actionlint test python-test python-lint terraform-check xray-build xray-check xray-e2e list-scripts list-lint-files
+.PHONY: check syntax lint format-check yaml-lint actionlint test python-test python-lint terraform-check list-scripts list-lint-files
 
 check: syntax lint python-lint format-check yaml-lint actionlint test terraform-check
-
-xray-build:
-	@$(XRAY_BUILD)
-
-xray-check:
-	@$(XRAY_BUILD) --check
-
-# Needs Docker and network access; downloads the latest stable and pre-release cores.
-xray-e2e:
-	@networking/xray/tests/e2e/run.sh
 
 syntax:
 	@for file in $(SCRIPT_FILES); do \
@@ -71,9 +55,7 @@ terraform-check:
 
 lint:
 	@if command -v shellcheck >/dev/null 2>&1; then \
-		bundle=$$(mktemp -d) && trap 'rm -rf "$$bundle"' EXIT && \
-		XRAY_BUILD_OUTPUT="$$bundle/xray-install.sh" $(XRAY_BUILD) >/dev/null && \
-		shellcheck --shell=bash --severity=warning $(LINT_FILES) "$$bundle/xray-install.sh"; \
+		shellcheck --shell=bash --severity=warning $(LINT_FILES); \
 	else \
 		echo "shellcheck not installed; skipped local lint"; \
 	fi
