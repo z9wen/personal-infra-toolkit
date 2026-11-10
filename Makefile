@@ -29,7 +29,7 @@ test: python-test
 
 python-test:
 	@if python3 -c 'import pytest' >/dev/null 2>&1; then \
-		python3 -m pytest -q -p no:cacheprovider aws/app/tests tools/tests; \
+		python3 -m pytest -q -p no:cacheprovider aws/app/tests; \
 	else \
 		echo "pytest not installed; skipped Python tests (pip install -r requirements-dev.txt)"; \
 	fi

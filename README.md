@@ -23,7 +23,6 @@ understandable operational automation rather than a large platform.
 | `sql_manage.sh` | Back up and restore MySQL/MariaDB and PostgreSQL | Keeps the newest N backups per database, transactional PostgreSQL restores |
 | `server-backup/` | Per-site and per-database archives with daily, weekly and monthly rotation, copied off-site with `rclone` | |
 | `hestiash/` | HestiaCP helpers: certificate sync and panel-backup upload | |
-| `bbr_optimizer.sh` | Apply Linux network tuning profiles | sysctl changes with a timed automatic revert |
 | `acme/`, `fail2ban/`, `nginx/docker-compose.yml` | Compose definitions for the supporting services | |
 
 ### Status of the cloud stacks
@@ -37,7 +36,7 @@ manually triggered and has not been run from this repository; it expects an
 
 - Shell and Python syntax is validated across the repository.
 - ShellCheck (warning level) and shfmt run on every script; Ruff and pytest
-  cover the Python code.
+  cover the Lambda handler.
 - yamllint and actionlint validate configuration and workflows.
 - Every Terraform stack is format-checked and validated in CI, with provider
   versions pinned by lock files.
@@ -94,12 +93,9 @@ Python checks need the pinned dev tools: `pip install -r requirements-dev.txt`.
 ├── nginx/                  # Nginx Compose definition and site manager
 ├── server-backup/          # Rotating site and database backups with rclone
 ├── tests/                  # Tests for the top-level scripts
-├── tools/                  # A local Python utility and its tests
 ├── acme_manage.sh          # acme.sh installation and CA management
-├── bbr_optimizer.sh        # Kernel network tuning profiles
 ├── copy_user_key_to_root.sh
 ├── fix_acme_serverauth.sh
-├── rclone-backup.sh
 └── sql_manage.sh           # SQL backup, restore and retention helper
 ```
 
